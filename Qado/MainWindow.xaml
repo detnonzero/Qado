@@ -1,0 +1,285 @@
+<Window x:Class="Qado.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Qado" Height="720" Width="1100"
+        WindowStartupLocation="CenterScreen">
+
+    <Grid Margin="12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="220"/>
+        </Grid.RowDefinitions>
+
+        <Border Grid.Row="0" Padding="10" BorderThickness="1">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+
+                <StackPanel Orientation="Vertical">
+                    <TextBlock Text="Node Status" FontWeight="Bold" FontSize="14"/>
+                    <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                        <TextBlock Text="Tip Height:" FontWeight="Bold"/>
+                        <TextBlock x:Name="TipHeightText" Margin="8,0,18,0"/>
+                        <TextBlock Text="Tip Hash:" FontWeight="Bold"/>
+                        <TextBlock x:Name="TipHashText" Margin="8,0,0,0"
+                                   TextTrimming="CharacterEllipsis" Width="520"/>
+                    </StackPanel>
+
+                    <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                        <TextBlock Text="Balance:" FontWeight="Bold"/>
+                        <TextBlock x:Name="BalanceTextBlock" Margin="8,0,18,0"/>
+                        <TextBlock Text="Mempool:" FontWeight="Bold"/>
+                        <TextBlock x:Name="MempoolCountText" Margin="8,0,18,0"/>
+                        <TextBlock Text="Peers:" FontWeight="Bold"/>
+                        <TextBlock x:Name="PeerCountText" Margin="8,0,0,0"/>
+                    </StackPanel>
+                </StackPanel>
+
+                <StackPanel Grid.Column="1" Orientation="Vertical" Margin="18,0,0,0" VerticalAlignment="Center">
+                    <TextBlock Text="Private Key (hex)" FontWeight="Bold"/>
+                    <ComboBox x:Name="PrivateKeyComboBox"
+                              Width="420"
+                              Margin="0,6,0,0"
+                              IsEditable="True"
+                              SelectionChanged="PrivateKeyComboBox_SelectionChanged"/>
+
+                    <TextBlock Text="Wallet Address (PubKey32 hex)" FontWeight="Bold" Margin="0,10,0,0"/>
+                    <TextBox x:Name="SpendPublicKeyTextBox" Width="420" Margin="0,6,0,0" IsReadOnly="True"/>
+                </StackPanel>
+
+                <StackPanel Grid.Column="2" Orientation="Horizontal" Margin="18,0,0,0" VerticalAlignment="Center">
+                    <Button x:Name="GeneratePrivateKeyButton" Content="Generate Key" Width="140" Margin="0,0,8,0"
+                            Click="GeneratePrivateKeyButton_Click"/>
+                    <Button x:Name="AcceptPrivateKeyButton" Content="Accept" Width="90" Margin="0,0,8,0"
+                            Click="AcceptPrivateKeyButton_Click" Opacity="0.5" IsEnabled="False"/>
+                    <Button x:Name="CopyKeyButton" Content="Copy" Width="70"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <Grid Grid.Row="1" Margin="0,12,0,12">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="420"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+
+            <StackPanel Grid.Column="0" Orientation="Vertical">
+
+                <GroupBox Header="Mining" Padding="10" Margin="0,0,0,12">
+                    <StackPanel>
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                            <Button x:Name="StartMiningButton" Content="Start Mining" Width="140" Margin="0,0,8,0"
+                                    Click="StartMiningButton_Click"/>
+                        </StackPanel>
+
+                        <StackPanel x:Name="MiningStatsPanel" Margin="0,4,0,0">
+                            <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
+                                <TextBlock Text="Block uptime:" Width="120"/>
+                                <TextBlock x:Name="BlockUptimeText"/>
+                            </StackPanel>
+                            <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
+                                <TextBlock Text="Hashrate:" Width="120"/>
+                                <TextBlock x:Name="CurrentHashrateText"/>
+                            </StackPanel>
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="Nonce:" Width="120"/>
+                                <TextBlock x:Name="NonceText"/>
+                            </StackPanel>
+                        </StackPanel>
+
+                        <TextBlock Text="Mining creates blocks; rewards are defined by consensus."
+                                   Margin="0,8,0,0" TextWrapping="Wrap"/>
+                    </StackPanel>
+                </GroupBox>
+
+                <GroupBox Header="Send Transaction (account-based)" Padding="10" Margin="0,0,0,12">
+                    <StackPanel>
+                        <TextBlock Text="To (PubKey32 hex):" FontWeight="Bold"/>
+                        <TextBox x:Name="RecipientAddressTextBox" Margin="0,6,0,8"/>
+
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                            <StackPanel Width="190">
+                                <TextBlock Text="Amount (units):" FontWeight="Bold"/>
+                                <TextBox x:Name="AmountTextBox" Margin="0,6,0,0"
+                                         TextChanged="AmountTextBox_TextChanged"/>
+                            </StackPanel>
+                            <StackPanel Width="190" Margin="12,0,0,0">
+                                <TextBlock Text="Fee (units):" FontWeight="Bold"/>
+                                <TextBox x:Name="FeeTextBox" Margin="0,6,0,0"/>
+                            </StackPanel>
+                        </StackPanel>
+
+                        <Button x:Name="SendButton" Content="Sign + Add to Mempool" Height="32"
+                                Click="SendButton_Click"/>
+
+                        <TextBlock x:Name="SendStatusText" Margin="0,8,0,0" TextWrapping="Wrap"/>
+                    </StackPanel>
+                </GroupBox>
+
+                <GroupBox Header="P2P" Padding="10">
+                    <StackPanel>
+                        <StackPanel Orientation="Horizontal">
+                            <TextBox x:Name="PeerHostTextBox" Width="220"/>
+                            <TextBox x:Name="PeerPortTextBox" Width="80" Margin="8,0,0,0"/>
+                            <Button x:Name="ConnectPeerButton" Content="Connect" Width="90" Margin="8,0,0,0"
+                                    Click="ConnectPeerButton_Click"/>
+                        </StackPanel>
+                        <TextBlock Text="Connect will dial a peer (your existing P2P bootstrap stays unchanged)."
+                                   Margin="0,8,0,0" TextWrapping="Wrap"/>
+                    </StackPanel>
+                </GroupBox>
+            </StackPanel>
+
+            <TabControl x:Name="MainTabs" Grid.Column="1" Margin="12,0,0,0">
+                <TabItem Header="Blocks">
+                    <Grid Margin="10">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                        </Grid.RowDefinitions>
+
+                        <StackPanel Orientation="Horizontal" Grid.Row="0" Margin="0,0,0,8">
+                            <Button x:Name="ReloadBlocksButton" Content="Reload" Width="90"
+                                    Click="ReloadBlocksButton_Click"/>
+                            <TextBlock Text="(auto reload on new tip)" Margin="12,4,0,0"/>
+                        </StackPanel>
+
+                        <ListView x:Name="BlocksListView"
+                                  Grid.Row="1"
+                                  MouseDoubleClick="BlocksListView_MouseDoubleClick"
+                                  ScrollViewer.VerticalScrollBarVisibility="Auto"
+                                  ScrollViewer.HorizontalScrollBarVisibility="Auto">
+                            <ListView.View>
+                                <GridView>
+                                    <GridViewColumn Header="Height" DisplayMemberBinding="{Binding Height}" Width="90"/>
+                                    <GridViewColumn Header="Hash" DisplayMemberBinding="{Binding Hash}" Width="360"/>
+                                    <GridViewColumn Header="Prev Hash" DisplayMemberBinding="{Binding PreviousHash}" Width="360"/>
+                                    <GridViewColumn Header="Time" DisplayMemberBinding="{Binding TimestampLocal}" Width="170"/>
+                                    <GridViewColumn Header="Miner" DisplayMemberBinding="{Binding Miner}" Width="220"/>
+                                    <GridViewColumn Header="Nonce" DisplayMemberBinding="{Binding Nonce}" Width="130"/>
+                                    <GridViewColumn Header="Diff" DisplayMemberBinding="{Binding Difficulty}" Width="150"/>
+                                    <GridViewColumn Header="Ver" DisplayMemberBinding="{Binding Version}" Width="70"/>
+                                    <GridViewColumn Header="Merkle" DisplayMemberBinding="{Binding MerkleRoot}" Width="360"/>
+                                    <GridViewColumn Header="Tx" DisplayMemberBinding="{Binding TxCount}" Width="60"/>
+                                </GridView>
+                            </ListView.View>
+                        </ListView>
+                    </Grid>
+                </TabItem>
+
+                <TabItem Header="Mempool">
+                    <Grid Margin="10">
+                        <ListView x:Name="MempoolListView"
+                                  ScrollViewer.VerticalScrollBarVisibility="Auto"
+                                  ScrollViewer.HorizontalScrollBarVisibility="Auto">
+                            <ListView.View>
+                                <GridView>
+                                    <GridViewColumn Header="From" DisplayMemberBinding="{Binding From}" Width="360"/>
+                                    <GridViewColumn Header="To" DisplayMemberBinding="{Binding To}" Width="360"/>
+                                    <GridViewColumn Header="Amount" DisplayMemberBinding="{Binding AmountQado}" Width="140"/>
+                                    <GridViewColumn Header="Fee" DisplayMemberBinding="{Binding FeeQado}" Width="140"/>
+                                    <GridViewColumn Header="Nonce" DisplayMemberBinding="{Binding Nonce}" Width="120"/>
+                                </GridView>
+                            </ListView.View>
+                        </ListView>
+                    </Grid>
+                </TabItem>
+
+                <TabItem Header="Peers">
+                    <Grid Margin="10">
+                        <ListView x:Name="PeersListView"
+                                  ScrollViewer.VerticalScrollBarVisibility="Auto"
+                                  ScrollViewer.HorizontalScrollBarVisibility="Auto">
+                            <ListView.View>
+                                <GridView>
+                                    <GridViewColumn Header="Endpoint" DisplayMemberBinding="{Binding Endpoint}" Width="300"/>
+                                    <GridViewColumn Header="Last Seen (UTC)" DisplayMemberBinding="{Binding LastSeenUtc}" Width="200"/>
+                                    <GridViewColumn Header="Status" DisplayMemberBinding="{Binding Status}" Width="420"/>
+                                </GridView>
+                            </ListView.View>
+                        </ListView>
+                    </Grid>
+                </TabItem>
+
+                <TabItem Header="State">
+                    <Grid Margin="10">
+                        <ListView x:Name="StateListView"
+                                  ScrollViewer.VerticalScrollBarVisibility="Auto"
+                                  ScrollViewer.HorizontalScrollBarVisibility="Auto">
+                            <ListView.View>
+                                <GridView>
+                                    <GridViewColumn Header="Public Key" DisplayMemberBinding="{Binding PublicKey}" Width="420"/>
+                                    <GridViewColumn Header="Balance" DisplayMemberBinding="{Binding BalanceFormatted}" Width="160"/>
+                                    <GridViewColumn Header="Nonce" DisplayMemberBinding="{Binding Nonce}" Width="120"/>
+                                </GridView>
+                            </ListView.View>
+                        </ListView>
+                    </Grid>
+                </TabItem>
+
+                <TabItem Header="Transactions">
+                    <Grid Margin="10">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                        </Grid.RowDefinitions>
+
+                        <TextBlock x:Name="TxHeaderText"
+                                   FontSize="16"
+                                   FontWeight="Bold"
+                                   Margin="0,0,0,8"
+                                   Text="Select a block to view its transactions." />
+
+                        <ListView x:Name="TxListView"
+                                  Grid.Row="1"
+                                  ScrollViewer.VerticalScrollBarVisibility="Auto"
+                                  ScrollViewer.HorizontalScrollBarVisibility="Auto">
+                            <ListView.View>
+                                <GridView>
+                                    <GridViewColumn Header="#" DisplayMemberBinding="{Binding Index}" Width="50"/>
+                                    <GridViewColumn Header="From" DisplayMemberBinding="{Binding From}" Width="420"/>
+                                    <GridViewColumn Header="To" DisplayMemberBinding="{Binding To}" Width="420"/>
+                                    <GridViewColumn Header="Amount" DisplayMemberBinding="{Binding AmountQado}" Width="140"/>
+                                    <GridViewColumn Header="Fee" DisplayMemberBinding="{Binding FeeQado}" Width="140"/>
+                                    <GridViewColumn Header="Nonce" DisplayMemberBinding="{Binding Nonce}" Width="100"/>
+                                </GridView>
+                            </ListView.View>
+                        </ListView>
+                    </Grid>
+                </TabItem>
+            </TabControl>
+        </Grid>
+
+        <GroupBox Grid.Row="2" Header="Log" Padding="10">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="*"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+
+                <ListView x:Name="LogListView"
+                          Grid.Row="0"
+                          ScrollViewer.VerticalScrollBarVisibility="Auto"
+                          ScrollViewer.HorizontalScrollBarVisibility="Auto">
+                    <ListView.View>
+                        <GridView>
+                            <GridViewColumn Header="Time" DisplayMemberBinding="{Binding Timestamp}" Width="70"/>
+                            <GridViewColumn Header="Level" DisplayMemberBinding="{Binding Level}" Width="70"/>
+                            <GridViewColumn Header="Category" DisplayMemberBinding="{Binding Category}" Width="120"/>
+                            <GridViewColumn Header="Message" DisplayMemberBinding="{Binding Message}" Width="680"/>
+                        </GridView>
+                    </ListView.View>
+                </ListView>
+
+                <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,10,0,0">
+                    <Button x:Name="ClearLogButton" Content="Clear" Width="90" Click="ClearLogButton_Click"/>
+                    <TextBlock Margin="12,6,0,0" Text="UI log only (node logs later)."/>
+                </StackPanel>
+            </Grid>
+        </GroupBox>
+    </Grid>
+</Window>

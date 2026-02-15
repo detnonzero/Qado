@@ -1,0 +1,470 @@
+openapi: 3.1.0
+info:
+  title: Qado Exchange Node API
+  version: 1.0.0
+  summary: Minimal REST/JSON API schema for exchange listing and wallet integration
+  description: |
+    Exchange-facing API for deposits, confirmations, and transaction broadcast.
+    All numeric chain values are encoded as decimal strings to avoid precision loss.
+    The node API is served as plain HTTP on port 18080 by default.
+    TLS termination is intentionally delegated to an external reverse proxy.
+servers:
+  - url: http://127.0.0.1:18080
+    description: Default node API (no TLS)
+  - url: http://node-api.internal:18080
+    description: Private/internal exchange network (no TLS)
+tags:
+  - name: System
+  - name: Chain
+  - name: Address
+  - name: Transaction
+paths:
+  /v1/health:
+    get:
+      tags: [System]
+      summary: Health and readiness probe
+      operationId: getHealth
+      responses:
+        "200":
+          description: Node is alive
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              examples:
+                ok:
+                  value:
+                    status: ok
+                    network: mainnet
+                    node_version: "1.0.0"
+                    timestamp_utc: "2026-02-12T10:30:10Z"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/network:
+    get:
+      tags: [System]
+      summary: Static network metadata
+      operationId: getNetwork
+      responses:
+        "200":
+          description: Network metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkResponse"
+              examples:
+                default:
+                  value:
+                    chain_name: qado
+                    symbol: QADO
+                    decimals: 9
+                    chain_id: "1"
+                    network_id: "1"
+                    p2p_port: 34000
+                    genesis_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/tip:
+    get:
+      tags: [Chain]
+      summary: Current canonical tip
+      operationId: getTip
+      responses:
+        "200":
+          description: Canonical tip info
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TipResponse"
+              examples:
+                default:
+                  value:
+                    height: "15234"
+                    hash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    timestamp_utc: "2026-02-12T10:29:48Z"
+                    chainwork: "932998193"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/block/{block_ref}:
+    get:
+      tags: [Chain]
+      summary: Get block by height or hash
+      description: |
+        `block_ref` accepts either a decimal height string or a 64-char lowercase hex hash.
+      operationId: getBlock
+      parameters:
+        - name: block_ref
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Block found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BlockResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/address/{address}:
+    get:
+      tags: [Address]
+      summary: Get account state for an address
+      operationId: getAddress
+      parameters:
+        - name: address
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/AddressHex"
+      responses:
+        "200":
+          description: Address/account state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AddressResponse"
+              examples:
+                default:
+                  value:
+                    address: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                    balance_atomic: "12000000000"
+                    nonce: "17"
+                    pending_outgoing_count: 1
+                    pending_incoming_count: 0
+                    latest_observed_height: "15234"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/tx/{txid}:
+    get:
+      tags: [Transaction]
+      summary: Get transaction by hash
+      operationId: getTransaction
+      parameters:
+        - name: txid
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/HashHex"
+      responses:
+        "200":
+          description: Transaction status and details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/tx/{txid}/confirmations:
+    get:
+      tags: [Transaction]
+      summary: Canonical confirmation status for a transaction
+      operationId: getConfirmations
+      parameters:
+        - name: txid
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/HashHex"
+      responses:
+        "200":
+          description: Confirmation status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxConfirmationsResponse"
+              examples:
+                default:
+                  value:
+                    txid: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                    status: confirmed
+                    confirmations: "18"
+                    block_hash: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                    block_height: "15216"
+                    tip_height: "15234"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/tx/broadcast:
+    post:
+      tags: [Transaction]
+      summary: Broadcast a raw signed transaction
+      operationId: broadcastTransaction
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BroadcastRequest"
+            examples:
+              default:
+                value:
+                  raw_tx_hex: "f0ab..."
+                  idempotency_key: "exch-deposit-hotwallet-0000123"
+      responses:
+        "200":
+          description: Broadcast result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BroadcastResponse"
+              examples:
+                accepted:
+                  value:
+                    accepted: true
+                    txid: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                    status: mempool
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/InternalError"
+components:
+  responses:
+    BadRequest:
+      description: Invalid request payload or parameter
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiError"
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiError"
+    Conflict:
+      description: Request conflicts with current state (duplicate or incompatible state)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiError"
+    RateLimited:
+      description: Too many requests
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiError"
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiError"
+  schemas:
+    UIntString:
+      type: string
+      pattern: "^[0-9]+$"
+      example: "15234"
+    HashHex:
+      type: string
+      pattern: "^[a-f0-9]{64}$"
+      example: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    AddressHex:
+      type: string
+      pattern: "^[a-f0-9]{64}$"
+      example: "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+    TxStatus:
+      type: string
+      enum: [unknown, mempool, confirmed, orphaned]
+    HealthResponse:
+      type: object
+      required: [status, network, node_version, timestamp_utc]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        network:
+          type: string
+          example: mainnet
+        node_version:
+          type: string
+          example: "1.0.0"
+        timestamp_utc:
+          type: string
+          format: date-time
+    NetworkResponse:
+      type: object
+      required: [chain_name, symbol, decimals, chain_id, network_id, p2p_port, genesis_hash]
+      properties:
+        chain_name:
+          type: string
+          example: qado
+        symbol:
+          type: string
+          example: QADO
+        decimals:
+          type: integer
+          minimum: 0
+          maximum: 18
+          example: 9
+        chain_id:
+          $ref: "#/components/schemas/UIntString"
+        network_id:
+          $ref: "#/components/schemas/UIntString"
+        p2p_port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          example: 34000
+        genesis_hash:
+          $ref: "#/components/schemas/HashHex"
+    TipResponse:
+      type: object
+      required: [height, hash, timestamp_utc, chainwork]
+      properties:
+        height:
+          $ref: "#/components/schemas/UIntString"
+        hash:
+          $ref: "#/components/schemas/HashHex"
+        timestamp_utc:
+          type: string
+          format: date-time
+        chainwork:
+          $ref: "#/components/schemas/UIntString"
+    BlockResponse:
+      type: object
+      required: [hash, height, prev_hash, timestamp_utc, miner, tx_count, txids]
+      properties:
+        hash:
+          $ref: "#/components/schemas/HashHex"
+        height:
+          $ref: "#/components/schemas/UIntString"
+        prev_hash:
+          $ref: "#/components/schemas/HashHex"
+        timestamp_utc:
+          type: string
+          format: date-time
+        miner:
+          $ref: "#/components/schemas/AddressHex"
+        tx_count:
+          type: integer
+          minimum: 0
+          example: 3
+        txids:
+          type: array
+          items:
+            $ref: "#/components/schemas/HashHex"
+    AddressResponse:
+      type: object
+      required: [address, balance_atomic, nonce, pending_outgoing_count, pending_incoming_count, latest_observed_height]
+      properties:
+        address:
+          $ref: "#/components/schemas/AddressHex"
+        balance_atomic:
+          $ref: "#/components/schemas/UIntString"
+        nonce:
+          $ref: "#/components/schemas/UIntString"
+        pending_outgoing_count:
+          type: integer
+          minimum: 0
+        pending_incoming_count:
+          type: integer
+          minimum: 0
+        latest_observed_height:
+          $ref: "#/components/schemas/UIntString"
+    TxResponse:
+      type: object
+      required: [txid, status, from, to, amount_atomic, fee_atomic, nonce]
+      properties:
+        txid:
+          $ref: "#/components/schemas/HashHex"
+        status:
+          $ref: "#/components/schemas/TxStatus"
+        confirmations:
+          $ref: "#/components/schemas/UIntString"
+        block_hash:
+          $ref: "#/components/schemas/HashHex"
+        block_height:
+          $ref: "#/components/schemas/UIntString"
+        timestamp_utc:
+          type: string
+          format: date-time
+        from:
+          $ref: "#/components/schemas/AddressHex"
+        to:
+          $ref: "#/components/schemas/AddressHex"
+        amount_atomic:
+          $ref: "#/components/schemas/UIntString"
+        fee_atomic:
+          $ref: "#/components/schemas/UIntString"
+        nonce:
+          $ref: "#/components/schemas/UIntString"
+        raw_tx_hex:
+          type: string
+          pattern: "^[a-f0-9]+$"
+    TxConfirmationsResponse:
+      type: object
+      required: [txid, status, confirmations, tip_height]
+      properties:
+        txid:
+          $ref: "#/components/schemas/HashHex"
+        status:
+          $ref: "#/components/schemas/TxStatus"
+        confirmations:
+          $ref: "#/components/schemas/UIntString"
+        block_hash:
+          $ref: "#/components/schemas/HashHex"
+        block_height:
+          $ref: "#/components/schemas/UIntString"
+        tip_height:
+          $ref: "#/components/schemas/UIntString"
+    BroadcastRequest:
+      type: object
+      required: [raw_tx_hex]
+      properties:
+        raw_tx_hex:
+          type: string
+          pattern: "^[a-f0-9]+$"
+        idempotency_key:
+          type: string
+          minLength: 8
+          maxLength: 128
+    BroadcastResponse:
+      type: object
+      required: [accepted, status]
+      properties:
+        accepted:
+          type: boolean
+        txid:
+          $ref: "#/components/schemas/HashHex"
+        status:
+          $ref: "#/components/schemas/TxStatus"
+        error:
+          type: string
+    ApiError:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          example: invalid_request
+        message:
+          type: string
+          example: txid is malformed
+        details:
+          type: object
+          additionalProperties: true
+        request_id:
+          type: string
