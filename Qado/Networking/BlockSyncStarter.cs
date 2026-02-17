@@ -27,6 +27,10 @@ namespace Qado.Networking
         private static readonly TimeSpan MaxIdleDelay = TimeSpan.FromMinutes(2);
         private const int MaxIdleBackoffShift = 4; // up to 16x base delay
         private const double IdleJitterFraction = 0.20;
+        private static readonly SemaphoreSlim ImmediateSyncSignal = new(0, 1);
+        private static readonly object ImmediateSyncGate = new();
+        private static readonly TimeSpan ImmediateSyncCooldown = TimeSpan.FromSeconds(5);
+        private static DateTime _lastImmediateSyncUtc = DateTime.MinValue;
 
         public static async Task StartAsync(MempoolManager mempool, ILogSink? log = null, CancellationToken ct = default)
         {
@@ -239,10 +243,43 @@ namespace Qado.Networking
 
                 int sleepSecs = Math.Max(1, (int)Math.Round(idleDelay.TotalSeconds));
                 log?.Info("BlockSync", $"No sync progress ({idleReason}). Sleep {sleepSecs}s ...");
-                try { await Task.Delay(idleDelay, ct).ConfigureAwait(false); } catch { }
+                bool wokeBySignal = false;
+                try
+                {
+                    wokeBySignal = await WaitForIdleOrImmediateSignalAsync(idleDelay, ct).ConfigureAwait(false);
+                }
+                catch { }
+
+                if (wokeBySignal)
+                {
+                    idleRounds = 0;
+                    log?.Info("BlockSync", "Immediate sync wake-up.");
+                }
             }
 
             log?.Warn("BlockSync", "Cancelled.");
+        }
+
+        public static void RequestImmediateSync(ILogSink? log = null, string reason = "handshake")
+        {
+            bool allowed;
+            lock (ImmediateSyncGate)
+            {
+                var now = DateTime.UtcNow;
+                allowed = (now - _lastImmediateSyncUtc) >= ImmediateSyncCooldown;
+                if (allowed)
+                    _lastImmediateSyncUtc = now;
+            }
+
+            if (!allowed)
+                return;
+
+            try { ImmediateSyncSignal.Release(); } catch (SemaphoreFullException) { }
+
+            if (!string.IsNullOrWhiteSpace(reason))
+                log?.Info("BlockSync", $"Immediate sync requested ({reason}).");
+            else
+                log?.Info("BlockSync", "Immediate sync requested.");
         }
 
         private static (TimeSpan delay, string reason) ComputeIdleDelay(
@@ -315,6 +352,21 @@ namespace Qado.Networking
             if (ticks > MaxIdleDelay.Ticks) ticks = MaxIdleDelay.Ticks;
 
             return TimeSpan.FromTicks(ticks);
+        }
+
+        private static async Task<bool> WaitForIdleOrImmediateSignalAsync(TimeSpan idleDelay, CancellationToken ct)
+        {
+            if (idleDelay < TimeSpan.Zero)
+                idleDelay = TimeSpan.Zero;
+
+            try
+            {
+                return await ImmediateSyncSignal.WaitAsync(idleDelay, ct).ConfigureAwait(false);
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         private static ulong GetLatestHeightDirect()

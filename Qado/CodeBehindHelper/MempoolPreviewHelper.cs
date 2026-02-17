@@ -17,7 +17,8 @@ namespace Qado.CodeBehindHelper
         public static void StartMempoolUiUpdater(
             MempoolManager mempool,
             ObservableCollection<MainWindow.MempoolRow> targetCollection,
-            Func<bool>? isMiningActive = null)
+            Func<bool>? isMiningActive = null,
+            Action? onUiTick = null)
         {
             if (mempool == null) throw new ArgumentNullException(nameof(mempool));
             if (targetCollection == null) throw new ArgumentNullException(nameof(targetCollection));
@@ -57,6 +58,8 @@ namespace Qado.CodeBehindHelper
                                 Nonce = tx.TxNonce
                             });
                         }
+
+                        try { onUiTick?.Invoke(); } catch { }
                     }));
                 }
                 catch

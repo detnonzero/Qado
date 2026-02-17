@@ -178,6 +178,58 @@ namespace Qado.Networking
             }, ct);
         }
 
+        public bool IsPeerConnected(string ip, int port)
+        {
+            if (string.IsNullOrWhiteSpace(ip)) return false;
+            if (port <= 0 || port > 65535) return false;
+
+            string wantedIp = NormalizeBanKey(ip);
+
+            foreach (var kv in _sessions)
+            {
+                var s = kv.Value;
+                if (!s.HandshakeOk) continue;
+
+                string sessionIp = "";
+                int sessionPort = 0;
+
+                if (!string.IsNullOrWhiteSpace(s.RemoteIpAdvertised))
+                    sessionIp = NormalizeBanKey(s.RemoteIpAdvertised!);
+
+                if (s.RemotePortAdvertised is int advPort && advPort > 0 && advPort <= 65535)
+                    sessionPort = advPort;
+
+                if (sessionIp.Length == 0 || sessionPort == 0)
+                {
+                    try
+                    {
+                        if (s.Client?.Client?.RemoteEndPoint is IPEndPoint iep)
+                        {
+                            if (sessionIp.Length == 0)
+                                sessionIp = NormalizeBanKey(iep.Address.ToString());
+                            if (sessionPort == 0)
+                                sessionPort = iep.Port;
+                        }
+                    }
+                    catch { }
+                }
+
+                if (sessionPort == 0 && TryParsePortFromEndpoint(s.RemoteEndpoint, out int parsedPort))
+                    sessionPort = parsedPort;
+
+                if (sessionIp.Length == 0)
+                    sessionIp = EndpointToBanKey(s.Client?.Client?.RemoteEndPoint);
+
+                if (sessionIp.Length == 0)
+                    sessionIp = NormalizeBanKey(s.RemoteEndpoint);
+
+                if (sessionIp == wantedIp && sessionPort == port)
+                    return true;
+            }
+
+            return false;
+        }
+
         public async Task BroadcastTxAsync(Transaction tx)
         {
             try
@@ -406,6 +458,7 @@ namespace Qado.Networking
 
             s.HandshakeOk = true;
             PeerFailTracker.ReportSuccess(GetBanKey(s));
+            BlockSyncStarter.RequestImmediateSync(_log, $"handshake {ip}:{port}");
             _log?.Info("P2P", $"handshake from {ip}:{port} (v{ver})");
         }
 
@@ -802,6 +855,21 @@ namespace Qado.Networking
                 return NormalizeBanKey(iep.Address.ToString());
 
             return NormalizeBanKey(endpoint?.ToString() ?? "");
+        }
+
+        private static bool TryParsePortFromEndpoint(string endpoint, out int port)
+        {
+            port = 0;
+            if (string.IsNullOrWhiteSpace(endpoint)) return false;
+
+            int idx = endpoint.LastIndexOf(':');
+            if (idx <= 0 || idx >= endpoint.Length - 1) return false;
+
+            if (!int.TryParse(endpoint[(idx + 1)..], out int p)) return false;
+            if (p <= 0 || p > 65535) return false;
+
+            port = p;
+            return true;
         }
 
         private static string NormalizeBanKey(string raw)

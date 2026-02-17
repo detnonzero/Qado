@@ -44,6 +44,7 @@ namespace Qado
         private Timer? _mempoolCleanupTimer;
         private Timer? _blockExplorerTimer;
         private Timer? _peerReloadDebounceTimer;
+        private Timer? _nodeStatusDebounceTimer;
 
         private CancellationTokenSource? _p2pCts;
         private P2PNode? _p2pNode;
@@ -52,6 +53,8 @@ namespace Qado
         private const int InitialCount = 100;
         private const int PageSize = 50;
         private const int PeerReloadDebounceMs = 300;
+        private const int NodeStatusDebounceMs = 400;
+        private static readonly TimeSpan PeerSeenRecentlyWindow = TimeSpan.FromMinutes(5);
 
         private ulong _nextHeightToLoad = 0;
         private bool _isLoading = false;
@@ -79,6 +82,12 @@ namespace Qado
             {
                 if (_isClosing) return;
                 try { Dispatcher.BeginInvoke(new Action(ReloadPeers)); } catch { }
+            }, null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+
+            _nodeStatusDebounceTimer = new Timer(_ =>
+            {
+                if (_isClosing) return;
+                try { Dispatcher.BeginInvoke(new Action(RefreshNodeStatusHeader)); } catch { }
             }, null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
 
             PeerStore.PeerListChanged += OnPeerListChanged;
@@ -113,7 +122,10 @@ namespace Qado
                     this
                 );
 
-                MempoolPreviewHelper.StartMempoolUiUpdater(_mempool, _mempoolPreview);
+                MempoolPreviewHelper.StartMempoolUiUpdater(
+                    _mempool,
+                    _mempoolPreview,
+                    onUiTick: ScheduleNodeStatusRefresh);
 
                 PopulateKeyDropdown();
 
@@ -145,6 +157,7 @@ namespace Qado
 
                 LoadAccounts();
                 ReloadPeers();
+                ScheduleNodeStatusRefresh();
 
                 Info("Startup", "Qado UI initialized.");
             };
@@ -159,6 +172,8 @@ namespace Qado
             _blockExplorerTimer?.Dispose();
             _peerReloadDebounceTimer?.Dispose();
             _peerReloadDebounceTimer = null;
+            _nodeStatusDebounceTimer?.Dispose();
+            _nodeStatusDebounceTimer = null;
             PeerStore.PeerListChanged -= OnPeerListChanged;
             MiningHelper.StopMiningForShutdown();
             MempoolPreviewHelper.StopMempoolUiUpdater();
@@ -263,6 +278,7 @@ namespace Qado
                 _mempoolPreview.Insert(0, row);
                 if (_mempoolPreview.Count > 1000)
                     _mempoolPreview.RemoveAt(_mempoolPreview.Count - 1);
+                ScheduleNodeStatusRefresh();
             }));
         }
 
@@ -281,6 +297,7 @@ namespace Qado
 
                 Dispatcher.BeginInvoke(new Action(LoadAccounts));
                 Dispatcher.BeginInvoke(new Action(ReloadPeers));
+                ScheduleNodeStatusRefresh();
 
                 TryAdoptCurrentTip();
             }
@@ -538,6 +555,7 @@ namespace Qado
                 Info("P2P", $"Dialing peer: {host}:{port}");
                 await _p2pNode.ConnectAsync(host, port, _p2pCts?.Token ?? CancellationToken.None);
                 SchedulePeerReload();
+                ScheduleNodeStatusRefresh();
             }
             catch (Exception ex)
             {
@@ -552,6 +570,12 @@ namespace Qado
         {
             if (_isClosing) return;
             try { _peerReloadDebounceTimer?.Change(PeerReloadDebounceMs, Timeout.Infinite); } catch { }
+        }
+
+        private void ScheduleNodeStatusRefresh()
+        {
+            if (_isClosing) return;
+            try { _nodeStatusDebounceTimer?.Change(NodeStatusDebounceMs, Timeout.Infinite); } catch { }
         }
 
         private void ClearLogButton_Click(object sender, RoutedEventArgs e)
@@ -580,11 +604,13 @@ namespace Qado
                     int port = r.GetInt32(1);
                     if (SelfPeerGuard.IsSelf(ip, port)) continue;
                     long ts = r.GetInt64(2);
-                    var dt = DateTimeOffset.FromUnixTimeSeconds(ts).UtcDateTime;
+                    var seenAt = DateTimeOffset.FromUnixTimeSeconds(ts);
+                    var dt = seenAt.UtcDateTime;
                     _peers.Add(new PeerRow
                     {
                         Endpoint = $"{ip}:{port}",
-                        LastSeenUtc = $"{dt:yyyy-MM-dd HH:mm:ss} UTC"
+                        LastSeenUtc = $"{dt:yyyy-MM-dd HH:mm:ss} UTC",
+                        Status = GetPeerStatus(ip, port, seenAt)
                     });
                 }
 
@@ -599,6 +625,61 @@ namespace Qado
             {
                 _peers.Add(new PeerRow { Status = $"Error loading peers: {ex.Message}" });
             }
+
+            ScheduleNodeStatusRefresh();
+        }
+
+        private string GetPeerStatus(string ip, int port, DateTimeOffset seenAt)
+        {
+            if (_p2pNode?.IsPeerConnected(ip, port) == true)
+                return "Connected";
+
+            if (PeerFailTracker.ShouldBan(ip))
+                return "Cooling down";
+
+            var age = DateTimeOffset.UtcNow - seenAt;
+            if (age <= PeerSeenRecentlyWindow)
+                return "Seen recently";
+
+            return "Stale";
+        }
+
+        private void RefreshNodeStatusHeader()
+        {
+            ulong tipHeight = 0;
+            string tipHashText = "-";
+
+            try
+            {
+                tipHeight = BlockStore.GetLatestHeight();
+                var tipHash = BlockStore.GetCanonicalHashAtHeight(tipHeight);
+                if (tipHash is { Length: 32 })
+                    tipHashText = Convert.ToHexString(tipHash).ToLowerInvariant();
+            }
+            catch
+            {
+            }
+
+            int mempoolCount = 0;
+            try { mempoolCount = _mempool?.Count ?? 0; } catch { }
+
+            int peerCount = 0;
+            try
+            {
+                for (int i = 0; i < _peers.Count; i++)
+                {
+                    if (!string.IsNullOrWhiteSpace(_peers[i].Endpoint))
+                        peerCount++;
+                }
+            }
+            catch
+            {
+            }
+
+            TipHeightText.Text = tipHeight.ToString();
+            TipHashText.Text = tipHashText;
+            MempoolCountText.Text = mempoolCount.ToString();
+            PeerCountText.Text = peerCount.ToString();
         }
 
         private void LoadAccounts()
