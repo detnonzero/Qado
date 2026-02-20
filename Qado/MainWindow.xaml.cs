@@ -60,6 +60,14 @@ namespace Qado
         private bool _isLoading = false;
         private bool _initialized = false;
         private bool _isClosing = false;
+        private int _tipAdoptRequested;
+        private int _tipAdoptWorkerRunning;
+        private int _accountsReloadRequested;
+        private int _accountsReloadWorkerRunning;
+        private int _peersReloadRequested;
+        private int _peersReloadWorkerRunning;
+        private int _nodeStatusRefreshRequested;
+        private int _nodeStatusRefreshWorkerRunning;
 
         private readonly HashSet<ulong> _displayedHeights = new();
 
@@ -152,7 +160,7 @@ namespace Qado
                 await StartExchangeApiAsync();
                 if (_isClosing) return;
 
-                TryAdoptCurrentTip();
+                RequestTipAdoption();
                 InitializeBlockExplorerLazy();
 
                 LoadAccounts();
@@ -299,14 +307,44 @@ namespace Qado
                 Dispatcher.BeginInvoke(new Action(ReloadPeers));
                 ScheduleNodeStatusRefresh();
 
-                TryAdoptCurrentTip();
+                RequestTipAdoption();
             }
             catch
             {
             }
         }
 
-        private void TryAdoptCurrentTip()
+        private void RequestTipAdoption()
+        {
+            if (_isClosing) return;
+
+            Interlocked.Exchange(ref _tipAdoptRequested, 1);
+            if (Interlocked.CompareExchange(ref _tipAdoptWorkerRunning, 1, 0) != 0)
+                return;
+
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    while (!_isClosing)
+                    {
+                        if (Interlocked.Exchange(ref _tipAdoptRequested, 0) == 0)
+                            break;
+
+                        TryAdoptCurrentTipCore();
+                    }
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _tipAdoptWorkerRunning, 0);
+
+                    if (!_isClosing && Volatile.Read(ref _tipAdoptRequested) != 0)
+                        RequestTipAdoption();
+                }
+            });
+        }
+
+        private void TryAdoptCurrentTipCore()
         {
             try
             {
@@ -585,12 +623,57 @@ namespace Qado
 
         private void ReloadPeers()
         {
-            _peers.Clear();
+            if (_isClosing) return;
+
+            Interlocked.Exchange(ref _peersReloadRequested, 1);
+            if (Interlocked.CompareExchange(ref _peersReloadWorkerRunning, 1, 0) != 0)
+                return;
+
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    while (!_isClosing)
+                    {
+                        if (Interlocked.Exchange(ref _peersReloadRequested, 0) == 0)
+                            break;
+
+                        var rows = BuildPeerRowsSnapshot();
+                        if (_isClosing) break;
+
+                        try
+                        {
+                            Dispatcher.BeginInvoke(new Action(() =>
+                            {
+                                if (_isClosing) return;
+                                _peers.Clear();
+                                for (int i = 0; i < rows.Count; i++)
+                                    _peers.Add(rows[i]);
+                                ScheduleNodeStatusRefresh();
+                            }));
+                        }
+                        catch
+                        {
+                        }
+                    }
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _peersReloadWorkerRunning, 0);
+                    if (!_isClosing && Volatile.Read(ref _peersReloadRequested) != 0)
+                        ReloadPeers();
+                }
+            });
+        }
+
+        private List<PeerRow> BuildPeerRowsSnapshot()
+        {
+            var rows = new List<PeerRow>();
 
             if (Db.Connection == null)
             {
-                _peers.Add(new PeerRow { Status = "Database not initialized yet." });
-                return;
+                rows.Add(new PeerRow { Status = "Database not initialized yet." });
+                return rows;
             }
 
             try
@@ -603,10 +686,12 @@ namespace Qado
                     string ip = r.GetString(0);
                     int port = r.GetInt32(1);
                     if (SelfPeerGuard.IsSelf(ip, port)) continue;
+
                     long ts = r.GetInt64(2);
                     var seenAt = DateTimeOffset.FromUnixTimeSeconds(ts);
                     var dt = seenAt.UtcDateTime;
-                    _peers.Add(new PeerRow
+
+                    rows.Add(new PeerRow
                     {
                         Endpoint = $"{ip}:{port}",
                         LastSeenUtc = $"{dt:yyyy-MM-dd HH:mm:ss} UTC",
@@ -614,19 +699,21 @@ namespace Qado
                     });
                 }
 
-                if (_peers.Count == 0)
-                    _peers.Add(new PeerRow { Status = "No peers known." });
+                if (rows.Count == 0)
+                    rows.Add(new PeerRow { Status = "No peers known." });
             }
             catch (SqliteException ex)
             {
-                _peers.Add(new PeerRow { Status = $"SQLite error: {ex.Message}" });
+                rows.Clear();
+                rows.Add(new PeerRow { Status = $"SQLite error: {ex.Message}" });
             }
             catch (Exception ex)
             {
-                _peers.Add(new PeerRow { Status = $"Error loading peers: {ex.Message}" });
+                rows.Clear();
+                rows.Add(new PeerRow { Status = $"Error loading peers: {ex.Message}" });
             }
 
-            ScheduleNodeStatusRefresh();
+            return rows;
         }
 
         private string GetPeerStatus(string ip, int port, DateTimeOffset seenAt)
@@ -646,8 +733,47 @@ namespace Qado
 
         private void RefreshNodeStatusHeader()
         {
+            if (_isClosing) return;
+
+            Interlocked.Exchange(ref _nodeStatusRefreshRequested, 1);
+            if (Interlocked.CompareExchange(ref _nodeStatusRefreshWorkerRunning, 1, 0) != 0)
+                return;
+
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    while (!_isClosing)
+                    {
+                        if (Interlocked.Exchange(ref _nodeStatusRefreshRequested, 0) == 0)
+                            break;
+
+                        var snap = ReadNodeStatusSnapshot();
+                        if (_isClosing) break;
+
+                        try
+                        {
+                            Dispatcher.BeginInvoke(new Action(() => ApplyNodeStatusSnapshot(snap)));
+                        }
+                        catch
+                        {
+                        }
+                    }
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _nodeStatusRefreshWorkerRunning, 0);
+                    if (!_isClosing && Volatile.Read(ref _nodeStatusRefreshRequested) != 0)
+                        RefreshNodeStatusHeader();
+                }
+            });
+        }
+
+        private (ulong tipHeight, string tipHashText, int mempoolCount) ReadNodeStatusSnapshot()
+        {
             ulong tipHeight = 0;
             string tipHashText = "-";
+            int mempoolCount = 0;
 
             try
             {
@@ -660,8 +786,14 @@ namespace Qado
             {
             }
 
-            int mempoolCount = 0;
             try { mempoolCount = _mempool?.Count ?? 0; } catch { }
+
+            return (tipHeight, tipHashText, mempoolCount);
+        }
+
+        private void ApplyNodeStatusSnapshot((ulong tipHeight, string tipHashText, int mempoolCount) snap)
+        {
+            if (_isClosing) return;
 
             int peerCount = 0;
             try
@@ -676,25 +808,74 @@ namespace Qado
             {
             }
 
-            TipHeightText.Text = tipHeight.ToString();
-            TipHashText.Text = tipHashText;
-            MempoolCountText.Text = mempoolCount.ToString();
+            TipHeightText.Text = snap.tipHeight.ToString();
+            TipHashText.Text = snap.tipHashText;
+            MempoolCountText.Text = snap.mempoolCount.ToString();
             PeerCountText.Text = peerCount.ToString();
         }
 
         private void LoadAccounts()
         {
-            _accounts.Clear();
+            if (_isClosing) return;
+
+            Interlocked.Exchange(ref _accountsReloadRequested, 1);
+            if (Interlocked.CompareExchange(ref _accountsReloadWorkerRunning, 1, 0) != 0)
+                return;
+
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    while (!_isClosing)
+                    {
+                        if (Interlocked.Exchange(ref _accountsReloadRequested, 0) == 0)
+                            break;
+
+                        var rows = BuildAccountRowsSnapshot(out var errorMessage);
+                        if (_isClosing) break;
+
+                        try
+                        {
+                            Dispatcher.BeginInvoke(new Action(() =>
+                            {
+                                if (_isClosing) return;
+
+                                _accounts.Clear();
+                                for (int i = 0; i < rows.Count; i++)
+                                    _accounts.Add(rows[i]);
+
+                                if (!string.IsNullOrWhiteSpace(errorMessage))
+                                    Warn("State", errorMessage);
+                            }));
+                        }
+                        catch
+                        {
+                        }
+                    }
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _accountsReloadWorkerRunning, 0);
+                    if (!_isClosing && Volatile.Read(ref _accountsReloadRequested) != 0)
+                        LoadAccounts();
+                }
+            });
+        }
+
+        private List<AccountStateViewModel> BuildAccountRowsSnapshot(out string? errorMessage)
+        {
+            errorMessage = null;
+            var rows = new List<AccountStateViewModel>(256);
 
             if (Db.Connection == null)
             {
-                _accounts.Add(new AccountStateViewModel
+                rows.Add(new AccountStateViewModel
                 {
                     PublicKey = "Database not initialized yet.",
                     Balance = 0UL,
                     Nonce = 0UL
                 });
-                return;
+                return rows;
             }
 
             try
@@ -709,7 +890,7 @@ namespace Qado
                     ulong balance = ReadU64Blob(r.GetValue(1));
                     ulong nonce = ReadU64IntegerOrBlob(r.GetValue(2));
 
-                    _accounts.Add(new AccountStateViewModel
+                    rows.Add(new AccountStateViewModel
                     {
                         PublicKey = addr,
                         Balance = balance,
@@ -719,8 +900,11 @@ namespace Qado
             }
             catch (Exception ex)
             {
-                Warn("State", $"LoadAccounts failed: {ex.Message}");
+                rows.Clear();
+                errorMessage = $"LoadAccounts failed: {ex.Message}";
             }
+
+            return rows;
         }
 
         public class AccountStateViewModel

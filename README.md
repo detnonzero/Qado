@@ -38,7 +38,7 @@ The app starts:
 
 - P2P port: `34000`
 - API port: `18080` (override via `QADO_API_PORT`)
-- Seed host: `genesis.qado.org`
+- Seed host: `82.165.63.4`
 
 Important: verify network parameters for each release/tag before joining a network.
 

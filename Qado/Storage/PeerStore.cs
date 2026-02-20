@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Net;
+using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using Microsoft.Data.Sqlite;
@@ -43,6 +45,7 @@ namespace Qado.Storage
         public static void UpsertByEndpoint(string ip, int port, ulong lastSeen, byte networkId, SqliteTransaction? tx = null)
         {
             if (string.IsNullOrWhiteSpace(ip) || port <= 0) return;
+            if (!IsPublicRoutableIPv4Literal(ip)) return;
             if (SelfPeerGuard.IsSelf(ip, port)) return;
             byte[] id = ComputeEndpointId(networkId, ip, port);
 
@@ -184,12 +187,50 @@ WHERE id NOT IN (
                 delExpired.ExecuteNonQuery();
             }
 
+            DeleteNonPublicPeersCore(conn, tx);
+
             using (var trimGlobal = conn.CreateCommand())
             {
                 trimGlobal.Transaction = tx;
                 trimGlobal.CommandText = trimGlobalSql;
                 trimGlobal.Parameters.AddWithValue("$max_total", MaxPeersTotal);
                 trimGlobal.ExecuteNonQuery();
+            }
+        }
+
+        private static void DeleteNonPublicPeersCore(SqliteConnection conn, SqliteTransaction? tx)
+        {
+            var deleteIds = new List<byte[]>();
+
+            using (var select = conn.CreateCommand())
+            {
+                select.Transaction = tx;
+                select.CommandText = "SELECT id, ip FROM peers;";
+
+                using var r = select.ExecuteReader();
+                while (r.Read())
+                {
+                    byte[] id = (byte[])r[0];
+                    string ip = r.GetString(1);
+                    if (!IsPublicRoutableIPv4Literal(ip))
+                        deleteIds.Add(id);
+                }
+            }
+
+            if (deleteIds.Count == 0)
+                return;
+
+            using var del = conn.CreateCommand();
+            del.Transaction = tx;
+            del.CommandText = "DELETE FROM peers WHERE id = $id;";
+            var pId = del.CreateParameter();
+            pId.ParameterName = "$id";
+            del.Parameters.Add(pId);
+
+            for (int i = 0; i < deleteIds.Count; i++)
+            {
+                pId.Value = deleteIds[i];
+                del.ExecuteNonQuery();
             }
         }
 
@@ -211,6 +252,60 @@ WHERE id NOT IN (
             if (parsed < min) return min;
             if (parsed > max) return max;
             return parsed;
+        }
+
+        private static bool IsPublicRoutableIPv4Literal(string ip)
+        {
+            if (string.IsNullOrWhiteSpace(ip)) return false;
+
+            string host = NormalizeHost(ip);
+            if (!IPAddress.TryParse(host, out var a)) return false;
+            if (a.AddressFamily != AddressFamily.InterNetwork) return false;
+
+            var b = a.GetAddressBytes();
+            if (b.Length != 4) return false;
+
+            if (b[0] == 0) return false; // 0.0.0.0/8
+            if (b[0] == 10) return false; // RFC1918
+            if (b[0] == 100 && b[1] >= 64 && b[1] <= 127) return false; // CGNAT 100.64/10
+            if (b[0] == 127) return false; // loopback
+            if (b[0] == 169 && b[1] == 254) return false; // link-local
+            if (b[0] == 172 && b[1] >= 16 && b[1] <= 31) return false; // RFC1918
+            if (b[0] == 192 && b[1] == 168) return false; // RFC1918
+            if (b[0] == 198 && (b[1] == 18 || b[1] == 19)) return false; // benchmark net
+            if (b[0] >= 224) return false; // multicast + reserved
+
+            return true;
+        }
+
+        private static string NormalizeHost(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return string.Empty;
+
+            string s = value.Trim().ToLowerInvariant();
+
+            if (s.StartsWith("[", StringComparison.Ordinal))
+            {
+                int close = s.IndexOf(']');
+                if (close > 1)
+                    s = s.Substring(1, close - 1);
+            }
+            else
+            {
+                int firstColon = s.IndexOf(':');
+                int lastColon = s.LastIndexOf(':');
+                if (firstColon > 0 && firstColon == lastColon)
+                {
+                    string tail = s[(firstColon + 1)..];
+                    if (int.TryParse(tail, out _))
+                        s = s[..firstColon];
+                }
+            }
+
+            if (s.StartsWith("::ffff:", StringComparison.Ordinal))
+                s = s[7..];
+
+            return s;
         }
 
         private static void RaisePeerListChanged()

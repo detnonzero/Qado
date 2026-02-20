@@ -22,7 +22,7 @@ namespace Qado.Networking
         private static readonly TimeSpan NoPeersBaseDelay = TimeSpan.FromSeconds(6);
         private static readonly TimeSpan NoTipBaseDelay = TimeSpan.FromSeconds(10);
         private static readonly TimeSpan CatchupStallBaseDelay = TimeSpan.FromSeconds(4);
-        private static readonly TimeSpan InSyncBaseDelay = TimeSpan.FromSeconds(30);
+        private static readonly TimeSpan InSyncBaseDelay = TimeSpan.FromSeconds(10);
         private static readonly TimeSpan CoolingDownBaseDelay = TimeSpan.FromSeconds(30);
         private static readonly TimeSpan MaxIdleDelay = TimeSpan.FromMinutes(2);
         private const int MaxIdleBackoffShift = 4; // up to 16x base delay
@@ -83,140 +83,152 @@ namespace Qado.Networking
                         var myHs = BuildHandshakePayload(DefaultP2PPort);
                         await WriteFrame(ns, MsgType.Handshake, myHs, ct).ConfigureAwait(false);
 
-                        await WriteFrame(ns, MsgType.GetTip, Array.Empty<byte>(), ct).ConfigureAwait(false);
-                        var (tipOk, remoteHeight, remoteTipHash) = await WaitForTipAsync(ns, client, log, ct).ConfigureAwait(false);
-                        if (!tipOk)
+                        bool handshakeValidated = false;
+                        while (!ct.IsCancellationRequested)
                         {
-                            PeerFailTracker.ReportFailure(peerKey);
-                            log?.Warn("BlockSync", "Peer did not provide a valid TIP.");
-                            continue;
-                        }
+                            await WriteFrame(ns, MsgType.GetTip, Array.Empty<byte>(), ct).ConfigureAwait(false);
+                            var (tipOk, remoteHeight, remoteTipHash, hsNowValidated) =
+                                await WaitForTipAsync(ns, client, log, ct, handshakeAlreadyValidated: handshakeValidated).ConfigureAwait(false);
+                            handshakeValidated = hsNowValidated;
 
-                        PeerFailTracker.ReportSuccess(peerKey);
-                        sawValidTip = true;
-
-                        ulong localHeight = GetCanonicalTipHeight();
-                        if (remoteHeight <= localHeight)
-                        {
-                            log?.Info("BlockSync", $"Already up-to-date (local={localHeight}, remote={remoteHeight}).");
-                            if (remoteTipHash is { Length: 32 })
+                            if (!tipOk)
                             {
-                                try { ChainSelector.MaybeAdoptNewTip(remoteTipHash, log); } catch { }
-                            }
-                            continue;
-                        }
-
-                        sawPeerAhead = true;
-
-                        ulong ancestor = await FindCommonAncestorAsync(ns, remoteHeight, localHeight, log, ct).ConfigureAwait(false);
-                        log?.Info("BlockSync", $"Common ancestor at h={ancestor}. Sync {ancestor + 1}..{remoteHeight}");
-
-                        byte[] expectedPrevHash = await GetAncestorHashAsync(ns, ancestor, log, ct).ConfigureAwait(false);
-                        byte[]? downloadedTipHash = null;
-
-                        for (ulong h = ancestor + 1; h <= remoteHeight; h++)
-                        {
-                            if (ct.IsCancellationRequested) return;
-
-                            var req = new byte[8];
-                            BinaryPrimitives.WriteUInt64LittleEndian(req, h);
-
-                            await WriteFrame(ns, MsgType.GetBlock, req, ct).ConfigureAwait(false);
-
-                            var blk = await WaitForBlockAtStrictAsync(ns, h, expectedPrevHash, log, ct).ConfigureAwait(false);
-                            if (blk == null)
-                            {
-                                log?.Warn("BlockSync", $"Failed to fetch/validate block h={h}.");
+                                PeerFailTracker.ReportFailure(peerKey);
+                                log?.Warn("BlockSync", "Peer did not provide a valid TIP.");
                                 break;
                             }
 
-                            blk.BlockHeight = h;
-                            EnsureCanonicalBlockHash(blk);
-                            if (!BlockValidator.ValidateNetworkSideBlockStateless(blk, out var reason))
-                            {
-                                log?.Warn("BlockSync", $"Fetched block h={h} failed validation: {reason}");
-                                break;
-                            }
+                            PeerFailTracker.ReportSuccess(peerKey);
+                            sawValidTip = true;
 
-                            try
+                            ulong localHeight = GetCanonicalTipHeight();
+                            if (remoteHeight <= localHeight)
                             {
-                                var txOffsets = ComputeTxOffsets(blk);
-
-                                lock (Db.Sync)
+                                log?.Info("BlockSync", $"Already up-to-date (local={localHeight}, remote={remoteHeight}).");
+                                if (remoteTipHash is { Length: 32 })
                                 {
-                                    using var trx = Db.Connection!.BeginTransaction();
-
-                                    BlockStore.SaveBlock(blk, trx);
-
-                                    for (int i = 0; i < txOffsets.Length; i++)
-                                    {
-                                        var (id, off, size) = txOffsets[i];
-                                        TxIndexStore.Insert(id, blk.BlockHash!, blk.BlockHeight, off, size, trx);
-                                    }
-
-                                    trx.Commit();
+                                    try { ChainSelector.MaybeAdoptNewTip(remoteTipHash, log); } catch { }
                                 }
-                            }
-                            catch (Exception ex)
-                            {
-                                log?.Warn("BlockSync", $"Store h={h} failed: {ex.Message}");
                                 break;
                             }
 
-                            expectedPrevHash = blk.BlockHash!;
-                            downloadedTipHash = blk.BlockHash!;
+                            sawPeerAhead = true;
 
-                            var after = GetLatestHeightDirect();
-                            log?.Info("BlockSync", $"Synced {h}/{remoteHeight} (dbMax={after})");
+                            ulong ancestor = await FindCommonAncestorAsync(ns, remoteHeight, localHeight, log, ct).ConfigureAwait(false);
+                            log?.Info("BlockSync", $"Common ancestor at h={ancestor}. Sync {ancestor + 1}..{remoteHeight}");
 
-                            if (after < h)
+                            byte[] expectedPrevHash = await GetAncestorHashAsync(ns, ancestor, log, ct).ConfigureAwait(false);
+                            byte[]? downloadedTipHash = null;
+
+                            for (ulong h = ancestor + 1; h <= remoteHeight; h++)
                             {
-                                log?.Error("BlockSync",
-                                    $"DB did not retain inserts: after commit MAX(height)={after}, expected >= {h}.");
-                                break;
+                                if (ct.IsCancellationRequested) return;
+
+                                var req = new byte[8];
+                                BinaryPrimitives.WriteUInt64LittleEndian(req, h);
+
+                                await WriteFrame(ns, MsgType.GetBlock, req, ct).ConfigureAwait(false);
+
+                                var blk = await WaitForBlockAtStrictAsync(ns, h, expectedPrevHash, log, ct).ConfigureAwait(false);
+                                if (blk == null)
+                                {
+                                    log?.Warn("BlockSync", $"Failed to fetch/validate block h={h}.");
+                                    break;
+                                }
+
+                                blk.BlockHeight = h;
+                                EnsureCanonicalBlockHash(blk);
+                                if (!BlockValidator.ValidateNetworkSideBlockStateless(blk, out var reason))
+                                {
+                                    log?.Warn("BlockSync", $"Fetched block h={h} failed validation: {reason}");
+                                    break;
+                                }
+
+                                try
+                                {
+                                    var txOffsets = ComputeTxOffsets(blk);
+
+                                    lock (Db.Sync)
+                                    {
+                                        using var trx = Db.Connection!.BeginTransaction();
+
+                                        BlockStore.SaveBlock(blk, trx);
+
+                                        for (int i = 0; i < txOffsets.Length; i++)
+                                        {
+                                            var (id, off, size) = txOffsets[i];
+                                            TxIndexStore.Insert(id, blk.BlockHash!, blk.BlockHeight, off, size, trx);
+                                        }
+
+                                        trx.Commit();
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    log?.Warn("BlockSync", $"Store h={h} failed: {ex.Message}");
+                                    break;
+                                }
+
+                                expectedPrevHash = blk.BlockHash!;
+                                downloadedTipHash = blk.BlockHash!;
+
+                                var after = GetLatestHeightDirect();
+                                log?.Info("BlockSync", $"Synced {h}/{remoteHeight} (dbMax={after})");
+
+                                if (after < h)
+                                {
+                                    log?.Error("BlockSync",
+                                        $"DB did not retain inserts: after commit MAX(height)={after}, expected >= {h}.");
+                                    break;
+                                }
+
+                                if (after > lastHeight) { madeProgress = true; lastHeight = after; }
                             }
 
-                            if (after > lastHeight) { madeProgress = true; lastHeight = after; }
-                        }
-
-                        var downloadedNow = GetLatestHeightDirect();
-                        if (downloadedNow >= remoteHeight)
-                        {
-                            log?.Info("BlockSync", "Download done -> consider adoption ...");
-
-                            if (downloadedTipHash is { Length: 32 } && remoteTipHash is { Length: 32 } &&
-                                !BytesEqual(downloadedTipHash, remoteTipHash))
+                            var downloadedNow = GetLatestHeightDirect();
+                            if (downloadedNow >= remoteHeight)
                             {
-                                log?.Warn("BlockSync", "Peer TIP hash mismatched downloaded chain tip. Using downloaded tip for adoption.");
+                                log?.Info("BlockSync", "Download done -> consider adoption ...");
+
+                                if (downloadedTipHash is { Length: 32 } && remoteTipHash is { Length: 32 } &&
+                                    !BytesEqual(downloadedTipHash, remoteTipHash))
+                                {
+                                    log?.Warn("BlockSync", "Peer TIP hash mismatched downloaded chain tip. Using downloaded tip for adoption.");
+                                }
+
+                                var candidateTip = downloadedTipHash ?? remoteTipHash;
+                                if (candidateTip is { Length: 32 })
+                                {
+                                    try { ChainSelector.MaybeAdoptNewTip(candidateTip, log); } catch { }
+                                }
+
+                                var canonNow = GetCanonicalTipHeight();
+                                var canonTipHash = BlockStore.GetCanonicalHashAtHeight(canonNow);
+                                bool canonHeightOk = canonNow >= remoteHeight;
+                                bool canonTipOk = candidateTip is not { Length: 32 } ||
+                                                  (canonTipHash is { Length: 32 } && BytesEqual(canonTipHash, candidateTip));
+
+                                if (canonHeightOk && canonTipOk)
+                                {
+                                    log?.Info("BlockSync",
+                                        $"Canonical sync complete (canon={canonNow}, remote={remoteHeight}).");
+                                    TryNotifyUiRefresh();
+
+                                    // The remote tip may have advanced while we were downloading.
+                                    // Re-query tip immediately on the same session and continue catch-up if needed.
+                                    continue;
+                                }
+
+                                log?.Warn("BlockSync",
+                                    $"Canonical sync incomplete after adoption (canon={canonNow}, remote={remoteHeight}). Retrying ...");
+                            }
+                            else
+                            {
+                                log?.Warn("BlockSync",
+                                    $"Download incomplete (dbMax={downloadedNow}, remote={remoteHeight}). Retrying ...");
                             }
 
-                            var candidateTip = downloadedTipHash ?? remoteTipHash;
-                            if (candidateTip is { Length: 32 })
-                            {
-                                try { ChainSelector.MaybeAdoptNewTip(candidateTip, log); } catch { }
-                            }
-
-                            var canonNow = GetCanonicalTipHeight();
-                            var canonTipHash = BlockStore.GetCanonicalHashAtHeight(canonNow);
-                            bool canonHeightOk = canonNow >= remoteHeight;
-                            bool canonTipOk = candidateTip is not { Length: 32 } ||
-                                              (canonTipHash is { Length: 32 } && BytesEqual(canonTipHash, candidateTip));
-
-                            if (canonHeightOk && canonTipOk)
-                            {
-                                log?.Info("BlockSync",
-                                    $"Canonical sync complete (canon={canonNow}, remote={remoteHeight}).");
-                                TryNotifyUiRefresh();
-                                break;
-                            }
-
-                            log?.Warn("BlockSync",
-                                $"Canonical sync incomplete after adoption (canon={canonNow}, remote={remoteHeight}). Retrying ...");
-                        }
-                        else
-                        {
-                            log?.Warn("BlockSync",
-                                $"Download incomplete (dbMax={downloadedNow}, remote={remoteHeight}). Retrying ...");
+                            break;
                         }
                     }
                     catch (Exception ex)
@@ -579,11 +591,15 @@ namespace Qado.Networking
             return true;
         }
 
-        private static async Task<(bool ok, ulong height, byte[]? hash)> WaitForTipAsync(
-            NetworkStream ns, TcpClient client, ILogSink? log, CancellationToken ct)
+        private static async Task<(bool ok, ulong height, byte[]? hash, bool handshakeValidated)> WaitForTipAsync(
+            NetworkStream ns,
+            TcpClient client,
+            ILogSink? log,
+            CancellationToken ct,
+            bool handshakeAlreadyValidated = false)
         {
             var deadline = DateTime.UtcNow + FrameTimeout;
-            bool handshakeValidated = false;
+            bool handshakeValidated = handshakeAlreadyValidated;
 
             while (DateTime.UtcNow < deadline)
             {
@@ -593,7 +609,7 @@ namespace Qado.Networking
                 if (fr.type == MsgType.Handshake)
                 {
                     if (!TryRecordPeerFromHandshake(fr.payload, client, log))
-                        return (false, 0, null);
+                        return (false, 0, null, handshakeValidated);
                     handshakeValidated = true;
                     continue;
                 }
@@ -606,14 +622,14 @@ namespace Qado.Networking
                         continue;
                     }
 
-                    if (fr.payload.Length < 8) return (false, 0, null);
+                    if (fr.payload.Length < 8) return (false, 0, null, handshakeValidated);
                     ulong h = BinaryPrimitives.ReadUInt64LittleEndian(fr.payload.AsSpan(0, 8));
                     byte[]? hash = fr.payload.Length >= 40 ? fr.payload.AsSpan(8, 32).ToArray() : null;
-                    return (true, h, hash);
+                    return (true, h, hash, handshakeValidated);
                 }
             }
 
-            return (false, 0, null);
+            return (false, 0, null, handshakeValidated);
         }
 
         private static void EnsureCanonicalBlockHash(Block block)

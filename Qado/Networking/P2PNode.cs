@@ -602,6 +602,7 @@ namespace Qado.Networking
                 {
                     PeerFailTracker.ReportFailure(GetBanKey(s));
                     _log?.Warn("P2P", "Block rejected: prev block not known (out of order).");
+                    BlockSyncStarter.RequestImmediateSync(_log, "out-of-order block (missing prev)");
                     return;
                 }
             }
