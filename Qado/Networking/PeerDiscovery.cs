@@ -57,9 +57,10 @@ namespace Qado.Networking
                     int port = portU16;
                     if (port <= 0) port = DefaultP2PPort;
 
-                    if (!IsValidIPv4Literal(ip)) continue;
+                    if (!IsPublicRoutableIPv4Literal(ip)) continue;
                     if (port is < 1 or > 65535) continue;
                     if (SelfPeerGuard.IsSelf(ip, port)) continue;
+                    if (IsConfiguredSeed(ip, port)) continue;
 
                     try
                     {
@@ -90,11 +91,13 @@ namespace Qado.Networking
             ushort count = 0;
             foreach (var (ip, port, _) in peers)
             {
-                if (!IsValidIPv4Literal(ip)) continue;
+                if (!IsPublicRoutableIPv4Literal(ip)) continue;
 
                 int p = port;
                 if (p <= 0) p = DefaultP2PPort;
                 if (p is < 1 or > 65535) continue;
+                if (SelfPeerGuard.IsSelf(ip, p)) continue;
+                if (IsConfiguredSeed(ip, p)) continue;
 
                 var ipBytes = Encoding.UTF8.GetBytes(ip);
                 if (ipBytes.Length == 0 || ipBytes.Length > byte.MaxValue) continue;
@@ -141,11 +144,44 @@ namespace Qado.Networking
             return BinaryPrimitives.ReadUInt16LittleEndian(payload.AsSpan(0, 2));
         }
 
-        private static bool IsValidIPv4Literal(string ip)
+        private static bool IsPublicRoutableIPv4Literal(string ip)
         {
             if (string.IsNullOrWhiteSpace(ip)) return false;
             if (!IPAddress.TryParse(ip, out var a)) return false;
-            return a.AddressFamily == AddressFamily.InterNetwork;
+            if (a.AddressFamily != AddressFamily.InterNetwork) return false;
+
+            var b = a.GetAddressBytes();
+            if (b.Length != 4) return false;
+
+            // Exclude non-routable and special-purpose ranges.
+            if (b[0] == 0) return false; // 0.0.0.0/8
+            if (b[0] == 10) return false; // RFC1918
+            if (b[0] == 100 && b[1] >= 64 && b[1] <= 127) return false; // CGNAT 100.64/10
+            if (b[0] == 127) return false; // loopback
+            if (b[0] == 169 && b[1] == 254) return false; // link-local
+            if (b[0] == 172 && b[1] >= 16 && b[1] <= 31) return false; // RFC1918
+            if (b[0] == 192 && b[1] == 168) return false; // RFC1918
+            if (b[0] == 198 && (b[1] == 18 || b[1] == 19)) return false; // benchmark net
+            if (b[0] >= 224) return false; // multicast + reserved (incl. broadcast)
+
+            return true;
+        }
+
+        private static bool IsConfiguredSeed(string ip, int port)
+        {
+            if (port != GenesisConfig.P2PPort) return false;
+
+            var seed = NormalizeHost(GenesisConfig.GenesisHost);
+            if (seed.Length == 0) return false;
+
+            return string.Equals(NormalizeHost(ip), seed, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string NormalizeHost(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return string.Empty;
+            var s = value.Trim().ToLowerInvariant();
+            return s.StartsWith("::ffff:", StringComparison.Ordinal) ? s[7..] : s;
         }
 
         private static bool Skip(byte[] payload, ref int idx, int bytes)

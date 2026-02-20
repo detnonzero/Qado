@@ -17,13 +17,14 @@ namespace Qado.Networking
             var node = new P2PNode(mempool, log);
             node.Start(GenesisConfig.P2PPort, ct);
 
-            _ = node.ConnectKnownPeersAsync(ct);
+            _ = node.ConnectSeedAndKnownPeersAsync(ct);
 
             _ = Task.Run(() => BlockSyncStarter.StartAsync(mempool, log, ct), ct);
 
             node.StartPeerExchangeLoop(ct);
+            node.StartReconnectLoop(ct);
 
-            log?.Info("Bootstrap", "P2P started, known peers dialed (if any), blocksync triggered.");
+            log?.Info("Bootstrap", "P2P started, seed+known peers dialed, reconnect + blocksync triggered.");
             return Task.FromResult(node);
         }
     }

@@ -23,6 +23,9 @@ namespace Qado.Networking
         public const int DefaultPort = GenesisConfig.P2PPort;
         private const int MaxFramePayloadBytes = ConsensusRules.MaxBlockSizeBytes;
         private const int MaxSessions = 128;
+        private static readonly TimeSpan ReconnectWhenDisconnectedDelay = TimeSpan.FromSeconds(8);
+        private static readonly TimeSpan ReconnectSteadyDelay = TimeSpan.FromSeconds(25);
+        private const double ReconnectJitterFraction = 0.20;
 
         public static P2PNode? Instance { get; private set; }
 
@@ -32,6 +35,7 @@ namespace Qado.Networking
         private TcpListener? _listener;
         private int _listenPort = DefaultPort;
         private int _stopped;
+        private int _reconnectLoopStarted;
 
         private readonly byte[] _nodeId;
         private readonly ConcurrentDictionary<string, Session> _sessions = new(StringComparer.Ordinal);
@@ -75,6 +79,7 @@ namespace Qado.Networking
 
             try { _listener?.Stop(); } catch { }
             _listener = null;
+            Interlocked.Exchange(ref _reconnectLoopStarted, 0);
 
             foreach (var kv in _sessions)
             {
@@ -145,13 +150,39 @@ namespace Qado.Networking
             }
         }
 
-        public async Task ConnectKnownPeersAsync(CancellationToken ct = default)
+        public async Task ConnectSeedAndKnownPeersAsync(CancellationToken ct = default, int maxKnownPeers = 16)
         {
+            if (Volatile.Read(ref _stopped) != 0) return;
+            if (ct.IsCancellationRequested) return;
+
+            int seedPort = DefaultPort;
+            TryRememberSeedEndpointNoThrow(GenesisConfig.GenesisHost, seedPort);
+
+            if (!SelfPeerGuard.IsSelf(GenesisConfig.GenesisHost, seedPort) &&
+                !IsPeerConnected(GenesisConfig.GenesisHost, seedPort))
+            {
+                await ConnectAsync(GenesisConfig.GenesisHost, seedPort, ct).ConfigureAwait(false);
+            }
+
+            await ConnectKnownPeersAsync(ct, maxAttempts: maxKnownPeers).ConfigureAwait(false);
+        }
+
+        public async Task ConnectKnownPeersAsync(CancellationToken ct = default, int maxAttempts = int.MaxValue)
+        {
+            int attempts = 0;
             foreach (var (ip, port) in GetPeersFromDb())
             {
                 if (ct.IsCancellationRequested) return;
+                int p = port <= 0 ? DefaultPort : port;
+
+                if (SelfPeerGuard.IsSelf(ip, p)) continue;
+                if (IsPeerConnected(ip, p)) continue;
                 if (PeerFailTracker.ShouldBan(ip)) continue;
-                await ConnectAsync(ip, port <= 0 ? DefaultPort : port, ct).ConfigureAwait(false);
+
+                await ConnectAsync(ip, p, ct).ConfigureAwait(false);
+
+                attempts++;
+                if (attempts >= maxAttempts) return;
             }
         }
 
@@ -174,6 +205,33 @@ namespace Qado.Networking
                     catch { }
 
                     try { await Task.Delay(TimeSpan.FromMinutes(2), ct).ConfigureAwait(false); } catch { }
+                }
+            }, ct);
+        }
+
+        public void StartReconnectLoop(CancellationToken ct)
+        {
+            if (Interlocked.Exchange(ref _reconnectLoopStarted, 1) != 0)
+                return;
+
+            _ = Task.Run(async () =>
+            {
+                while (!ct.IsCancellationRequested && Volatile.Read(ref _stopped) == 0)
+                {
+                    try
+                    {
+                        await ConnectSeedAndKnownPeersAsync(ct).ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                    }
+
+                    var baseDelay = HasAnyHandshakePeerConnected()
+                        ? ReconnectSteadyDelay
+                        : ReconnectWhenDisconnectedDelay;
+
+                    var delay = ApplyReconnectJitter(baseDelay);
+                    try { await Task.Delay(delay, ct).ConfigureAwait(false); } catch { }
                 }
             }, ct);
         }
@@ -814,6 +872,55 @@ namespace Qado.Networking
             }
 
             return list;
+        }
+
+        private bool HasAnyHandshakePeerConnected()
+        {
+            foreach (var kv in _sessions)
+            {
+                if (kv.Value.HandshakeOk)
+                    return true;
+            }
+            return false;
+        }
+
+        private static TimeSpan ApplyReconnectJitter(TimeSpan baseDelay)
+        {
+            if (baseDelay <= TimeSpan.Zero || ReconnectJitterFraction <= 0)
+                return baseDelay;
+
+            double delta = (Random.Shared.NextDouble() * 2.0 - 1.0) * ReconnectJitterFraction;
+            double factor = 1.0 + delta;
+            long ticks = (long)(baseDelay.Ticks * factor);
+
+            long minTicks = TimeSpan.FromSeconds(1).Ticks;
+            if (ticks < minTicks) ticks = minTicks;
+
+            return TimeSpan.FromTicks(ticks);
+        }
+
+        private static void TryRememberSeedEndpointNoThrow(string hostOrIp, int port)
+        {
+            if (string.IsNullOrWhiteSpace(hostOrIp)) return;
+            if (port <= 0 || port > 65535) return;
+
+            try
+            {
+                string normalized = NormalizeBanKey(hostOrIp);
+                if (normalized.StartsWith("::ffff:", StringComparison.Ordinal))
+                    normalized = normalized[7..];
+
+                if (!IPAddress.TryParse(normalized, out var addr)) return;
+                if (addr.AddressFamily != AddressFamily.InterNetwork) return;
+
+                string ip = addr.ToString();
+                if (SelfPeerGuard.IsSelf(ip, port)) return;
+
+                PeerStore.MarkSeen(ip, port, (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds(), GenesisConfig.NetworkId);
+            }
+            catch
+            {
+            }
         }
 
 
