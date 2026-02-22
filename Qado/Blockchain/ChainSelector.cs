@@ -1,15 +1,24 @@
 using System;
 using System.Collections.Generic;
+using System.Threading.Tasks;
 using System.Windows;
 using Microsoft.Data.Sqlite;
 using Qado.Logging;
+using Qado.Mempool;
+using Qado.Networking;
 using Qado.Storage;
+using Qado.Utils;
 
 namespace Qado.Blockchain
 {
     public static class ChainSelector
     {
-        public static void MaybeAdoptNewTip(byte[] candidateTipHash, ILogSink? log = null)
+        private const int MaxReorgRequeueGossipPerAdoption = 512;
+        private const int ReorgRequeueGossipBurstSize = 16;
+        private static readonly TimeSpan ReorgRequeueGossipPause = TimeSpan.FromMilliseconds(20);
+        private static readonly LruSet ReorgRequeueGossipSeen = new(capacity: 200_000, ttl: TimeSpan.FromMinutes(30));
+
+        public static void MaybeAdoptNewTip(byte[] candidateTipHash, ILogSink? log = null, MempoolManager? mempool = null)
         {
             if (candidateTipHash is not { Length: 32 })
                 return;
@@ -58,7 +67,8 @@ namespace Qado.Blockchain
 
             ulong rollbackTop = canonTipHeight;
 
-            List<Block> newBlocksAsc;
+            List<Block> newBlocksAsc = new();
+            List<Block> oldBlocksDesc = new();
 
             lock (Db.Sync)
             {
@@ -78,6 +88,8 @@ namespace Qado.Blockchain
                         tx.Rollback();
                         return;
                     }
+
+                    _ = TryPrefetchBlocksDescending(oldCanonDesc, out oldBlocksDesc, log);
 
                     for (int i = 0; i < oldCanonDesc.Count; i++)
                         StateUndoStore.RollbackBlock(oldCanonDesc[i], tx);
@@ -101,6 +113,20 @@ namespace Qado.Blockchain
                     log?.Error("ChainSel", $"Atomic adoption failed: {ex.Message}");
                     TryNotifyUiReload();
                     return;
+                }
+            }
+
+            if (mempool != null)
+            {
+                try
+                {
+                    var recon = mempool.ReconcileAfterReorg(oldBlocksDesc, newBlocksAsc);
+                    if (recon.RequeuedTransactions is { Count: > 0 })
+                        TriggerReorgRequeueGossip(recon.RequeuedTransactions, log);
+                }
+                catch (Exception ex)
+                {
+                    log?.Warn("ChainSel", $"Mempool reconcile after reorg failed: {ex.Message}");
                 }
             }
 
@@ -134,6 +160,33 @@ namespace Qado.Blockchain
 
                 if (h == fromHeight) break;
                 h--;
+            }
+
+            return true;
+        }
+
+        private static bool TryPrefetchBlocksDescending(
+            List<byte[]> hashesDesc,
+            out List<Block> blocksDesc,
+            ILogSink? log)
+        {
+            blocksDesc = new List<Block>(hashesDesc.Count);
+
+            for (int i = 0; i < hashesDesc.Count; i++)
+            {
+                var h = hashesDesc[i];
+                if (h is not { Length: 32 }) continue;
+
+                var b = BlockStore.GetBlockByHash(h);
+                if (b == null)
+                {
+                    log?.Warn("ChainSel", $"Missing old canonical block payload ({ToHex(h, 16)}).");
+                    blocksDesc.Clear();
+                    return false;
+                }
+
+                b.BlockHash = (byte[])h.Clone();
+                blocksDesc.Add(b);
             }
 
             return true;
@@ -308,6 +361,80 @@ namespace Qado.Blockchain
             }
 
             return byHeight.Count > 0;
+        }
+
+        private static void TriggerReorgRequeueGossip(IReadOnlyList<Transaction> requeuedTxs, ILogSink? log)
+        {
+            if (requeuedTxs == null || requeuedTxs.Count == 0)
+                return;
+
+            _ = Task.Run(async () =>
+            {
+                var node = P2PNode.Instance;
+                if (node == null)
+                    return;
+
+                int sent = 0;
+                int deduped = 0;
+                int skipped = 0;
+
+                int limit = Math.Min(requeuedTxs.Count, MaxReorgRequeueGossipPerAdoption);
+                for (int i = 0; i < limit; i++)
+                {
+                    var tx = requeuedTxs[i];
+                    if (tx == null)
+                    {
+                        skipped++;
+                        continue;
+                    }
+
+                    byte[] txid;
+                    try
+                    {
+                        txid = tx.ComputeTransactionHash();
+                    }
+                    catch
+                    {
+                        skipped++;
+                        continue;
+                    }
+
+                    if (txid is not { Length: 32 })
+                    {
+                        skipped++;
+                        continue;
+                    }
+
+                    if (!ReorgRequeueGossipSeen.TryAdd(txid))
+                    {
+                        deduped++;
+                        continue;
+                    }
+
+                    try
+                    {
+                        await node.BroadcastTxAsync(tx).ConfigureAwait(false);
+                        sent++;
+                    }
+                    catch
+                    {
+                        skipped++;
+                        continue;
+                    }
+
+                    if (sent > 0 && (sent % ReorgRequeueGossipBurstSize) == 0)
+                    {
+                        try { await Task.Delay(ReorgRequeueGossipPause).ConfigureAwait(false); } catch { }
+                    }
+                }
+
+                int capped = requeuedTxs.Count > MaxReorgRequeueGossipPerAdoption
+                    ? (requeuedTxs.Count - MaxReorgRequeueGossipPerAdoption)
+                    : 0;
+
+                log?.Info("Gossip",
+                    $"Reorg requeue gossip: sent={sent}, deduped={deduped}, skipped={skipped}, capped={capped}, total={requeuedTxs.Count}");
+            });
         }
 
         private static ulong FindFirstDivergingHeight(ulong candTipHeight, Dictionary<ulong, byte[]> candByHeight)

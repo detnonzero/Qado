@@ -283,7 +283,7 @@ namespace Qado.CodeBehindHelper
 
                 if (!extendedCanon)
                 {
-                    try { ChainSelector.MaybeAdoptNewTip(block.BlockHash!, logSink); }
+                    try { ChainSelector.MaybeAdoptNewTip(block.BlockHash!, logSink, mempool); }
                     catch { }
                 }
 

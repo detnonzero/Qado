@@ -17,7 +17,7 @@ namespace Qado.Storage
         public static readonly int MaxPortsPerIp = ReadIntEnv("QADO_PEERS_MAX_PORTS_PER_IP", fallback: 4, min: 1, max: 32);
         public static readonly int MaxPeersTotal = ReadIntEnv("QADO_PEERS_MAX_TOTAL", fallback: 5_000, min: 500, max: 200_000);
         public static readonly ulong PeerTtlSeconds =
-            (ulong)ReadIntEnv("QADO_PEERS_TTL_DAYS", fallback: 21, min: 1, max: 365) * 24UL * 60UL * 60UL;
+            (ulong)ReadIntEnv("QADO_PEERS_TTL_DAYS", fallback: 1, min: 1, max: 365) * 24UL * 60UL * 60UL;
 
         public static void Upsert(byte[] id, string ip, int port, ulong lastSeen, byte[]? pubkey, SqliteTransaction? tx = null)
         {
@@ -70,6 +70,39 @@ namespace Qado.Storage
 
         public static void MarkSeen(string ip, int port, ulong lastSeen, byte networkId, SqliteTransaction? tx = null)
             => UpsertByEndpoint(ip, port, lastSeen, networkId, tx);
+
+        // Announce-only insert from PEX. Does not update last_seen for existing entries.
+        public static bool AnnouncePeer(string ip, int port, SqliteTransaction? tx = null)
+            => AnnouncePeer(ip, port, networkId: GenesisConfig.NetworkId, tx);
+
+        // Returns true only when a new peer row was created.
+        public static bool AnnouncePeer(string ip, int port, byte networkId, SqliteTransaction? tx = null)
+        {
+            if (string.IsNullOrWhiteSpace(ip) || port <= 0) return false;
+            if (!IsPublicRoutableIPv4Literal(ip)) return false;
+            if (SelfPeerGuard.IsSelf(ip, port)) return false;
+
+            byte[] id = ComputeEndpointId(networkId, ip, port);
+
+            if (tx != null)
+            {
+                bool inserted = InsertAnnouncedIfMissingCore(tx.Connection!, tx, id, ip, port);
+                EnforcePerIpPortCapCore(tx.Connection!, tx, ip);
+                return inserted;
+            }
+
+            bool insertedNow;
+            lock (Db.Sync)
+            {
+                insertedNow = InsertAnnouncedIfMissingCore(Db.Connection, null, id, ip, port);
+                EnforcePerIpPortCapCore(Db.Connection, null, ip);
+            }
+
+            if (insertedNow)
+                RaisePeerListChanged();
+
+            return insertedNow;
+        }
 
         public static void PruneAndEnforceLimits(ulong? nowUnix = null, SqliteTransaction? tx = null)
         {
@@ -146,6 +179,27 @@ ON CONFLICT(id) DO UPDATE SET
             cmd.ExecuteNonQuery();
         }
 
+        private static bool InsertAnnouncedIfMissingCore(
+            SqliteConnection conn,
+            SqliteTransaction? tx,
+            byte[] id,
+            string ip,
+            int port)
+        {
+            const string sql = @"
+INSERT INTO peers(id,ip,port,last_seen,pubkey)
+VALUES($i,$ip,$p,0,NULL)
+ON CONFLICT(id) DO NOTHING;";
+
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = sql;
+            cmd.Parameters.AddWithValue("$i", id);
+            cmd.Parameters.AddWithValue("$ip", ip);
+            cmd.Parameters.AddWithValue("$p", port);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+
         private static void EnforcePerIpPortCapCore(SqliteConnection conn, SqliteTransaction? tx, string ip)
         {
             const string sql = @"
@@ -169,7 +223,7 @@ WHERE ip = $ip
 
         private static void PruneAndEnforceLimitsCore(SqliteConnection conn, SqliteTransaction? tx, long cutoff)
         {
-            const string delExpiredSql = "DELETE FROM peers WHERE last_seen < $cutoff;";
+            const string delExpiredSql = "DELETE FROM peers WHERE last_seen > 0 AND last_seen < $cutoff;";
             const string trimGlobalSql = @"
 DELETE FROM peers
 WHERE id NOT IN (

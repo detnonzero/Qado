@@ -2,12 +2,13 @@ using System;
 using Microsoft.Data.Sqlite;
 using Qado.Blockchain;
 using Qado.Logging;
+using Qado.Mempool;
 
 namespace Qado.Storage
 {
     public static class BlockPersistHelper
     {
-        public static void Persist(Block block, ILogSink? log = null)
+        public static void Persist(Block block, ILogSink? log = null, MempoolManager? mempool = null)
         {
             if (block == null) throw new ArgumentNullException(nameof(block));
             EnsureBlockHash(block);
@@ -36,7 +37,7 @@ namespace Qado.Storage
 
             if (!canonExtended)
             {
-                try { ChainSelector.MaybeAdoptNewTip(block.BlockHash!, log); }
+                try { ChainSelector.MaybeAdoptNewTip(block.BlockHash!, log, mempool); }
                 catch (Exception ex) { log?.Warn("Persist", $"ChainSelector adoption failed: {ex.Message}"); }
             }
         }

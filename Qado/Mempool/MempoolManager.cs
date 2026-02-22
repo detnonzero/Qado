@@ -20,6 +20,29 @@ namespace Qado.Mempool
 
         private static readonly ConcurrentDictionary<string, int> _pendingBySender = new(StringComparer.Ordinal);
 
+        public readonly struct ReorgReconcileResult
+        {
+            public readonly int RemovedIncluded;
+            public readonly int Requeued;
+            public readonly int Rejected;
+            public readonly int PurgedInvalid;
+            public readonly IReadOnlyList<Transaction> RequeuedTransactions;
+
+            public ReorgReconcileResult(
+                int removedIncluded,
+                int requeued,
+                int rejected,
+                int purgedInvalid,
+                IReadOnlyList<Transaction>? requeuedTransactions = null)
+            {
+                RemovedIncluded = removedIncluded;
+                Requeued = requeued;
+                Rejected = rejected;
+                PurgedInvalid = purgedInvalid;
+                RequeuedTransactions = requeuedTransactions ?? Array.Empty<Transaction>();
+            }
+        }
+
         public MempoolManager(
             Func<string, ulong> getBalanceHex,
             Func<string, ulong> getConfirmedNonceHex,
@@ -175,6 +198,89 @@ namespace Qado.Mempool
             }
         }
 
+        public ReorgReconcileResult ReconcileAfterReorg(
+            IReadOnlyList<Block>? oldCanonicalBlocksDesc,
+            IReadOnlyList<Block>? newCanonicalBlocksAsc)
+        {
+            oldCanonicalBlocksDesc ??= Array.Empty<Block>();
+            newCanonicalBlocksAsc ??= Array.Empty<Block>();
+
+            var newTxIds = new HashSet<string>(StringComparer.Ordinal);
+            for (int i = 0; i < newCanonicalBlocksAsc.Count; i++)
+            {
+                var b = newCanonicalBlocksAsc[i];
+                if (b?.Transactions == null) continue;
+
+                for (int t = 1; t < b.Transactions.Count; t++)
+                {
+                    var tx = b.Transactions[t];
+                    if (tx == null) continue;
+                    newTxIds.Add(Hex(tx.ComputeTransactionHash()));
+                }
+            }
+
+            var candidates = new List<Transaction>(256);
+            for (int i = 0; i < oldCanonicalBlocksDesc.Count; i++)
+            {
+                var b = oldCanonicalBlocksDesc[i];
+                if (b?.Transactions == null) continue;
+
+                for (int t = 1; t < b.Transactions.Count; t++)
+                {
+                    var tx = b.Transactions[t];
+                    if (tx == null) continue;
+
+                    var txId = Hex(tx.ComputeTransactionHash());
+                    if (!newTxIds.Contains(txId))
+                        candidates.Add(tx);
+                }
+            }
+
+            candidates.Sort(static (a, b) =>
+            {
+                string sa = Convert.ToHexString(a.Sender).ToLowerInvariant();
+                string sb = Convert.ToHexString(b.Sender).ToLowerInvariant();
+                int sc = string.CompareOrdinal(sa, sb);
+                if (sc != 0) return sc;
+                return a.TxNonce.CompareTo(b.TxNonce);
+            });
+
+            int removedIncluded = 0;
+            var touched = new HashSet<string>(StringComparer.Ordinal);
+            lock (_gate)
+            {
+                for (int i = 0; i < newCanonicalBlocksAsc.Count; i++)
+                    removedIncluded += RemoveIncludedNoLog(newCanonicalBlocksAsc[i], touched);
+
+                foreach (var sender in touched)
+                    ResyncSenderCount_NoThrow(sender);
+            }
+
+            int requeued = 0;
+            int rejected = 0;
+            var requeuedTxs = new List<Transaction>(Math.Min(candidates.Count, 2048));
+            for (int i = 0; i < candidates.Count; i++)
+            {
+                if (TryAddReorgCandidateNoLog(candidates[i]))
+                {
+                    requeued++;
+                    requeuedTxs.Add(candidates[i]);
+                }
+                else
+                    rejected++;
+            }
+
+            int purgedInvalid = PurgeInvalid();
+
+            if (removedIncluded > 0 || requeued > 0 || rejected > 0 || purgedInvalid > 0)
+            {
+                _log?.Info("Mempool",
+                    $"Reorg reconcile: removedIncluded={removedIncluded}, requeued={requeued}, rejected={rejected}, purged={purgedInvalid}");
+            }
+
+            return new ReorgReconcileResult(removedIncluded, requeued, rejected, purgedInvalid, requeuedTxs);
+        }
+
 
         private void ResyncSenderCount_NoThrow(string senderHex)
         {
@@ -200,6 +306,54 @@ namespace Qado.Mempool
             }
             catch { }
         }
+
+        private int RemoveIncludedNoLog(Block block, HashSet<string> touchedSenders)
+        {
+            if (block?.Transactions == null) return 0;
+
+            int removed = 0;
+            for (int i = 0; i < block.Transactions.Count; i++)
+            {
+                var tx = block.Transactions[i];
+                if (tx == null) continue;
+                if (TransactionValidator.IsCoinbase(tx)) continue;
+                if (tx.Sender is not { Length: 32 }) continue;
+
+                string senderHex = Convert.ToHexString(tx.Sender).ToLowerInvariant();
+                if (_buffer.Remove(tx))
+                {
+                    removed++;
+                    touchedSenders.Add(senderHex);
+                }
+            }
+
+            return removed;
+        }
+
+        private bool TryAddReorgCandidateNoLog(Transaction tx)
+        {
+            if (tx is null) return false;
+            if (TransactionValidator.IsCoinbase(tx)) return false;
+            if (!TransactionValidator.ValidateBasic(tx, out _)) return false;
+            if (tx.Sender is not { Length: 32 }) return false;
+
+            string senderHex = Convert.ToHexString(tx.Sender).ToLowerInvariant();
+
+            lock (_gate)
+            {
+                if (_buffer.Count >= MaxMempoolTxCount)
+                {
+                    ResyncSenderCount_NoThrow(senderHex);
+                    return false;
+                }
+
+                bool added = _buffer.Add(tx);
+                ResyncSenderCount_NoThrow(senderHex);
+                return added;
+            }
+        }
+
+        private static string Hex(byte[] data) => Convert.ToHexString(data).ToLowerInvariant();
 
         private static string Short(string hex, int head = 6, int tail = 6)
             => string.IsNullOrEmpty(hex) || hex.Length <= head + tail ? hex : $"{hex[..head]}…{hex[^tail..]}";

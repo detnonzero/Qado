@@ -5,6 +5,7 @@ using System.Linq;
 using System.Security.Cryptography;
 using NSec.Cryptography;
 using Qado.Blockchain;
+using Qado.Mempool;
 using Qado.Networking;
 using Qado.Storage;
 using Qado.Utils;
@@ -30,6 +31,7 @@ internal static class Program
             Run("StateApplier_AcceptsSequentialNonce", TestStateApplierAcceptsSequentialNonce);
             Run("KeyStore_EncryptsAtRest", TestKeyStoreEncryptsAtRest);
             Run("Merkle_DomainSeparation_Profile", TestMerkleDomainSeparationProfile);
+            Run("ChainSelector_Reorg_MempoolReconcile", TestChainSelectorReorgMempoolReconcile);
         }
         catch (Exception ex)
         {
@@ -226,6 +228,87 @@ internal static class Program
         Assert(root3.SequenceEqual(want3), "odd-leaf root mismatch");
     }
 
+    private static void TestChainSelectorReorgMempoolReconcile()
+    {
+        var mempool = new MempoolManager(
+            senderHex => StateStore.GetBalanceU64(senderHex),
+            senderHex => StateStore.GetNonceU64(senderHex),
+            log: null);
+
+        var genesis = BlockStore.GetBlockByHeight(0) ?? throw new InvalidOperationException("missing genesis block");
+        var genesisHash = genesis.BlockHash ?? throw new InvalidOperationException("missing genesis hash");
+
+        var senderResurrect = KeyGenerator.GenerateKeypairHex();
+        var recipientResurrect = KeyGenerator.GenerateKeypairHex();
+        var senderDrop = KeyGenerator.GenerateKeypairHex();
+        var recipientDrop = KeyGenerator.GenerateKeypairHex();
+        var recipientConflict = KeyGenerator.GenerateKeypairHex();
+        var minerA1 = KeyGenerator.GenerateKeypairHex();
+        var minerB1 = KeyGenerator.GenerateKeypairHex();
+        var minerB2 = KeyGenerator.GenerateKeypairHex();
+
+        SeedAccount(senderResurrect.pubHex, balance: 1_000_000UL, nonce: 0UL);
+        SeedAccount(senderDrop.pubHex, balance: 1_000_000UL, nonce: 0UL);
+
+        var txResurrect = BuildSignedTx(
+            senderPrivHex: senderResurrect.privHex,
+            senderPubHex: senderResurrect.pubHex,
+            recipientPubHex: recipientResurrect.pubHex,
+            amount: 25_000UL,
+            fee: 100UL,
+            nonce: 1UL);
+
+        var txDrop = BuildSignedTx(
+            senderPrivHex: senderDrop.privHex,
+            senderPubHex: senderDrop.pubHex,
+            recipientPubHex: recipientDrop.pubHex,
+            amount: 30_000UL,
+            fee: 150UL,
+            nonce: 1UL);
+
+        var a1 = BuildMinedBlock(
+            height: 1,
+            prevHash: genesisHash,
+            timestamp: genesis.Header!.Timestamp + 61UL,
+            minerPubHex: minerA1.pubHex,
+            txs: new[] { txResurrect, txDrop });
+        BlockPersistHelper.Persist(a1, mempool: mempool);
+
+        Assert(!MempoolContainsTx(mempool, txResurrect), "tx should not be pending while canonical");
+        Assert(!MempoolContainsTx(mempool, txDrop), "tx should not be pending while canonical");
+
+        var b1 = BuildMinedBlock(
+            height: 1,
+            prevHash: genesisHash,
+            timestamp: genesis.Header.Timestamp + 62UL,
+            minerPubHex: minerB1.pubHex);
+        BlockPersistHelper.Persist(b1, mempool: mempool);
+
+        var txConflict = BuildSignedTx(
+            senderPrivHex: senderDrop.privHex,
+            senderPubHex: senderDrop.pubHex,
+            recipientPubHex: recipientConflict.pubHex,
+            amount: 12_000UL,
+            fee: 200UL,
+            nonce: 1UL);
+
+        var b2 = BuildMinedBlock(
+            height: 2,
+            prevHash: b1.BlockHash!,
+            timestamp: b1.Header!.Timestamp + 61UL,
+            minerPubHex: minerB2.pubHex,
+            txs: new[] { txConflict });
+        BlockPersistHelper.Persist(b2, mempool: mempool);
+
+        var canonH1 = BlockStore.GetCanonicalHashAtHeight(1) ?? throw new InvalidOperationException("missing canonical h=1");
+        var canonH2 = BlockStore.GetCanonicalHashAtHeight(2) ?? throw new InvalidOperationException("missing canonical h=2");
+        Assert(BytesEqual(canonH1, b1.BlockHash!), "reorg must replace canonical h=1 with side branch block");
+        Assert(BytesEqual(canonH2, b2.BlockHash!), "stronger side-chain must become canonical");
+        Assert(MempoolContainsTx(mempool, txResurrect), "tx from reorged-out block should be requeued");
+        Assert(!MempoolContainsTx(mempool, txDrop), "conflicting tx must not be requeued after reorg");
+        Assert(!MempoolContainsTx(mempool, txConflict), "tx included in new canonical chain must not be in mempool");
+    }
+
     private static Transaction BuildCoinbase(string minerPubHex, ulong amount)
         => new()
         {
@@ -285,6 +368,137 @@ internal static class Program
 
         block.RecomputeAndSetMerkleRoot();
         return block;
+    }
+
+    private static Block BuildMinedBlock(
+        ulong height,
+        byte[] prevHash,
+        ulong timestamp,
+        string minerPubHex,
+        IEnumerable<Transaction>? txs = null)
+    {
+        txs ??= Array.Empty<Transaction>();
+
+        ulong totalFees = 0;
+        var list = new List<Transaction>();
+        foreach (var tx in txs)
+        {
+            if (tx == null) continue;
+            if (TransactionValidator.IsCoinbase(tx))
+                throw new InvalidOperationException("non-coinbase tx list contains coinbase");
+
+            checked { totalFees += tx.Fee; }
+            list.Add(tx);
+        }
+
+        ulong subsidy = RewardCalculator.GetBlockSubsidy(height);
+        ulong coinbaseAmount = checked(subsidy + totalFees);
+
+        var blockTxs = new List<Transaction>(1 + list.Count)
+        {
+            BuildCoinbase(minerPubHex, coinbaseAmount)
+        };
+        blockTxs.AddRange(list);
+
+        var target = ComputeExpectedTargetForHeight(height, prevHash);
+
+        var block = new Block
+        {
+            BlockHeight = height,
+            Header = new BlockHeader
+            {
+                Version = 1,
+                PreviousBlockHash = (byte[])prevHash.Clone(),
+                MerkleRoot = new byte[32],
+                Timestamp = timestamp,
+                Target = target,
+                Nonce = 0,
+                Miner = Convert.FromHexString(minerPubHex)
+            },
+            Transactions = blockTxs,
+            BlockHash = new byte[32]
+        };
+
+        block.RecomputeAndSetMerkleRoot();
+        MineBlockInPlace(block);
+
+        if (!BlockValidator.ValidateNetworkSideBlockStateless(block, out var reason))
+            throw new InvalidOperationException($"built block failed validation at h={height}: {reason}");
+
+        return block;
+    }
+
+    private static byte[] ComputeExpectedTargetForHeight(ulong nextHeight, byte[] prevHash)
+    {
+        if (nextHeight == 0)
+            return Difficulty.PowLimit.ToArray();
+
+        if (prevHash is not { Length: 32 })
+            throw new InvalidOperationException("prevHash must be 32 bytes");
+
+        var byHeight = new Dictionary<ulong, Block>();
+        byte[] walk = (byte[])prevHash.Clone();
+
+        for (int guard = 0; guard < 1_000_000; guard++)
+        {
+            var b = BlockStore.GetBlockByHash(walk);
+            if (b == null)
+                throw new InvalidOperationException("cannot compute target: missing prev chain payload");
+
+            byHeight[b.BlockHeight] = b;
+            if (b.BlockHeight == 0) break;
+
+            var ph = b.Header?.PreviousBlockHash;
+            if (ph is not { Length: 32 })
+                throw new InvalidOperationException("cannot compute target: missing previous hash in ancestor");
+
+            walk = ph;
+        }
+
+        return DifficultyCalculator.GetNextTarget(nextHeight, h => byHeight.TryGetValue(h, out var b) ? b : null);
+    }
+
+    private static void MineBlockInPlace(Block block)
+    {
+        var target = block.Header?.Target ?? throw new InvalidOperationException("target missing");
+
+        for (uint nonce = 0; ; nonce++)
+        {
+            block.Header!.Nonce = nonce;
+            var hash = block.ComputeBlockHash();
+            if (Difficulty.Meets(hash, target))
+            {
+                block.BlockHash = hash;
+                return;
+            }
+
+            if (nonce == uint.MaxValue)
+                throw new InvalidOperationException("mining failed: nonce exhausted");
+        }
+    }
+
+    private static void SeedAccount(string addrHex, ulong balance, ulong nonce)
+    {
+        lock (Db.Sync)
+        {
+            using var tx = Db.Connection.BeginTransaction();
+            StateStore.Set(addrHex, balance, nonce, tx);
+            tx.Commit();
+        }
+    }
+
+    private static bool MempoolContainsTx(MempoolManager mempool, Transaction tx)
+    {
+        var wanted = tx.ComputeTransactionHash();
+        return mempool.GetAll().Any(t => t != null && t.ComputeTransactionHash().SequenceEqual(wanted));
+    }
+
+    private static bool BytesEqual(byte[] a, byte[] b)
+    {
+        if (a.Length != b.Length) return false;
+        for (int i = 0; i < a.Length; i++)
+            if (a[i] != b[i]) return false;
+        return true;
     }
 
     private static void Assert(bool condition, string message)

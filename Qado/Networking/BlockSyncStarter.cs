@@ -11,6 +11,7 @@ using Qado.Serialization;
 using Qado.Logging;
 using Qado.Mempool;
 using Qado.Storage;
+using Qado.Utils;
 
 namespace Qado.Networking
 {
@@ -18,6 +19,9 @@ namespace Qado.Networking
     {
         private const int DefaultP2PPort = GenesisConfig.P2PPort;
         private const int MaxFramePayloadBytes = ConsensusRules.MaxBlockSizeBytes;
+        private const int MinBlockFetchWindow = 360;
+        private const int MaxBlockFetchWindow = 1440;
+        private const int DefaultBlockFetchWindow = 720;
         private static readonly TimeSpan FrameTimeout = TimeSpan.FromSeconds(8);
         private static readonly TimeSpan NoPeersBaseDelay = TimeSpan.FromSeconds(6);
         private static readonly TimeSpan NoTipBaseDelay = TimeSpan.FromSeconds(10);
@@ -30,7 +34,14 @@ namespace Qado.Networking
         private static readonly SemaphoreSlim ImmediateSyncSignal = new(0, 1);
         private static readonly object ImmediateSyncGate = new();
         private static readonly TimeSpan ImmediateSyncCooldown = TimeSpan.FromSeconds(5);
+        private static readonly TimeSpan HandshakeImmediateSyncCooldown = TimeSpan.FromSeconds(30);
+        private static readonly TimeSpan HandshakePeerImmediateSyncCooldown = TimeSpan.FromSeconds(90);
         private static DateTime _lastImmediateSyncUtc = DateTime.MinValue;
+        private static readonly Dictionary<string, DateTime> HandshakeImmediateSyncByPeer = new(StringComparer.Ordinal);
+        private static readonly object DialablePeerGate = new();
+        private static readonly Dictionary<string, DateTime> DialablePeerLastSuccessUtc = new(StringComparer.Ordinal);
+        private static readonly TimeSpan DialablePeerTtl = TimeSpan.FromDays(1);
+        private const int MaxDialablePeerEntries = 2048;
 
         public static async Task StartAsync(MempoolManager mempool, ILogSink? log = null, CancellationToken ct = default)
         {
@@ -51,6 +62,7 @@ namespace Qado.Networking
                 int skippedCoolingDown = 0;
                 bool sawValidTip = false;
                 bool sawPeerAhead = false;
+                bool inSyncConfirmed = false;
 
                 foreach (var (rawHost, port0) in peers)
                 {
@@ -79,6 +91,7 @@ namespace Qado.Networking
 #endif
                         client.NoDelay = true;
                         using var ns = client.GetStream();
+                        ReportPeerDialSuccess(host, port);
 
                         var myHs = BuildHandshakePayload(DefaultP2PPort);
                         await WriteFrame(ns, MsgType.Handshake, myHs, ct).ConfigureAwait(false);
@@ -87,28 +100,45 @@ namespace Qado.Networking
                         while (!ct.IsCancellationRequested)
                         {
                             await WriteFrame(ns, MsgType.GetTip, Array.Empty<byte>(), ct).ConfigureAwait(false);
-                            var (tipOk, remoteHeight, remoteTipHash, hsNowValidated) =
+                            var (tipOk, remoteHeight, remoteTipHash, remoteTipWork, hsNowValidated) =
                                 await WaitForTipAsync(ns, client, log, ct, handshakeAlreadyValidated: handshakeValidated).ConfigureAwait(false);
                             handshakeValidated = hsNowValidated;
 
                             if (!tipOk)
                             {
+                                ReportPeerDialFailure(host, port);
                                 PeerFailTracker.ReportFailure(peerKey);
                                 log?.Warn("BlockSync", "Peer did not provide a valid TIP.");
                                 break;
                             }
 
+                            ReportPeerDialSuccess(host, port);
                             PeerFailTracker.ReportSuccess(peerKey);
                             sawValidTip = true;
 
                             ulong localHeight = GetCanonicalTipHeight();
+                            UInt128 localTipWork = GetCanonicalTipWork();
+
+                            if (remoteTipWork != 0 && localTipWork != 0 && remoteTipWork <= localTipWork)
+                            {
+                                log?.Info("BlockSync",
+                                    $"Peer tip chainwork not stronger (remoteWork={remoteTipWork}, localWork={localTipWork}).");
+                                if (remoteTipHash is { Length: 32 })
+                                {
+                                    try { ChainSelector.MaybeAdoptNewTip(remoteTipHash, log, mempool); } catch { }
+                                }
+                                inSyncConfirmed = true;
+                                break;
+                            }
+
                             if (remoteHeight <= localHeight)
                             {
                                 log?.Info("BlockSync", $"Already up-to-date (local={localHeight}, remote={remoteHeight}).");
                                 if (remoteTipHash is { Length: 32 })
                                 {
-                                    try { ChainSelector.MaybeAdoptNewTip(remoteTipHash, log); } catch { }
+                                    try { ChainSelector.MaybeAdoptNewTip(remoteTipHash, log, mempool); } catch { }
                                 }
+                                inSyncConfirmed = true;
                                 break;
                             }
 
@@ -119,71 +149,30 @@ namespace Qado.Networking
 
                             byte[] expectedPrevHash = await GetAncestorHashAsync(ns, ancestor, log, ct).ConfigureAwait(false);
                             byte[]? downloadedTipHash = null;
+                            int configuredWindow = GetConfiguredBlockFetchWindow();
+                            int rangeWindow = (int)Math.Min((ulong)configuredWindow, (remoteHeight - ancestor));
+                            if (rangeWindow <= 0) rangeWindow = 1;
 
-                            for (ulong h = ancestor + 1; h <= remoteHeight; h++)
+                            log?.Info("BlockSync", $"Windowed block fetch enabled (window={rangeWindow}).");
+
+                            var dl = await DownloadRangeWindowedAsync(
+                                ns: ns,
+                                fromHeight: ancestor + 1,
+                                toHeight: remoteHeight,
+                                expectedPrevHash: expectedPrevHash,
+                                fetchWindow: rangeWindow,
+                                log: log,
+                                ct: ct).ConfigureAwait(false);
+
+                            downloadedTipHash = dl.lastBlockHash;
+                            if (dl.madeProgress)
                             {
-                                if (ct.IsCancellationRequested) return;
-
-                                var req = new byte[8];
-                                BinaryPrimitives.WriteUInt64LittleEndian(req, h);
-
-                                await WriteFrame(ns, MsgType.GetBlock, req, ct).ConfigureAwait(false);
-
-                                var blk = await WaitForBlockAtStrictAsync(ns, h, expectedPrevHash, log, ct).ConfigureAwait(false);
-                                if (blk == null)
-                                {
-                                    log?.Warn("BlockSync", $"Failed to fetch/validate block h={h}.");
-                                    break;
-                                }
-
-                                blk.BlockHeight = h;
-                                EnsureCanonicalBlockHash(blk);
-                                if (!BlockValidator.ValidateNetworkSideBlockStateless(blk, out var reason))
-                                {
-                                    log?.Warn("BlockSync", $"Fetched block h={h} failed validation: {reason}");
-                                    break;
-                                }
-
-                                try
-                                {
-                                    var txOffsets = ComputeTxOffsets(blk);
-
-                                    lock (Db.Sync)
-                                    {
-                                        using var trx = Db.Connection!.BeginTransaction();
-
-                                        BlockStore.SaveBlock(blk, trx);
-
-                                        for (int i = 0; i < txOffsets.Length; i++)
-                                        {
-                                            var (id, off, size) = txOffsets[i];
-                                            TxIndexStore.Insert(id, blk.BlockHash!, blk.BlockHeight, off, size, trx);
-                                        }
-
-                                        trx.Commit();
-                                    }
-                                }
-                                catch (Exception ex)
-                                {
-                                    log?.Warn("BlockSync", $"Store h={h} failed: {ex.Message}");
-                                    break;
-                                }
-
-                                expectedPrevHash = blk.BlockHash!;
-                                downloadedTipHash = blk.BlockHash!;
-
-                                var after = GetLatestHeightDirect();
-                                log?.Info("BlockSync", $"Synced {h}/{remoteHeight} (dbMax={after})");
-
-                                if (after < h)
-                                {
-                                    log?.Error("BlockSync",
-                                        $"DB did not retain inserts: after commit MAX(height)={after}, expected >= {h}.");
-                                    break;
-                                }
-
-                                if (after > lastHeight) { madeProgress = true; lastHeight = after; }
+                                madeProgress = true;
+                                if (dl.lastStoredHeight > lastHeight) lastHeight = dl.lastStoredHeight;
                             }
+
+                            if (!dl.ok)
+                                log?.Warn("BlockSync", $"Windowed download interrupted (lastStored={dl.lastStoredHeight}, target={remoteHeight}).");
 
                             var downloadedNow = GetLatestHeightDirect();
                             if (downloadedNow >= remoteHeight)
@@ -199,7 +188,7 @@ namespace Qado.Networking
                                 var candidateTip = downloadedTipHash ?? remoteTipHash;
                                 if (candidateTip is { Length: 32 })
                                 {
-                                    try { ChainSelector.MaybeAdoptNewTip(candidateTip, log); } catch { }
+                                    try { ChainSelector.MaybeAdoptNewTip(candidateTip, log, mempool); } catch { }
                                 }
 
                                 var canonNow = GetCanonicalTipHeight();
@@ -233,9 +222,13 @@ namespace Qado.Networking
                     }
                     catch (Exception ex)
                     {
+                        ReportPeerDialFailure(host, port);
                         PeerFailTracker.ReportFailure(peerKey);
                         log?.Warn("BlockSync", $"Peer {host}:{port} failed: {ex.Message}");
                     }
+
+                    if (inSyncConfirmed)
+                        break;
                 }
 
                 if (madeProgress)
@@ -274,11 +267,35 @@ namespace Qado.Networking
 
         public static void RequestImmediateSync(ILogSink? log = null, string reason = "handshake")
         {
+            string normalizedReason = (reason ?? string.Empty).Trim();
+            bool isHandshakeReason = normalizedReason.StartsWith("handshake", StringComparison.OrdinalIgnoreCase);
+
             bool allowed;
             lock (ImmediateSyncGate)
             {
                 var now = DateTime.UtcNow;
-                allowed = (now - _lastImmediateSyncUtc) >= ImmediateSyncCooldown;
+                var minCooldown = isHandshakeReason ? HandshakeImmediateSyncCooldown : ImmediateSyncCooldown;
+                allowed = (now - _lastImmediateSyncUtc) >= minCooldown;
+                if (allowed)
+                {
+                    if (isHandshakeReason)
+                    {
+                        var peerKey = ExtractHandshakePeerKey(normalizedReason);
+                        if (peerKey.Length != 0 &&
+                            HandshakeImmediateSyncByPeer.TryGetValue(peerKey, out var lastForPeer) &&
+                            (now - lastForPeer) < HandshakePeerImmediateSyncCooldown)
+                        {
+                            allowed = false;
+                        }
+                        else if (peerKey.Length != 0)
+                        {
+                            HandshakeImmediateSyncByPeer[peerKey] = now;
+                        }
+
+                        PruneHandshakeImmediateSyncByPeer_NoThrow(now);
+                    }
+                }
+
                 if (allowed)
                     _lastImmediateSyncUtc = now;
             }
@@ -292,6 +309,128 @@ namespace Qado.Networking
                 log?.Info("BlockSync", $"Immediate sync requested ({reason}).");
             else
                 log?.Info("BlockSync", "Immediate sync requested.");
+        }
+
+        public static void ReportPeerDialSuccess(string host, int port)
+        {
+            string key = BuildDialablePeerKey(host, port);
+            if (key.Length == 0) return;
+
+            lock (DialablePeerGate)
+            {
+                var now = DateTime.UtcNow;
+                DialablePeerLastSuccessUtc[key] = now;
+                PruneDialablePeers_NoThrow(now);
+            }
+        }
+
+        public static void ReportPeerDialFailure(string host, int port)
+        {
+            string key = BuildDialablePeerKey(host, port);
+            if (key.Length == 0) return;
+
+            lock (DialablePeerGate)
+            {
+                DialablePeerLastSuccessUtc.Remove(key);
+                PruneDialablePeers_NoThrow(DateTime.UtcNow);
+            }
+        }
+
+        private static bool TrySelectBestDialablePeer(
+            List<(string ip, int port)> candidates,
+            out (string ip, int port) selected)
+        {
+            selected = default;
+            if (candidates.Count == 0) return false;
+
+            var now = DateTime.UtcNow;
+            DateTime bestSeen = DateTime.MinValue;
+
+            lock (DialablePeerGate)
+            {
+                PruneDialablePeers_NoThrow(now);
+
+                for (int i = 0; i < candidates.Count; i++)
+                {
+                    string host = NormalizeHost(candidates[i].ip);
+                    int port = candidates[i].port > 0 ? candidates[i].port : DefaultP2PPort;
+                    string key = BuildDialablePeerKey(host, port);
+                    if (key.Length == 0) continue;
+
+                    if (!DialablePeerLastSuccessUtc.TryGetValue(key, out var seen))
+                        continue;
+
+                    if (seen > bestSeen)
+                    {
+                        bestSeen = seen;
+                        selected = (host, port);
+                    }
+                }
+            }
+
+            return bestSeen != DateTime.MinValue;
+        }
+
+        private static void PruneDialablePeers_NoThrow(DateTime now)
+        {
+            try
+            {
+                if (DialablePeerLastSuccessUtc.Count == 0)
+                    return;
+
+                var stale = new List<string>();
+                foreach (var kv in DialablePeerLastSuccessUtc)
+                {
+                    if ((now - kv.Value) > DialablePeerTtl)
+                        stale.Add(kv.Key);
+                }
+
+                for (int i = 0; i < stale.Count; i++)
+                    DialablePeerLastSuccessUtc.Remove(stale[i]);
+
+                if (DialablePeerLastSuccessUtc.Count <= MaxDialablePeerEntries)
+                    return;
+
+                var ordered = new List<KeyValuePair<string, DateTime>>(DialablePeerLastSuccessUtc);
+                ordered.Sort((a, b) => a.Value.CompareTo(b.Value));
+                int toRemove = ordered.Count - MaxDialablePeerEntries;
+
+                for (int i = 0; i < toRemove; i++)
+                    DialablePeerLastSuccessUtc.Remove(ordered[i].Key);
+            }
+            catch
+            {
+            }
+        }
+
+        private static string ExtractHandshakePeerKey(string reason)
+        {
+            if (reason.Length == 0) return string.Empty;
+            int sep = reason.IndexOf(' ');
+            if (sep < 0 || sep + 1 >= reason.Length) return string.Empty;
+            return reason[(sep + 1)..].Trim().ToLowerInvariant();
+        }
+
+        private static void PruneHandshakeImmediateSyncByPeer_NoThrow(DateTime now)
+        {
+            try
+            {
+                if (HandshakeImmediateSyncByPeer.Count <= 512)
+                    return;
+
+                var stale = new List<string>();
+                foreach (var kv in HandshakeImmediateSyncByPeer)
+                {
+                    if ((now - kv.Value) > TimeSpan.FromMinutes(10))
+                        stale.Add(kv.Key);
+                }
+
+                for (int i = 0; i < stale.Count; i++)
+                    HandshakeImmediateSyncByPeer.Remove(stale[i]);
+            }
+            catch
+            {
+            }
         }
 
         private static (TimeSpan delay, string reason) ComputeIdleDelay(
@@ -308,7 +447,7 @@ namespace Qado.Networking
             if (peerCount == 0)
             {
                 baseDelay = NoPeersBaseDelay;
-                reason = "no-known-peers";
+                reason = "no-dialable-peers";
             }
             else if (dialAttempts == 0 && skippedCoolingDown > 0)
             {
@@ -401,6 +540,179 @@ namespace Qado.Networking
             {
                 return BlockStore.GetLatestHeight();
             }
+        }
+
+        private static UInt128 GetCanonicalTipWork()
+        {
+            if (Db.Connection == null) return 0;
+            lock (Db.Sync)
+            {
+                ulong tipHeight = BlockStore.GetLatestHeight();
+                var tipHash = BlockStore.GetCanonicalHashAtHeight(tipHeight);
+                if (tipHash is not { Length: 32 }) return 0;
+                return BlockIndexStore.GetChainwork(tipHash);
+            }
+        }
+
+        private static int GetConfiguredBlockFetchWindow()
+        {
+            string? raw = Environment.GetEnvironmentVariable("QADO_BLOCKSYNC_WINDOW");
+            if (int.TryParse(raw, out int parsed))
+                return Math.Clamp(parsed, MinBlockFetchWindow, MaxBlockFetchWindow);
+
+            return DefaultBlockFetchWindow;
+        }
+
+        private static async Task<(bool ok, ulong lastStoredHeight, byte[]? lastBlockHash, bool madeProgress)> DownloadRangeWindowedAsync(
+            NetworkStream ns,
+            ulong fromHeight,
+            ulong toHeight,
+            byte[] expectedPrevHash,
+            int fetchWindow,
+            ILogSink? log,
+            CancellationToken ct)
+        {
+            if (fromHeight > toHeight)
+                return (true, GetLatestHeightDirect(), null, false);
+
+            if (expectedPrevHash is not { Length: 32 })
+                return (false, GetLatestHeightDirect(), null, false);
+
+            fetchWindow = Math.Clamp(fetchWindow, 1, MaxBlockFetchWindow);
+
+            ulong nextToRequest = fromHeight;
+            ulong nextToProcess = fromHeight;
+            var pendingByHeight = new Dictionary<ulong, Block>(capacity: Math.Min(fetchWindow * 2, 4096));
+            var expectedHeightsByResponseOrder = new Queue<ulong>(Math.Min(fetchWindow * 2, 4096));
+
+            ulong lastStoredHeight = GetLatestHeightDirect();
+            byte[]? lastBlockHash = null;
+            bool madeProgress = false;
+
+            while (nextToRequest <= toHeight && (nextToRequest - nextToProcess) < (ulong)fetchWindow)
+            {
+                var req = new byte[8];
+                BinaryPrimitives.WriteUInt64LittleEndian(req, nextToRequest);
+                await WriteFrame(ns, MsgType.GetBlock, req, ct).ConfigureAwait(false);
+                expectedHeightsByResponseOrder.Enqueue(nextToRequest);
+                nextToRequest++;
+            }
+
+            while (!ct.IsCancellationRequested && nextToProcess <= toHeight)
+            {
+                var fr = await ReadFrameWithTimeout(ns, ct).ConfigureAwait(false);
+                if (fr.payload == null)
+                    return (false, lastStoredHeight, lastBlockHash, madeProgress);
+
+                if (fr.type != MsgType.BlockAt)
+                    continue;
+
+                Block blk;
+                try
+                {
+                    blk = BlockBinarySerializer.Read(fr.payload);
+                    EnsureCanonicalBlockHash(blk);
+                }
+                catch (Exception ex)
+                {
+                    log?.Warn("BlockSync", $"BlockAt decode failed in windowed mode: {ex.Message}");
+                    return (false, lastStoredHeight, lastBlockHash, madeProgress);
+                }
+
+                if (expectedHeightsByResponseOrder.Count == 0)
+                {
+                    log?.Warn("BlockSync", "Windowed mode received unexpected BlockAt without outstanding request.");
+                    return (false, lastStoredHeight, lastBlockHash, madeProgress);
+                }
+
+                ulong h = expectedHeightsByResponseOrder.Dequeue();
+                if (blk.BlockHeight != 0 && blk.BlockHeight != h)
+                {
+                    log?.Warn("BlockSync", $"Windowed mode response height mismatch: expected h={h}, got h={blk.BlockHeight}.");
+                    return (false, lastStoredHeight, lastBlockHash, madeProgress);
+                }
+
+                blk.BlockHeight = h;
+
+                if (!pendingByHeight.ContainsKey(h))
+                    pendingByHeight[h] = blk;
+
+                while (pendingByHeight.TryGetValue(nextToProcess, out var ready))
+                {
+                    var prev = ready.Header?.PreviousBlockHash;
+                    if (prev is not { Length: 32 } || !BytesEqual(prev, expectedPrevHash))
+                    {
+                        log?.Warn("BlockSync", $"Windowed mode linkage mismatch at h={nextToProcess}.");
+                        return (false, lastStoredHeight, lastBlockHash, madeProgress);
+                    }
+
+                    ready.BlockHeight = nextToProcess;
+                    if (!BlockValidator.ValidateNetworkSideBlockStateless(ready, out var reason))
+                    {
+                        log?.Warn("BlockSync", $"Fetched block h={nextToProcess} failed validation: {reason}");
+                        return (false, lastStoredHeight, lastBlockHash, madeProgress);
+                    }
+
+                    try
+                    {
+                        var txOffsets = ComputeTxOffsets(ready);
+
+                        lock (Db.Sync)
+                        {
+                            using var trx = Db.Connection!.BeginTransaction();
+
+                            BlockStore.SaveBlock(ready, trx);
+
+                            for (int i = 0; i < txOffsets.Length; i++)
+                            {
+                                var (id, off, size) = txOffsets[i];
+                                TxIndexStore.Insert(id, ready.BlockHash!, ready.BlockHeight, off, size, trx);
+                            }
+
+                            trx.Commit();
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        log?.Warn("BlockSync", $"Store h={nextToProcess} failed: {ex.Message}");
+                        return (false, lastStoredHeight, lastBlockHash, madeProgress);
+                    }
+
+                    pendingByHeight.Remove(nextToProcess);
+                    expectedPrevHash = ready.BlockHash!;
+                    lastBlockHash = ready.BlockHash!;
+
+                    var after = GetLatestHeightDirect();
+                    ulong inFlight = nextToRequest > nextToProcess ? (nextToRequest - nextToProcess) : 0UL;
+                    log?.Info("BlockSync", $"Synced {nextToProcess}/{toHeight} (dbMax={after}, inFlight={inFlight})");
+
+                    if (after < nextToProcess)
+                    {
+                        log?.Error("BlockSync",
+                            $"DB did not retain inserts: after commit MAX(height)={after}, expected >= {nextToProcess}.");
+                        return (false, lastStoredHeight, lastBlockHash, madeProgress);
+                    }
+
+                    if (after > lastStoredHeight)
+                    {
+                        lastStoredHeight = after;
+                        madeProgress = true;
+                    }
+
+                    nextToProcess++;
+
+                    while (nextToRequest <= toHeight && (nextToRequest - nextToProcess) < (ulong)fetchWindow)
+                    {
+                        var req = new byte[8];
+                        BinaryPrimitives.WriteUInt64LittleEndian(req, nextToRequest);
+                        await WriteFrame(ns, MsgType.GetBlock, req, ct).ConfigureAwait(false);
+                        expectedHeightsByResponseOrder.Enqueue(nextToRequest);
+                        nextToRequest++;
+                    }
+                }
+            }
+
+            return (nextToProcess > toHeight, lastStoredHeight, lastBlockHash, madeProgress);
         }
 
         private static async Task<ulong> FindCommonAncestorAsync(
@@ -591,7 +903,7 @@ namespace Qado.Networking
             return true;
         }
 
-        private static async Task<(bool ok, ulong height, byte[]? hash, bool handshakeValidated)> WaitForTipAsync(
+        private static async Task<(bool ok, ulong height, byte[]? hash, UInt128 chainwork, bool handshakeValidated)> WaitForTipAsync(
             NetworkStream ns,
             TcpClient client,
             ILogSink? log,
@@ -609,7 +921,7 @@ namespace Qado.Networking
                 if (fr.type == MsgType.Handshake)
                 {
                     if (!TryRecordPeerFromHandshake(fr.payload, client, log))
-                        return (false, 0, null, handshakeValidated);
+                        return (false, 0, null, 0, handshakeValidated);
                     handshakeValidated = true;
                     continue;
                 }
@@ -622,14 +934,17 @@ namespace Qado.Networking
                         continue;
                     }
 
-                    if (fr.payload.Length < 8) return (false, 0, null, handshakeValidated);
+                    if (fr.payload.Length < 8) return (false, 0, null, 0, handshakeValidated);
                     ulong h = BinaryPrimitives.ReadUInt64LittleEndian(fr.payload.AsSpan(0, 8));
                     byte[]? hash = fr.payload.Length >= 40 ? fr.payload.AsSpan(8, 32).ToArray() : null;
-                    return (true, h, hash, handshakeValidated);
+                    UInt128 cw = 0;
+                    if (fr.payload.Length >= 56)
+                        cw = U128.ReadBE(fr.payload.AsSpan(40, 16).ToArray());
+                    return (true, h, hash, cw, handshakeValidated);
                 }
             }
 
-            return (false, 0, null, handshakeValidated);
+            return (false, 0, null, 0, handshakeValidated);
         }
 
         private static void EnsureCanonicalBlockHash(Block block)
@@ -662,13 +977,13 @@ namespace Qado.Networking
 
         private static List<(string ip, int port)> GetPeersFromDb()
         {
-            var list = new List<(string, int)>();
-            if (Db.Connection == null) return list;
+            var candidates = new List<(string, int)>();
+            if (Db.Connection == null) return candidates;
 
             lock (Db.Sync)
             {
                 using var cmd = Db.Connection.CreateCommand();
-                cmd.CommandText = "SELECT ip, port FROM peers ORDER BY last_seen DESC LIMIT 32;";
+                cmd.CommandText = "SELECT ip, port FROM peers ORDER BY last_seen DESC LIMIT 64;";
                 using var r = cmd.ExecuteReader();
                 while (r.Read())
                 {
@@ -678,15 +993,56 @@ namespace Qado.Networking
                     if (!string.IsNullOrWhiteSpace(ip))
                     {
                         if (SelfPeerGuard.IsSelf(ip, p)) continue;
-                        list.Add((ip, p));
+                        candidates.Add((ip, p));
                     }
                 }
             }
-            return list;
+
+            if (TrySelectBestDialablePeer(candidates, out var selected))
+                return new List<(string, int)> { selected };
+
+            return new List<(string, int)>();
         }
 
         private static string NormalizePeerKey(string host)
             => (host ?? string.Empty).Trim().ToLowerInvariant();
+
+        private static string BuildDialablePeerKey(string host, int port)
+        {
+            string h = NormalizeDialableHost(host);
+            int p = port > 0 && port <= 65535 ? port : DefaultP2PPort;
+            if (h.Length == 0) return string.Empty;
+            return $"{h}:{p}";
+        }
+
+        private static string NormalizeDialableHost(string host)
+        {
+            if (string.IsNullOrWhiteSpace(host)) return string.Empty;
+            string s = host.Trim().ToLowerInvariant();
+
+            if (s.StartsWith("[", StringComparison.Ordinal))
+            {
+                int close = s.IndexOf(']');
+                if (close > 1)
+                    s = s.Substring(1, close - 1);
+            }
+            else
+            {
+                int firstColon = s.IndexOf(':');
+                int lastColon = s.LastIndexOf(':');
+                if (firstColon > 0 && firstColon == lastColon)
+                {
+                    string tail = s[(firstColon + 1)..];
+                    if (int.TryParse(tail, out _))
+                        s = s[..firstColon];
+                }
+            }
+
+            if (s.StartsWith("::ffff:", StringComparison.Ordinal))
+                s = s[7..];
+
+            return s;
+        }
 
         private static string NormalizeHost(string host)
         {

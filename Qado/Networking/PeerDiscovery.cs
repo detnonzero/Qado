@@ -16,12 +16,18 @@ namespace Qado.Networking
         private const int MaxPeersInPayload = 256;        // hard cap for remote payload parsing
         private const int MaxIpStringBytes = 64;          // upper bound for IPv4 literals and malformed inputs
         private const int DefaultP2PPort = P2PNode.DefaultPort;
+        private static readonly object PexLogGate = new();
+        private static readonly TimeSpan PexLogWindow = TimeSpan.FromSeconds(10);
+        private static DateTime _lastPexSentLogUtc = DateTime.MinValue;
+        private static DateTime _lastPexReceivedLogUtc = DateTime.MinValue;
+        private static int _pexSentSuppressed;
+        private static int _pexReceivedSuppressed;
 
         public static async Task HandleGetPeersAsync(NetworkStream ns, ILogSink? log, CancellationToken ct)
         {
             var payload = BuildPeersPayload(maxPeers: 64);
             await P2PNode.WriteFrame(ns, MsgType.Peers, payload, ct).ConfigureAwait(false);
-            log?.Info("PEX", $"Sent {GetCountFromPayload(payload)} peers.");
+            LogPexSent(log, GetCountFromPayload(payload));
         }
 
         public static void HandlePeersPayload(byte[] payload, ILogSink? log)
@@ -36,7 +42,6 @@ namespace Qado.Networking
 
                 int count = Math.Min(declared, (ushort)MaxPeersInPayload);
 
-                ulong now = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
                 int added = 0;
 
                 for (int i = 0; i < count; i++)
@@ -64,8 +69,8 @@ namespace Qado.Networking
 
                     try
                     {
-                        PeerStore.MarkSeen(ip, port, now, GenesisConfig.NetworkId);
-                        added++;
+                        if (PeerStore.AnnouncePeer(ip, port, GenesisConfig.NetworkId))
+                            added++;
                     }
                     catch
                     {
@@ -73,7 +78,7 @@ namespace Qado.Networking
                 }
 
                 if (added > 0)
-                    log?.Info("PEX", $"Received {added} peer(s).");
+                    LogPexReceived(log, added);
             }
             catch (Exception ex)
             {
@@ -89,8 +94,9 @@ namespace Qado.Networking
             var chunks = new List<byte[]>(peers.Count);
 
             ushort count = 0;
-            foreach (var (ip, port, _) in peers)
+            foreach (var (ip, port, lastSeen) in peers)
             {
+                if (lastSeen == 0) continue; // announce only verified/seen peers
                 if (!IsPublicRoutableIPv4Literal(ip)) continue;
 
                 int p = port;
@@ -190,6 +196,59 @@ namespace Qado.Networking
             if (next > payload.Length) return false;
             idx = (int)next;
             return true;
+        }
+
+        private static void LogPexSent(ILogSink? log, int count)
+        {
+            LogPex(log, count, isSent: true);
+        }
+
+        private static void LogPexReceived(ILogSink? log, int count)
+        {
+            LogPex(log, count, isSent: false);
+        }
+
+        private static void LogPex(ILogSink? log, int count, bool isSent)
+        {
+            lock (PexLogGate)
+            {
+                var now = DateTime.UtcNow;
+
+                if (isSent)
+                {
+                    if ((now - _lastPexSentLogUtc) >= PexLogWindow)
+                    {
+                        if (_pexSentSuppressed > 0)
+                            log?.Info("PEX", $"Sent {count} peers. (+{_pexSentSuppressed} events suppressed)");
+                        else
+                            log?.Info("PEX", $"Sent {count} peers.");
+
+                        _lastPexSentLogUtc = now;
+                        _pexSentSuppressed = 0;
+                    }
+                    else
+                    {
+                        _pexSentSuppressed++;
+                    }
+
+                    return;
+                }
+
+                if ((now - _lastPexReceivedLogUtc) >= PexLogWindow)
+                {
+                    if (_pexReceivedSuppressed > 0)
+                        log?.Info("PEX", $"Received {count} peer(s). (+{_pexReceivedSuppressed} events suppressed)");
+                    else
+                        log?.Info("PEX", $"Received {count} peer(s).");
+
+                    _lastPexReceivedLogUtc = now;
+                    _pexReceivedSuppressed = 0;
+                }
+                else
+                {
+                    _pexReceivedSuppressed++;
+                }
+            }
         }
     }
 }

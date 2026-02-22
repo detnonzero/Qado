@@ -8,6 +8,7 @@ namespace Qado.Networking
     {
         private const int MaxFails = 3;
         private static readonly TimeSpan BanThresholdWindow = TimeSpan.FromMinutes(30);
+        private static readonly string SeedNeverBanKey = Normalize(GenesisConfig.GenesisHost);
 
         private static readonly ConcurrentDictionary<string, int> _failCounts = new(StringComparer.Ordinal);
 
@@ -20,6 +21,11 @@ namespace Qado.Networking
         {
             address = Normalize(address);
             if (address.Length == 0) return;
+            if (IsNeverBan(address))
+            {
+                Reset(address);
+                return;
+            }
 
             _failCounts.AddOrUpdate(address, 1, (_, n) => n + 1);
             _lastFailUtc[address] = DateTime.UtcNow;
@@ -45,6 +51,11 @@ namespace Qado.Networking
         {
             address = Normalize(address);
             if (address.Length == 0) return false;
+            if (IsNeverBan(address))
+            {
+                Reset(address);
+                return false;
+            }
 
             if (_failCounts.TryGetValue(address, out int count) &&
                 _lastFailUtc.TryGetValue(address, out DateTime last) &&
@@ -61,13 +72,45 @@ namespace Qado.Networking
         {
             address = Normalize(address);
             if (address.Length == 0) return 0;
+            if (IsNeverBan(address)) return 0;
             return _failCounts.TryGetValue(address, out var n) ? n : 0;
         }
 
         private static string Normalize(string address)
         {
             if (string.IsNullOrWhiteSpace(address)) return string.Empty;
-            return address.Trim().ToLowerInvariant();
+            string s = address.Trim().ToLowerInvariant();
+
+            // Remove optional [host]:port brackets.
+            if (s.StartsWith("[", StringComparison.Ordinal))
+            {
+                int close = s.IndexOf(']');
+                if (close > 1)
+                    s = s.Substring(1, close - 1);
+            }
+            else
+            {
+                // Remove optional :port for IPv4/host literals.
+                int firstColon = s.IndexOf(':');
+                int lastColon = s.LastIndexOf(':');
+                if (firstColon > 0 && firstColon == lastColon)
+                {
+                    string tail = s[(firstColon + 1)..];
+                    if (int.TryParse(tail, out _))
+                        s = s[..firstColon];
+                }
+            }
+
+            if (s.StartsWith("::ffff:", StringComparison.Ordinal))
+                s = s[7..];
+
+            return s;
+        }
+
+        private static bool IsNeverBan(string address)
+        {
+            if (SeedNeverBanKey.Length == 0) return false;
+            return string.Equals(address, SeedNeverBanKey, StringComparison.Ordinal);
         }
 
         private static void TryPruneExpired_NoThrow()

@@ -352,7 +352,7 @@ namespace Qado
                 var tip = BlockStore.GetBlockByHeight(latest);
                 var cand = tip?.BlockHash;
                 if (cand is { Length: 32 })
-                    Blockchain.ChainSelector.MaybeAdoptNewTip(cand, this);
+                    Blockchain.ChainSelector.MaybeAdoptNewTip(cand, this, _mempool);
             }
             catch (Exception ex)
             {
@@ -688,13 +688,16 @@ namespace Qado
                     if (SelfPeerGuard.IsSelf(ip, port)) continue;
 
                     long ts = r.GetInt64(2);
-                    var seenAt = DateTimeOffset.FromUnixTimeSeconds(ts);
-                    var dt = seenAt.UtcDateTime;
+                    bool neverSeen = ts <= 0;
+                    var seenAt = neverSeen ? DateTimeOffset.UnixEpoch : DateTimeOffset.FromUnixTimeSeconds(ts);
+                    string lastSeenText = neverSeen
+                        ? "-"
+                        : $"{seenAt.UtcDateTime:yyyy-MM-dd HH:mm:ss} UTC";
 
                     rows.Add(new PeerRow
                     {
                         Endpoint = $"{ip}:{port}",
-                        LastSeenUtc = $"{dt:yyyy-MM-dd HH:mm:ss} UTC",
+                        LastSeenUtc = lastSeenText,
                         Status = GetPeerStatus(ip, port, seenAt)
                     });
                 }
@@ -721,11 +724,18 @@ namespace Qado
             if (_p2pNode?.IsPeerConnected(ip, port) == true)
                 return "Connected";
 
-            if (PeerFailTracker.ShouldBan(ip))
-                return "Cooling down";
+            bool coolingDown = PeerFailTracker.ShouldBan(ip);
 
             var age = DateTimeOffset.UtcNow - seenAt;
-            if (age <= PeerSeenRecentlyWindow)
+            bool stale = age > PeerSeenRecentlyWindow;
+
+            if (coolingDown && stale)
+                return "Stale (cooling down)";
+
+            if (coolingDown)
+                return "Cooling down";
+
+            if (!stale)
                 return "Seen recently";
 
             return "Stale";
@@ -881,7 +891,7 @@ namespace Qado
             try
             {
                 using var cmd = Db.Connection.CreateCommand();
-                cmd.CommandText = "SELECT addr, balance, nonce FROM accounts WHERE 1 ORDER BY nonce DESC LIMIT 1000;";
+                cmd.CommandText = "SELECT addr, balance, nonce FROM accounts WHERE 1 LIMIT 1000;";
                 using var r = cmd.ExecuteReader();
                 while (r.Read())
                 {
@@ -897,6 +907,17 @@ namespace Qado
                         Nonce = nonce
                     });
                 }
+
+                rows.Sort(static (a, b) =>
+                {
+                    int c = b.Balance.CompareTo(a.Balance); // hard-coded: highest balance first
+                    if (c != 0) return c;
+
+                    c = b.Nonce.CompareTo(a.Nonce);
+                    if (c != 0) return c;
+
+                    return string.CompareOrdinal(a.PublicKey, b.PublicKey);
+                });
             }
             catch (Exception ex)
             {
