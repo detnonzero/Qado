@@ -4,7 +4,7 @@ namespace Qado.Blockchain
 {
     internal static class ConsensusRules
     {
-        public const int PowMemoryKb = 1 * 1024; // 1 MiB
+        public const int PowMemoryKb = 4; // 4 KiB
         public const int PowIterations = 1;
         public const int PowParallelism = 1;
 

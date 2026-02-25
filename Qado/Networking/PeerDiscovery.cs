@@ -67,6 +67,8 @@ namespace Qado.Networking
                     if (SelfPeerGuard.IsSelf(ip, port)) continue;
                     if (IsConfiguredSeed(ip, port)) continue;
 
+                    try { P2PNode.Instance?.NotePeerPublicClaim(ip, port); } catch { }
+
                     try
                     {
                         if (PeerStore.AnnouncePeer(ip, port, GenesisConfig.NetworkId))
@@ -90,13 +92,13 @@ namespace Qado.Networking
         {
             if (maxPeers <= 0) return MakeEmpty();
 
-            var peers = PeerStore.GetRecentPeers(maxPeers);
+            var peers = P2PNode.Instance?.GetPublicPeerCandidates(maxPeers)
+                        ?? new List<(string ip, int port)>();
             var chunks = new List<byte[]>(peers.Count);
 
             ushort count = 0;
-            foreach (var (ip, port, lastSeen) in peers)
+            foreach (var (ip, port) in peers)
             {
-                if (lastSeen == 0) continue; // announce only verified/seen peers
                 if (!IsPublicRoutableIPv4Literal(ip)) continue;
 
                 int p = port;

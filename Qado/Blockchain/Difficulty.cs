@@ -8,7 +8,7 @@ namespace Qado.Blockchain
         public const int HashSize = 32;
 
         private static readonly byte[] _powLimit =
-            Convert.FromHexString("0000" + new string('F', 60)); // 32-byte big-endian target
+            Convert.FromHexString("00000" + new string('F', 59)); // 32-byte big-endian target
 
         private static readonly byte[] _minTarget =
             Convert.FromHexString("0000000000000000000000000000000000000000000000000000000000000001");
@@ -31,13 +31,10 @@ namespace Qado.Blockchain
             if (hash is not { Length: HashSize }) return false;
             if (target is not { Length: HashSize }) return false;
 
-            if (IsZero32(target))
+            if (!IsValidTarget(target))
                 return false;
 
-            ReadOnlySpan<byte> effective =
-                CompareBE(target, _powLimit) > 0 ? _powLimit : target;
-
-            return CompareBE(hash, effective) <= 0;
+            return CompareBE(hash, target) <= 0;
         }
 
         public static bool IsValidTarget(byte[] target)

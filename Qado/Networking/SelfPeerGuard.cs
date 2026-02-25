@@ -40,6 +40,20 @@ namespace Qado.Networking
             return SelfIps.Contains(normalized);
         }
 
+        public static void RememberSelf(string? hostOrIp)
+        {
+            if (string.IsNullOrWhiteSpace(hostOrIp)) return;
+            EnsureInitialized();
+
+            string normalized = NormalizeHost(hostOrIp);
+            if (normalized.Length == 0) return;
+
+            lock (Sync)
+            {
+                SelfIps.Add(normalized);
+            }
+        }
+
         private static void EnsureInitialized()
         {
             if (_initialized) return;

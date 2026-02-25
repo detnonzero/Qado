@@ -7,6 +7,7 @@ using NSec.Cryptography;
 using Qado.Blockchain;
 using Qado.Mempool;
 using Qado.Networking;
+using Qado.Serialization;
 using Qado.Storage;
 using Qado.Utils;
 
@@ -31,7 +32,10 @@ internal static class Program
             Run("StateApplier_AcceptsSequentialNonce", TestStateApplierAcceptsSequentialNonce);
             Run("KeyStore_EncryptsAtRest", TestKeyStoreEncryptsAtRest);
             Run("Merkle_DomainSeparation_Profile", TestMerkleDomainSeparationProfile);
+            Run("TxId_CommitsSignature", TestTxIdCommitsSignature);
+            Run("BlockSerializer_RejectsInvalidTarget", TestBlockSerializerRejectsInvalidTarget);
             Run("ChainSelector_Reorg_MempoolReconcile", TestChainSelectorReorgMempoolReconcile);
+            Run("MempoolSelection_RespectsSenderNonceOrder", TestMempoolSelectionRespectsSenderNonceOrder);
         }
         catch (Exception ex)
         {
@@ -228,6 +232,70 @@ internal static class Program
         Assert(root3.SequenceEqual(want3), "odd-leaf root mismatch");
     }
 
+    private static void TestTxIdCommitsSignature()
+    {
+        var sender = KeyGenerator.GenerateKeypairHex();
+        var recipient = KeyGenerator.GenerateKeypairHex();
+
+        var tx = BuildSignedTx(
+            senderPrivHex: sender.privHex,
+            senderPubHex: sender.pubHex,
+            recipientPubHex: recipient.pubHex,
+            amount: 1234UL,
+            fee: 5UL,
+            nonce: 1UL);
+
+        var txMut = new Transaction
+        {
+            ChainId = tx.ChainId,
+            Sender = (byte[])tx.Sender.Clone(),
+            Recipient = (byte[])tx.Recipient.Clone(),
+            Amount = tx.Amount,
+            Fee = tx.Fee,
+            TxNonce = tx.TxNonce,
+            Signature = (byte[])tx.Signature.Clone()
+        };
+        txMut.Signature[0] ^= 0x01;
+
+        Assert(tx.ToHashBytes().SequenceEqual(txMut.ToHashBytes()), "signing preimage must ignore signature");
+        Assert(!tx.ComputeTransactionHash().SequenceEqual(txMut.ComputeTransactionHash()),
+            "txid must change when signature changes");
+
+        var rootA = MerkleUtil.ComputeMerkleRootFromTransactions(new List<Transaction> { tx });
+        var rootB = MerkleUtil.ComputeMerkleRootFromTransactions(new List<Transaction> { txMut });
+        Assert(!rootA.SequenceEqual(rootB), "merkle root must commit signature bytes via txid");
+    }
+
+    private static void TestBlockSerializerRejectsInvalidTarget()
+    {
+        var miner = KeyGenerator.GenerateKeypairHex();
+        var block = BuildBlock(
+            height: 1,
+            prevHash: new byte[32],
+            minerPubHex: miner.pubHex,
+            txs: new[] { BuildCoinbase(miner.pubHex, 1UL) });
+
+        int size = BlockBinarySerializer.GetSize(block);
+        var payload = new byte[size];
+        _ = BlockBinarySerializer.Write(payload, block);
+
+        const int targetOffset = 1 + 32 + 32 + 8;
+        for (int i = 0; i < 32; i++)
+            payload[targetOffset + i] = 0xFF;
+
+        bool rejected = false;
+        try
+        {
+            _ = BlockBinarySerializer.Read(payload);
+        }
+        catch (ArgumentException ex) when (ex.Message.Contains("target", StringComparison.OrdinalIgnoreCase))
+        {
+            rejected = true;
+        }
+
+        Assert(rejected, "serializer must reject out-of-range block target");
+    }
+
     private static void TestChainSelectorReorgMempoolReconcile()
     {
         var mempool = new MempoolManager(
@@ -307,6 +375,92 @@ internal static class Program
         Assert(MempoolContainsTx(mempool, txResurrect), "tx from reorged-out block should be requeued");
         Assert(!MempoolContainsTx(mempool, txDrop), "conflicting tx must not be requeued after reorg");
         Assert(!MempoolContainsTx(mempool, txConflict), "tx included in new canonical chain must not be in mempool");
+    }
+
+    private static void TestMempoolSelectionRespectsSenderNonceOrder()
+    {
+        var senderA = KeyGenerator.GenerateKeypairHex();
+        var senderB = KeyGenerator.GenerateKeypairHex();
+        var recipient = KeyGenerator.GenerateKeypairHex();
+
+        string senderAHex = senderA.pubHex.ToLowerInvariant();
+        string senderBHex = senderB.pubHex.ToLowerInvariant();
+
+        var confirmedBySender = new Dictionary<string, ulong>(StringComparer.Ordinal)
+        {
+            [senderAHex] = 0UL,
+            [senderBHex] = 0UL
+        };
+
+        var balanceBySender = new Dictionary<string, ulong>(StringComparer.Ordinal)
+        {
+            [senderAHex] = 10_000_000UL,
+            [senderBHex] = 10_000_000UL
+        };
+
+        var buffer = new PendingTransactionBuffer(
+            getConfirmedNonce: sender =>
+            {
+                sender = sender.ToLowerInvariant();
+                return confirmedBySender.TryGetValue(sender, out var n) ? n : 0UL;
+            },
+            getBalance: sender =>
+            {
+                sender = sender.ToLowerInvariant();
+                return balanceBySender.TryGetValue(sender, out var b) ? b : 0UL;
+            });
+
+        for (ulong nonce = 1; nonce <= 101UL; nonce++)
+        {
+            ulong fee = nonce == 101UL ? 100_000UL : 1UL;
+            var tx = BuildSignedTx(
+                senderPrivHex: senderA.privHex,
+                senderPubHex: senderA.pubHex,
+                recipientPubHex: recipient.pubHex,
+                amount: 1UL,
+                fee: fee,
+                nonce: nonce);
+
+            Assert(buffer.Add(tx), $"failed to add sender A nonce={nonce}");
+        }
+
+        var txB1 = BuildSignedTx(
+            senderPrivHex: senderB.privHex,
+            senderPubHex: senderB.pubHex,
+            recipientPubHex: recipient.pubHex,
+            amount: 1UL,
+            fee: 50_000UL,
+            nonce: 1UL);
+        var txB2 = BuildSignedTx(
+            senderPrivHex: senderB.privHex,
+            senderPubHex: senderB.pubHex,
+            recipientPubHex: recipient.pubHex,
+            amount: 1UL,
+            fee: 1UL,
+            nonce: 2UL);
+
+        Assert(buffer.Add(txB1), "failed to add sender B nonce=1");
+        Assert(buffer.Add(txB2), "failed to add sender B nonce=2");
+
+        var selected = buffer.GetAllReadyTransactionsSortedByFee();
+        Assert(selected.Count == 103, $"expected 103 selected tx, got {selected.Count}");
+
+        var lastNonceBySender = new Dictionary<string, ulong>(StringComparer.Ordinal);
+        for (int i = 0; i < selected.Count; i++)
+        {
+            var tx = selected[i];
+            string sender = Convert.ToHexString(tx.Sender).ToLowerInvariant();
+
+            ulong confirmed = confirmedBySender.TryGetValue(sender, out var cn) ? cn : 0UL;
+            ulong expected = lastNonceBySender.TryGetValue(sender, out var prev)
+                ? checked(prev + 1UL)
+                : checked(confirmed + 1UL);
+
+            Assert(tx.TxNonce == expected,
+                $"nonce order violated for {sender}: got {tx.TxNonce}, expected {expected} at index {i}");
+
+            lastNonceBySender[sender] = tx.TxNonce;
+        }
     }
 
     private static Transaction BuildCoinbase(string minerPubHex, ulong amount)

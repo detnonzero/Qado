@@ -95,11 +95,7 @@ namespace Qado.Mempool
 
             lock (_gate)
             {
-                if (_buffer.Count >= MaxMempoolTxCount)
-                {
-                    _log?.Warn("Mempool", "Mempool full.");
-                    return false;
-                }
+                bool poolWasFull = _buffer.Count >= MaxMempoolTxCount;
 
                 bool added = _buffer.Add(tx);
                 if (!added)
@@ -109,7 +105,29 @@ namespace Qado.Mempool
                     return false;
                 }
 
+                int replacementEvicted = 0;
+                if (poolWasFull)
+                {
+                    replacementEvicted = _buffer.EvictStaleAndLowFee(maxAgeSeconds: int.MaxValue, maxCount: MaxMempoolTxCount);
+                    bool incomingKept = _buffer.Contains(tx);
+                    if (!incomingKept)
+                    {
+                        _log?.Warn("Mempool", "Mempool full: incoming transaction is not competitive enough.");
+                        ResyncAllCounts_NoThrow();
+                        return false;
+                    }
+
+                    if (replacementEvicted > 0)
+                        ResyncAllCounts_NoThrow();
+                }
+
                 ResyncSenderCount_NoThrow(senderHex);
+
+                if (replacementEvicted > 0)
+                {
+                    _log?.Info("Mempool",
+                        $"Mempool replacement: evicted={replacementEvicted} to admit nonce={tx.TxNonce} fee={tx.Fee}");
+                }
 
                 _log?.Info("Mempool",
                     $"TX added: {Short(senderHex)} → {Short(recipHex)} | Nonce={tx.TxNonce} | Fee={tx.Fee}");
@@ -156,25 +174,13 @@ namespace Qado.Mempool
         {
             if (block?.Transactions == null) return;
 
+            var maxNonceBySender = CollectIncludedMaxNonceBySender(block);
             int removed = 0;
             HashSet<string> touched = new(StringComparer.Ordinal);
 
             lock (_gate)
             {
-                foreach (var tx in block.Transactions)
-                {
-                    if (tx == null) continue;
-                    if (TransactionValidator.IsCoinbase(tx)) continue;
-                    if (tx.Sender is not { Length: 32 }) continue;
-
-                    string senderHex = Convert.ToHexString(tx.Sender).ToLowerInvariant();
-
-                    if (_buffer.Remove(tx))
-                    {
-                        removed++;
-                        touched.Add(senderHex);
-                    }
-                }
+                removed = RemoveIncludedBySenderMaxNonceNoLock(maxNonceBySender, touched);
 
                 foreach (var s in touched)
                     ResyncSenderCount_NoThrow(s);
@@ -311,7 +317,47 @@ namespace Qado.Mempool
         {
             if (block?.Transactions == null) return 0;
 
+            var maxNonceBySender = CollectIncludedMaxNonceBySender(block);
+            return RemoveIncludedBySenderMaxNonceNoLock(maxNonceBySender, touchedSenders);
+        }
+
+        private int RemoveIncludedBySenderMaxNonceNoLock(
+            Dictionary<string, ulong> maxNonceBySender,
+            HashSet<string> touchedSenders)
+        {
+            if (maxNonceBySender == null || maxNonceBySender.Count == 0)
+                return 0;
+
             int removed = 0;
+
+            foreach (var kv in maxNonceBySender)
+            {
+                string senderHex = kv.Key;
+                ulong maxIncludedNonce = kv.Value;
+
+                int before = _buffer.GetCountForSender(senderHex);
+                if (before <= 0)
+                    continue;
+
+                _buffer.RemoveProcessed(senderHex, maxIncludedNonce);
+
+                int after = _buffer.GetCountForSender(senderHex);
+                if (after >= before)
+                    continue;
+
+                removed += before - after;
+                touchedSenders.Add(senderHex);
+            }
+
+            return removed;
+        }
+
+        private static Dictionary<string, ulong> CollectIncludedMaxNonceBySender(Block block)
+        {
+            var maxNonceBySender = new Dictionary<string, ulong>(StringComparer.Ordinal);
+            if (block?.Transactions == null)
+                return maxNonceBySender;
+
             for (int i = 0; i < block.Transactions.Count; i++)
             {
                 var tx = block.Transactions[i];
@@ -320,14 +366,11 @@ namespace Qado.Mempool
                 if (tx.Sender is not { Length: 32 }) continue;
 
                 string senderHex = Convert.ToHexString(tx.Sender).ToLowerInvariant();
-                if (_buffer.Remove(tx))
-                {
-                    removed++;
-                    touchedSenders.Add(senderHex);
-                }
+                if (!maxNonceBySender.TryGetValue(senderHex, out var currentMax) || tx.TxNonce > currentMax)
+                    maxNonceBySender[senderHex] = tx.TxNonce;
             }
 
-            return removed;
+            return maxNonceBySender;
         }
 
         private bool TryAddReorgCandidateNoLog(Transaction tx)

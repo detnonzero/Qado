@@ -6,7 +6,7 @@ namespace Qado.Utils
 {
     public static class Argon2Util
     {
-        public static byte[] ComputeHash(byte[] input, int memoryKb = 1024, int iterations = 1, int parallelism = 1)
+        public static byte[] ComputeHash(byte[] input, int memoryKb = 4, int iterations = 1, int parallelism = 1)
         {
             if (input == null) throw new ArgumentNullException(nameof(input));
             if (memoryKb <= 0) throw new ArgumentOutOfRangeException(nameof(memoryKb));

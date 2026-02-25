@@ -20,7 +20,7 @@ namespace Qado.Storage
             {
                 using var tx = Db.Connection.BeginTransaction();
 
-                BlockStore.SaveBlock(block, tx);
+                BlockStore.SaveBlock(block, tx, BlockIndexStore.StatusSideStatelessAccepted);
 
                 if (TryExtendCanonTipWithState(block, tx, out newHeight))
                 {
@@ -61,11 +61,12 @@ namespace Qado.Storage
             EnsureBlockHash(block);
             block.BlockHeight = newHeight;
 
-            StateApplier.ApplyBlockWithUndo(block, tx);
+                StateApplier.ApplyBlockWithUndo(block, tx);
 
-            BlockStore.SetCanonicalHashAtHeight(newHeight, block.BlockHash!, tx);
-            MetaStore.Set("LatestBlockHash", Convert.ToHexString(block.BlockHash!).ToLowerInvariant(), tx);
-            MetaStore.Set("LatestHeight", newHeight.ToString(), tx);
+                BlockStore.SetCanonicalHashAtHeight(newHeight, block.BlockHash!, tx);
+                BlockIndexStore.SetStatus(block.BlockHash!, BlockIndexStore.StatusCanonicalStateValidated, tx);
+                MetaStore.Set("LatestBlockHash", Convert.ToHexString(block.BlockHash!).ToLowerInvariant(), tx);
+                MetaStore.Set("LatestHeight", newHeight.ToString(), tx);
 
             return true;
         }

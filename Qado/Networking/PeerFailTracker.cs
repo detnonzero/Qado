@@ -6,8 +6,10 @@ namespace Qado.Networking
 {
     public static class PeerFailTracker
     {
-        private const int MaxFails = 3;
-        private static readonly TimeSpan BanThresholdWindow = TimeSpan.FromMinutes(30);
+        // Early-mainnet profile: prefer tolerance over aggressive cooldowns.
+        private const int MaxFails = 20;
+        private static readonly TimeSpan BanThresholdWindow = TimeSpan.FromMinutes(10);
+        public static readonly bool EnforceNetworkCooldown = ReadBoolEnv("QADO_ENFORCE_PEER_COOLDOWN", defaultValue: false);
         private static readonly string SeedNeverBanKey = Normalize(GenesisConfig.GenesisHost);
 
         private static readonly ConcurrentDictionary<string, int> _failCounts = new(StringComparer.Ordinal);
@@ -67,6 +69,9 @@ namespace Qado.Networking
             Reset(address);
             return false;
         }
+
+        public static bool ShouldEnforceCooldown(string address)
+            => EnforceNetworkCooldown && ShouldBan(address);
 
         public static int GetFailCount(string address)
         {
@@ -138,6 +143,28 @@ namespace Qado.Networking
             }
             catch
             {
+            }
+        }
+
+        private static bool ReadBoolEnv(string name, bool defaultValue)
+        {
+            try
+            {
+                string? raw = Environment.GetEnvironmentVariable(name);
+                if (string.IsNullOrWhiteSpace(raw))
+                    return defaultValue;
+
+                string v = raw.Trim().ToLowerInvariant();
+                if (v == "1" || v == "true" || v == "yes" || v == "on")
+                    return true;
+                if (v == "0" || v == "false" || v == "no" || v == "off")
+                    return false;
+
+                return defaultValue;
+            }
+            catch
+            {
+                return defaultValue;
             }
         }
     }

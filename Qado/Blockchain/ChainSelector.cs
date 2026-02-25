@@ -17,11 +17,24 @@ namespace Qado.Blockchain
         private const int ReorgRequeueGossipBurstSize = 16;
         private static readonly TimeSpan ReorgRequeueGossipPause = TimeSpan.FromMilliseconds(20);
         private static readonly LruSet ReorgRequeueGossipSeen = new(capacity: 200_000, ttl: TimeSpan.FromMinutes(30));
+        private static readonly object AdoptionCooldownGate = new();
+        private static readonly Dictionary<string, DateTime> AdoptionCooldownByTip = new(StringComparer.Ordinal);
+        private static readonly TimeSpan AdoptionCooldownTtl = TimeSpan.FromMinutes(15);
+        private const int MaxAdoptionCooldownEntries = 4096;
 
         public static void MaybeAdoptNewTip(byte[] candidateTipHash, ILogSink? log = null, MempoolManager? mempool = null)
         {
             if (candidateTipHash is not { Length: 32 })
                 return;
+
+            if (BlockIndexStore.IsBadOrHasBadAncestor(candidateTipHash))
+                return;
+
+            if (IsInAdoptionCooldown(candidateTipHash, out var cooldownRemaining))
+            {
+                log?.Info("ChainSel", $"Candidate tip in cooldown ({(int)Math.Ceiling(cooldownRemaining.TotalSeconds)}s remaining).");
+                return;
+            }
 
             var canonTipHeight = BlockStore.GetLatestHeight();
             var canonTipHash = BlockStore.GetCanonicalHashAtHeight(canonTipHeight);
@@ -69,6 +82,8 @@ namespace Qado.Blockchain
 
             List<Block> newBlocksAsc = new();
             List<Block> oldBlocksDesc = new();
+            byte[]? stateFailedBlockHash = null;
+            string? adoptionError = null;
 
             lock (Db.Sync)
             {
@@ -97,23 +112,48 @@ namespace Qado.Blockchain
                     BlockStore.DeleteCanonicalFromHeight(fromHeight, tx);
 
                     for (int i = 0; i < newCanonAsc.Count; i++)
+                    {
                         BlockStore.SetCanonicalHashAtHeight(newCanonAsc[i].Height, newCanonAsc[i].Hash, tx);
+                        BlockIndexStore.SetStatus(newCanonAsc[i].Hash, BlockIndexStore.StatusCanonicalStateValidated, tx);
+                    }
 
                     for (int i = 0; i < newBlocksAsc.Count; i++)
-                        StateApplier.ApplyBlockWithUndo(newBlocksAsc[i], tx);
+                    {
+                        try
+                        {
+                            StateApplier.ApplyBlockWithUndo(newBlocksAsc[i], tx);
+                        }
+                        catch (Exception ex)
+                        {
+                            stateFailedBlockHash = newBlocksAsc[i].BlockHash;
+                            throw new InvalidOperationException(
+                                $"State apply failed at height {newBlocksAsc[i].BlockHeight}: {ex.Message}",
+                                ex);
+                        }
+                    }
 
                     MetaStore.Set("LatestBlockHash", Hex(candidateTipHash), tx);
                     MetaStore.Set("LatestHeight", candTipHeight.ToString(), tx);
 
                     tx.Commit();
+                    ClearAdoptionCooldown_NoThrow(candidateTipHash);
                     log?.Info("ChainSel", $"Adopted tip {ToHex(candidateTipHash, 16)} @ height {candTipHeight} (fromHeight={fromHeight}).");
                 }
                 catch (Exception ex)
                 {
-                    log?.Error("ChainSel", $"Atomic adoption failed: {ex.Message}");
-                    TryNotifyUiReload();
-                    return;
+                    adoptionError = ex.Message;
                 }
+            }
+
+            if (!string.IsNullOrWhiteSpace(adoptionError))
+            {
+                if (stateFailedBlockHash is { Length: 32 })
+                    MarkStateInvalid_NoThrow(stateFailedBlockHash, log);
+
+                RememberAdoptionCooldown_NoThrow(candidateTipHash);
+                log?.Error("ChainSel", $"Atomic adoption failed: {adoptionError}");
+                TryNotifyUiReload();
+                return;
             }
 
             if (mempool != null)
@@ -313,6 +353,12 @@ namespace Qado.Blockchain
 
             while (curHash is { Length: 32 })
             {
+                if (BlockIndexStore.IsBadOrHasBadAncestor(curHash))
+                {
+                    log?.Warn("ChainSel", $"Candidate chain contains state-invalid block {ToHex(curHash, 16)}.");
+                    return false;
+                }
+
                 if (!BlockIndexStore.TryGetMeta(curHash, out var h, out var prevHash, out _))
                 {
                     log?.Warn("ChainSel", $"Missing block_index row for hash {ToHex(curHash, 16)} while walking candidate chain.");
@@ -454,6 +500,106 @@ namespace Qado.Blockchain
             }
 
             return 0;
+        }
+
+        private static bool IsInAdoptionCooldown(byte[] tipHash, out TimeSpan remaining)
+        {
+            remaining = TimeSpan.Zero;
+            if (tipHash is not { Length: 32 }) return false;
+
+            string key = Hex(tipHash);
+            lock (AdoptionCooldownGate)
+            {
+                var now = DateTime.UtcNow;
+                PruneAdoptionCooldown_NoThrow(now);
+                if (!AdoptionCooldownByTip.TryGetValue(key, out var until))
+                    return false;
+
+                if (until <= now)
+                {
+                    AdoptionCooldownByTip.Remove(key);
+                    return false;
+                }
+
+                remaining = until - now;
+                return true;
+            }
+        }
+
+        private static void RememberAdoptionCooldown_NoThrow(byte[] tipHash)
+        {
+            if (tipHash is not { Length: 32 }) return;
+
+            try
+            {
+                string key = Hex(tipHash);
+                lock (AdoptionCooldownGate)
+                {
+                    var now = DateTime.UtcNow;
+                    AdoptionCooldownByTip[key] = now + AdoptionCooldownTtl;
+                    PruneAdoptionCooldown_NoThrow(now);
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private static void ClearAdoptionCooldown_NoThrow(byte[] tipHash)
+        {
+            if (tipHash is not { Length: 32 }) return;
+
+            try
+            {
+                string key = Hex(tipHash);
+                lock (AdoptionCooldownGate)
+                {
+                    AdoptionCooldownByTip.Remove(key);
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private static void PruneAdoptionCooldown_NoThrow(DateTime now)
+        {
+            if (AdoptionCooldownByTip.Count == 0)
+                return;
+
+            var stale = new List<string>();
+            foreach (var kv in AdoptionCooldownByTip)
+            {
+                if (kv.Value <= now)
+                    stale.Add(kv.Key);
+            }
+
+            for (int i = 0; i < stale.Count; i++)
+                AdoptionCooldownByTip.Remove(stale[i]);
+
+            if (AdoptionCooldownByTip.Count <= MaxAdoptionCooldownEntries)
+                return;
+
+            var ordered = new List<KeyValuePair<string, DateTime>>(AdoptionCooldownByTip);
+            ordered.Sort((a, b) => a.Value.CompareTo(b.Value));
+            int remove = ordered.Count - MaxAdoptionCooldownEntries;
+            for (int i = 0; i < remove; i++)
+                AdoptionCooldownByTip.Remove(ordered[i].Key);
+        }
+
+        private static void MarkStateInvalid_NoThrow(byte[] blockHash, ILogSink? log)
+        {
+            if (blockHash is not { Length: 32 }) return;
+
+            try
+            {
+                _ = BlockIndexStore.MarkBadAndDescendants(blockHash, (int)BadChainReason.BlockStateInvalid);
+                log?.Warn("ChainSel", $"Marked block as state-invalid: {ToHex(blockHash, 16)}");
+            }
+            catch (Exception ex)
+            {
+                log?.Warn("ChainSel", $"Failed to mark state-invalid block: {ex.Message}");
+            }
         }
 
 

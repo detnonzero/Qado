@@ -15,20 +15,24 @@ namespace Qado.Storage
             Db.Connection ?? throw new InvalidOperationException("Db not initialized");
 
 
-        public static void SaveBlock(Block block, SqliteTransaction? tx = null)
+        public static void SaveBlock(
+            Block block,
+            SqliteTransaction? tx = null,
+            int statusFlags = BlockIndexStore.StatusCanonicalStateValidated)
         {
             if (block == null) throw new ArgumentNullException(nameof(block));
             if (block.Header == null) throw new ArgumentException("block.Header is null", nameof(block));
 
             lock (Db.Sync)
             {
-                SaveBlock_NoLock(block, tx);
+                SaveBlock_NoLock(block, tx, statusFlags);
             }
         }
 
-        private static void SaveBlock_NoLock(Block block, SqliteTransaction? tx)
+        private static void SaveBlock_NoLock(Block block, SqliteTransaction? tx, int statusFlags)
         {
             EnsureCanonicalBlockHash(block);
+            BlockIndexStore.UpsertHeaderBytes(block.BlockHash!, block.Header!.ToHashBytes(), tx);
 
             int payloadSize = BlockBinarySerializer.GetSize(block);
             var payload = new byte[payloadSize];
@@ -41,13 +45,17 @@ namespace Qado.Storage
             if (prev is { Length: 32 })
                 parentWork = BlockIndexStore.GetChainwork(prev, tx);
 
-            var target = Difficulty.ClampTarget(block.Header.Target);
+            if (!Difficulty.IsValidTarget(block.Header.Target))
+                throw new InvalidOperationException("Block header target out of consensus range.");
+
+            var target = (byte[])block.Header.Target.Clone();
             BigInteger diff = Difficulty.TargetToDifficulty(target);
             UInt128 delta = BigToUInt128Sat(diff);
             UInt128 cw = parentWork + (delta == 0 ? 1 : delta);
 
             const int fileId = 0;
-            const int status = 1; // status: known/valid
+            if (statusFlags <= 0)
+                statusFlags = BlockIndexStore.StatusCanonicalStateValidated;
 
             BlockIndexStore.Upsert(
                 hash: block.BlockHash!,
@@ -60,7 +68,7 @@ namespace Qado.Storage
                 fileId: fileId,
                 recordOffset: recOff,
                 recordSize: recSize,
-                statusFlags: status,
+                statusFlags: statusFlags,
                 tx: tx);
         }
 

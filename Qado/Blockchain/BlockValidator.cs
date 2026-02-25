@@ -113,7 +113,12 @@ namespace Qado.Blockchain
 
             Block? prevBlock = null;
 
-            if (block.BlockHeight > 0)
+            bool isGenesisCandidate =
+                block.BlockHeight == 0 &&
+                header.PreviousBlockHash is { Length: 32 } &&
+                IsAllZero32(header.PreviousBlockHash);
+
+            if (!isGenesisCandidate)
             {
                 if (header.PreviousBlockHash is not { Length: 32 })
                 {
@@ -162,12 +167,6 @@ namespace Qado.Blockchain
             }
             else
             {
-                if (header.PreviousBlockHash is not { Length: 32 } || !IsAllZero32(header.PreviousBlockHash))
-                {
-                    reason = "Genesis must have PreviousBlockHash = 0x00..00";
-                    return false;
-                }
-
                 if (!GenesisBlockProvider.ValidateGenesisBlock(block, out var gReason))
                 {
                     reason = $"Invalid genesis: {gReason}";
@@ -175,9 +174,13 @@ namespace Qado.Blockchain
                 }
             }
 
-            var haveTarget = Difficulty.ClampTarget(header.Target);
-            if (haveTarget is null || haveTarget.Length != 32) { reason = "ClampTarget failed"; return false; }
-            if (IsAllZero32(haveTarget)) { reason = "Invalid target (0)"; return false; }
+            if (!Difficulty.IsValidTarget(header.Target))
+            {
+                reason = "Invalid target";
+                return false;
+            }
+
+            var haveTarget = header.Target;
 
             if (block.BlockHeight > 0 && prevBlock != null)
             {

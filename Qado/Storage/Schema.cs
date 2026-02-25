@@ -39,6 +39,21 @@ CREATE TABLE IF NOT EXISTS peers(
 CREATE INDEX IF NOT EXISTS idx_peers_last_seen    ON peers(last_seen DESC);
 CREATE INDEX IF NOT EXISTS idx_peers_ip_last_seen ON peers(ip, last_seen DESC);
 
+CREATE TABLE IF NOT EXISTS peer_announced(
+  id          BLOB(32) PRIMARY KEY,
+  announced_at INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_peer_announced_at ON peer_announced(announced_at);
+
+CREATE TABLE IF NOT EXISTS peer_quarantine(
+  ip       TEXT NOT NULL,
+  port     INTEGER NOT NULL,
+  until_ts INTEGER NOT NULL,
+  reason   TEXT,
+  PRIMARY KEY(ip, port)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_peer_quarantine_until ON peer_quarantine(until_ts);
+
 CREATE TABLE IF NOT EXISTS keys(
   pub  BLOB(32) PRIMARY KEY,
   priv BLOB NOT NULL
@@ -68,11 +83,23 @@ CREATE TABLE IF NOT EXISTS block_index(
   file_id     INTEGER NOT NULL,
   file_offset INTEGER NOT NULL,
   file_size   INTEGER NOT NULL,
-  status      INTEGER NOT NULL
+  status      INTEGER NOT NULL,
+  is_bad      INTEGER NOT NULL DEFAULT 0,
+  bad_reason  INTEGER NOT NULL DEFAULT 0,
+  bad_ancestor INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS header_store(
+  hash   BLOB(32) PRIMARY KEY,
+  header BLOB NOT NULL
 ) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS idx_bi_height ON block_index(height);
 CREATE INDEX IF NOT EXISTS idx_bi_prev   ON block_index(prev_hash);
+CREATE INDEX IF NOT EXISTS idx_parent    ON block_index(prev_hash);
+CREATE INDEX IF NOT EXISTS idx_bi_status ON block_index(status);
+CREATE INDEX IF NOT EXISTS idx_bi_chainwork ON block_index(chainwork DESC);
+CREATE INDEX IF NOT EXISTS idx_bi_bad ON block_index(is_bad, bad_ancestor);
 
 CREATE TABLE IF NOT EXISTS canon(
   height INTEGER PRIMARY KEY,
@@ -100,11 +127,14 @@ CREATE INDEX IF NOT EXISTS idx_tx_txid   ON tx_index(txid);
 
             RequireColumns(tx, "block_index", new[]
             {
-                "hash","prev_hash","height","ts","target","miner","chainwork","file_id","file_offset","file_size","status"
+                "hash","prev_hash","height","ts","target","miner","chainwork","file_id","file_offset","file_size","status","is_bad","bad_reason","bad_ancestor"
             });
+            RequireColumns(tx, "header_store", new[] { "hash", "header" });
 
             RequireColumns(tx, "canon", new[] { "height", "hash" });
             RequireColumns(tx, "meta", new[] { "key", "value" });
+            RequireColumns(tx, "peer_announced", new[] { "id", "announced_at" });
+            RequireColumns(tx, "peer_quarantine", new[] { "ip", "port", "until_ts", "reason" });
 
             RequireColumns(tx, "tx_index", new[] { "txid", "block_hash", "height", "offset", "size" });
 

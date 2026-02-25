@@ -54,6 +54,9 @@ namespace Qado
         private const int PageSize = 50;
         private const int PeerReloadDebounceMs = 300;
         private const int NodeStatusDebounceMs = 400;
+        private const int BlockExplorerRefreshDebounceMs = 5000;
+        private static readonly TimeSpan MempoolCleanupInterval = TimeSpan.FromSeconds(15);
+        private const int MempoolCleanupMaxAgeSeconds = 3600;
         private static readonly TimeSpan PeerSeenRecentlyWindow = TimeSpan.FromMinutes(5);
 
         private ulong _nextHeightToLoad = 0;
@@ -68,6 +71,7 @@ namespace Qado
         private int _peersReloadWorkerRunning;
         private int _nodeStatusRefreshRequested;
         private int _nodeStatusRefreshWorkerRunning;
+        private int _blockExplorerRefreshRequested;
 
         private readonly HashSet<ulong> _displayedHeights = new();
 
@@ -96,6 +100,13 @@ namespace Qado
             {
                 if (_isClosing) return;
                 try { Dispatcher.BeginInvoke(new Action(RefreshNodeStatusHeader)); } catch { }
+            }, null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+
+            _blockExplorerTimer = new Timer(_ =>
+            {
+                if (_isClosing) return;
+                if (Interlocked.Exchange(ref _blockExplorerRefreshRequested, 0) == 0) return;
+                try { Dispatcher.BeginInvoke(new Action(PrependNewBlocksOrReloadIfReorg)); } catch { }
             }, null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
 
             PeerStore.PeerListChanged += OnPeerListChanged;
@@ -134,6 +145,23 @@ namespace Qado
                     _mempool,
                     _mempoolPreview,
                     onUiTick: ScheduleNodeStatusRefresh);
+
+                _mempoolCleanupTimer = new Timer(_ =>
+                {
+                    if (_isClosing) return;
+
+                    try
+                    {
+                        int evicted = _mempool.EvictStaleAndLowFee(MempoolCleanupMaxAgeSeconds);
+                        int purged = _mempool.PurgeInvalid();
+                        if (evicted > 0 || purged > 0)
+                            ScheduleNodeStatusRefresh();
+                    }
+                    catch (Exception ex)
+                    {
+                        Warn("Mempool", $"Cleanup failed: {ex.Message}");
+                    }
+                }, null, MempoolCleanupInterval, MempoolCleanupInterval);
 
                 PopulateKeyDropdown();
 
@@ -294,7 +322,7 @@ namespace Qado
         {
             try
             {
-                Dispatcher.BeginInvoke(new Action(ReloadAllBlocks));
+                ScheduleBlockExplorerRefresh();
 
                 Dispatcher.BeginInvoke(new Action(() =>
                 {
@@ -312,6 +340,17 @@ namespace Qado
             catch
             {
             }
+        }
+
+        private void ScheduleBlockExplorerRefresh()
+        {
+            if (_isClosing || !_initialized)
+                return;
+
+            Interlocked.Exchange(ref _blockExplorerRefreshRequested, 1);
+            _blockExplorerTimer?.Change(
+                TimeSpan.FromMilliseconds(BlockExplorerRefreshDebounceMs),
+                Timeout.InfiniteTimeSpan);
         }
 
         private void RequestTipAdoption()
@@ -679,7 +718,18 @@ namespace Qado
             try
             {
                 using var cmd = Db.Connection.CreateCommand();
-                cmd.CommandText = "SELECT ip, port, last_seen FROM peers ORDER BY last_seen DESC LIMIT 200;";
+                cmd.CommandText = @"
+SELECT p.ip, p.port, p.last_seen, IFNULL(a.announced_at, 0)
+FROM peers p
+LEFT JOIN peer_announced a ON a.id = p.id
+ORDER BY
+  CASE
+    WHEN p.last_seen > 0 THEN p.last_seen
+    ELSE IFNULL(a.announced_at, 0)
+  END DESC,
+  p.ip ASC,
+  p.port ASC
+LIMIT 200;";
                 using var r = cmd.ExecuteReader();
                 while (r.Read())
                 {
@@ -687,18 +737,35 @@ namespace Qado
                     int port = r.GetInt32(1);
                     if (SelfPeerGuard.IsSelf(ip, port)) continue;
 
-                    long ts = r.GetInt64(2);
-                    bool neverSeen = ts <= 0;
-                    var seenAt = neverSeen ? DateTimeOffset.UnixEpoch : DateTimeOffset.FromUnixTimeSeconds(ts);
-                    string lastSeenText = neverSeen
-                        ? "-"
-                        : $"{seenAt.UtcDateTime:yyyy-MM-dd HH:mm:ss} UTC";
+                    long lastSeenTs = r.GetInt64(2);
+                    long announcedTs = r.GetInt64(3);
+
+                    bool hasSeen = lastSeenTs > 0;
+                    long displayTs = hasSeen ? lastSeenTs : announcedTs;
+                    bool hasAnyTimestamp = displayTs > 0;
+                    var seenAt = hasAnyTimestamp ? DateTimeOffset.FromUnixTimeSeconds(displayTs) : DateTimeOffset.UnixEpoch;
+
+                    string lastSeenText;
+                    if (!hasAnyTimestamp)
+                    {
+                        lastSeenText = "-";
+                    }
+                    else if (hasSeen)
+                    {
+                        lastSeenText = $"{seenAt.UtcDateTime:yyyy-MM-dd HH:mm:ss} UTC";
+                    }
+                    else
+                    {
+                        lastSeenText = $"{seenAt.UtcDateTime:yyyy-MM-dd HH:mm:ss} UTC (announced)";
+                    }
 
                     rows.Add(new PeerRow
                     {
                         Endpoint = $"{ip}:{port}",
                         LastSeenUtc = lastSeenText,
-                        Status = GetPeerStatus(ip, port, seenAt)
+                        Status = hasSeen
+                            ? GetPeerStatus(ip, port, seenAt)
+                            : GetAnnouncedPeerStatus(ip, port, seenAt, hasAnyTimestamp)
                     });
                 }
 
@@ -739,6 +806,26 @@ namespace Qado
                 return "Seen recently";
 
             return "Stale";
+        }
+
+        private string GetAnnouncedPeerStatus(string ip, int port, DateTimeOffset announcedAt, bool hasTimestamp)
+        {
+            if (_p2pNode?.IsPeerConnected(ip, port) == true)
+                return "Connected";
+
+            bool coolingDown = PeerFailTracker.ShouldBan(ip);
+            if (!hasTimestamp)
+                return coolingDown ? "Unverified (cooling down)" : "Unverified";
+
+            bool stale = (DateTimeOffset.UtcNow - announcedAt) > PeerSeenRecentlyWindow;
+
+            if (coolingDown && stale)
+                return "Unverified (cooling down)";
+
+            if (coolingDown)
+                return "Announced (cooling down)";
+
+            return stale ? "Unverified" : "Announced";
         }
 
         private void RefreshNodeStatusHeader()

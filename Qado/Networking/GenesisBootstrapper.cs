@@ -19,12 +19,10 @@ namespace Qado.Networking
 
             _ = node.ConnectSeedAndKnownPeersAsync(ct);
 
-            _ = Task.Run(() => BlockSyncStarter.StartAsync(mempool, log, ct), ct);
-
             node.StartPeerExchangeLoop(ct);
             node.StartReconnectLoop(ct);
 
-            log?.Info("Bootstrap", "P2P started, seed+known peers dialed, reconnect + blocksync triggered.");
+            log?.Info("Bootstrap", "P2P started, seed+known peers dialed, reconnect + sync manager triggered.");
             return Task.FromResult(node);
         }
     }

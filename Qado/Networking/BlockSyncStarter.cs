@@ -31,6 +31,7 @@ namespace Qado.Networking
         private static readonly TimeSpan MaxIdleDelay = TimeSpan.FromMinutes(2);
         private const int MaxIdleBackoffShift = 4; // up to 16x base delay
         private const double IdleJitterFraction = 0.20;
+        private static readonly TimeSpan SyncProgressLogInterval = TimeSpan.FromSeconds(5);
         private static readonly SemaphoreSlim ImmediateSyncSignal = new(0, 1);
         private static readonly object ImmediateSyncGate = new();
         private static readonly TimeSpan ImmediateSyncCooldown = TimeSpan.FromSeconds(5);
@@ -42,6 +43,7 @@ namespace Qado.Networking
         private static readonly Dictionary<string, DateTime> DialablePeerLastSuccessUtc = new(StringComparer.Ordinal);
         private static readonly TimeSpan DialablePeerTtl = TimeSpan.FromDays(1);
         private const int MaxDialablePeerEntries = 2048;
+        private const int MaxPeersPerSyncRound = 8;
 
         public static async Task StartAsync(MempoolManager mempool, ILogSink? log = null, CancellationToken ct = default)
         {
@@ -72,7 +74,7 @@ namespace Qado.Networking
                     var port = port0 > 0 ? port0 : DefaultP2PPort;
                     var peerKey = NormalizePeerKey(host);
 
-                    if (PeerFailTracker.ShouldBan(peerKey))
+                    if (PeerFailTracker.ShouldEnforceCooldown(peerKey))
                     {
                         skippedCoolingDown++;
                         continue;
@@ -82,7 +84,7 @@ namespace Qado.Networking
 
                     try
                     {
-                        log?.Info("BlockSync", $"Connect {host}:{port} (IPv4) ...");
+                        log?.Info("BlockSync", $"Connect {EndpointLogFormatter.FormatHostPort(host, port)} (IPv4) ...");
                         using var client = new TcpClient(AddressFamily.InterNetwork);
 #if NET8_0_OR_GREATER
                         await client.ConnectAsync(host, port, ct).ConfigureAwait(false);
@@ -107,7 +109,6 @@ namespace Qado.Networking
                             if (!tipOk)
                             {
                                 ReportPeerDialFailure(host, port);
-                                PeerFailTracker.ReportFailure(peerKey);
                                 log?.Warn("BlockSync", "Peer did not provide a valid TIP.");
                                 break;
                             }
@@ -223,8 +224,7 @@ namespace Qado.Networking
                     catch (Exception ex)
                     {
                         ReportPeerDialFailure(host, port);
-                        PeerFailTracker.ReportFailure(peerKey);
-                        log?.Warn("BlockSync", $"Peer {host}:{port} failed: {ex.Message}");
+                        log?.Warn("BlockSync", $"Peer {EndpointLogFormatter.FormatHostPort(host, port)} failed: {ex.Message}");
                     }
 
                     if (inSyncConfirmed)
@@ -588,6 +588,7 @@ namespace Qado.Networking
             ulong lastStoredHeight = GetLatestHeightDirect();
             byte[]? lastBlockHash = null;
             bool madeProgress = false;
+            DateTime lastProgressLogUtc = DateTime.UtcNow;
 
             while (nextToRequest <= toHeight && (nextToRequest - nextToProcess) < (ulong)fetchWindow)
             {
@@ -661,7 +662,7 @@ namespace Qado.Networking
                         {
                             using var trx = Db.Connection!.BeginTransaction();
 
-                            BlockStore.SaveBlock(ready, trx);
+                            BlockStore.SaveBlock(ready, trx, BlockIndexStore.StatusSideStatelessAccepted);
 
                             for (int i = 0; i < txOffsets.Length; i++)
                             {
@@ -684,7 +685,14 @@ namespace Qado.Networking
 
                     var after = GetLatestHeightDirect();
                     ulong inFlight = nextToRequest > nextToProcess ? (nextToRequest - nextToProcess) : 0UL;
-                    log?.Info("BlockSync", $"Synced {nextToProcess}/{toHeight} (dbMax={after}, inFlight={inFlight})");
+                    var nowUtc = DateTime.UtcNow;
+                    bool progressLogByTime = (nowUtc - lastProgressLogUtc) >= SyncProgressLogInterval;
+                    bool isFinalProgressLog = nextToProcess >= toHeight;
+                    if (isFinalProgressLog || progressLogByTime)
+                    {
+                        log?.Info("BlockSync", $"Synced {nextToProcess}/{toHeight} (dbMax={after}, inFlight={inFlight})");
+                        lastProgressLogUtc = nowUtc;
+                    }
 
                     if (after < nextToProcess)
                     {
@@ -998,10 +1006,29 @@ namespace Qado.Networking
                 }
             }
 
-            if (TrySelectBestDialablePeer(candidates, out var selected))
-                return new List<(string, int)> { selected };
+            if (candidates.Count == 0)
+                return candidates;
 
-            return new List<(string, int)>();
+            var selectedPeers = new List<(string ip, int port)>(Math.Min(MaxPeersPerSyncRound, candidates.Count));
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+
+            void TryAdd(string hostRaw, int portRaw)
+            {
+                string host = NormalizeHost(hostRaw);
+                int port = portRaw > 0 && portRaw <= 65535 ? portRaw : DefaultP2PPort;
+                string key = BuildDialablePeerKey(host, port);
+                if (key.Length == 0) return;
+                if (!seen.Add(key)) return;
+                selectedPeers.Add((host, port));
+            }
+
+            if (TrySelectBestDialablePeer(candidates, out var selected))
+                TryAdd(selected.Item1, selected.Item2);
+
+            for (int i = 0; i < candidates.Count && selectedPeers.Count < MaxPeersPerSyncRound; i++)
+                TryAdd(candidates[i].Item1, candidates[i].Item2);
+
+            return selectedPeers;
         }
 
         private static string NormalizePeerKey(string host)
@@ -1102,11 +1129,24 @@ namespace Qado.Networking
                 byte networkId = payload[1];
                 if (networkId != GenesisConfig.NetworkId)
                 {
-                    log?.Warn("BlockSync", $"Rejected peer from foreign network id {networkId}.");
+                    var remote = client.Client.RemoteEndPoint?.ToString() ?? "unknown";
+                    log?.Warn(
+                        "BlockSync",
+                        $"Rejected peer {EndpointLogFormatter.FormatEndpoint(remote)} from foreign network id {networkId} (expected {GenesisConfig.NetworkId}, raw={remote}).");
                     return false;
                 }
 
-                _ = payload.AsSpan(2, 32); // peerId is untrusted metadata; do not use as DB identity.
+                var peerId = payload.AsSpan(2, 32); // peerId is untrusted metadata; use only for self-loop detection.
+                if (peerId.SequenceEqual(GetOrCreateNodeId()))
+                {
+                    var endpointIp = (client.Client.RemoteEndPoint as IPEndPoint)?.Address?.ToString();
+                    if (!string.IsNullOrWhiteSpace(endpointIp))
+                        SelfPeerGuard.RememberSelf(endpointIp);
+
+                    log?.Warn("BlockSync", $"Rejected self-loop peer {EndpointLogFormatter.FormatHost(endpointIp)} (same node id).");
+                    return false;
+                }
+
                 ushort portRaw = BinaryPrimitives.ReadUInt16LittleEndian(payload.AsSpan(34, 2));
                 int port = portRaw == 0 ? DefaultP2PPort : portRaw;
                 var ip = (client.Client.RemoteEndPoint as IPEndPoint)?.Address?.ToString();

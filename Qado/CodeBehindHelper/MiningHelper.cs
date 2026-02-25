@@ -256,7 +256,7 @@ namespace Qado.CodeBehindHelper
                         if (block.BlockHash is not { Length: 32 } || IsZero32(block.BlockHash))
                             block.BlockHash = block.ComputeBlockHash();
 
-                        BlockStore.SaveBlock(block, tx);
+                        BlockStore.SaveBlock(block, tx, BlockIndexStore.StatusCanonicalStateValidated);
 
                         StateApplier.ApplyBlockWithUndo(block, tx);
 
@@ -271,7 +271,7 @@ namespace Qado.CodeBehindHelper
                         if (block.BlockHash is not { Length: 32 } || IsZero32(block.BlockHash))
                             block.BlockHash = block.ComputeBlockHash();
 
-                        BlockStore.SaveBlock(block, tx);
+                        BlockStore.SaveBlock(block, tx, BlockIndexStore.StatusSideStatelessAccepted);
                     }
 
                     tx.Commit();

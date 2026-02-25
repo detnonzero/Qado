@@ -20,7 +20,11 @@ namespace Qado.Networking
         Ping = 12,
         Pong = 13,
 
-        GetTx = 14
+        GetTx = 14,
+
+        GetData = 15,
+        Headers = 16,
+        GetHeaders = 17
     }
 }
 

@@ -48,7 +48,7 @@ namespace Qado.Blockchain
         }
 
         public byte[] ComputeTransactionHash()
-            => SHA256.HashData(ToHashBytes());
+            => SHA256.HashData(ToBytes());
 
         public void ValidateBasicOrThrow()
         {

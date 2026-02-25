@@ -7,13 +7,13 @@ namespace Qado.Networking
             public const string Name = "mainnet";
             public const uint ChainId = 1u;
             public const byte NetworkId = 0x01;
-            public const int P2PPort = 34000;
+            public const int P2PPort = 34001;
             public const int ApiPort = 18080;
             public const string GenesisHost = "82.165.63.4";
-            public const string GenesisMinerHex = "C3B723B07AB5DA5A3D2F5538CABED0D4D5BF025BFD572AB3812F7A75858C0525";
-            public const ulong GenesisTimestamp = 1771192800UL;
+            public const string GenesisMinerHex = "6A37C7D48887658C233C80ED6D1F8A28753E1F9E209867ABE9278D714033BA80";
+            public const ulong GenesisTimestamp = 1772055600UL;
             public const uint GenesisNonce = 0u;
-            public const string GenesisTargetHex = "0000FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF";
+            public const string GenesisTargetHex = "00000FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF";
             public const string DataDirectoryName = "data-mainnet";
             public const string DbFileName = "qado.db";
             public const string BlockLogFileName = "blocks.dat";
@@ -22,10 +22,10 @@ namespace Qado.Networking
         public static class Testnet
         {
             public const string Name = "testnet";
-            public const uint ChainId = 1000u;
-            public const byte NetworkId = 0x02;
-            public const int P2PPort = 34000;
-            public const int ApiPort = 18080;
+            public const uint ChainId = 1001u;
+            public const byte NetworkId = 0x10;
+            public const int P2PPort = 34001;
+            public const int ApiPort = 19080;
             public const string GenesisHost = "82.165.63.4";
             public const string GenesisMinerHex = Mainnet.GenesisMinerHex;
             public const ulong GenesisTimestamp = Mainnet.GenesisTimestamp;

@@ -72,9 +72,8 @@ namespace Qado.Blockchain
 
         public byte[] ToHashBytesWithNonce(uint nonceCandidate)
         {
-            var targetClamped = global::Qado.Blockchain.Difficulty.ClampTarget(_target);
-            if (targetClamped is null || targetClamped.Length != HashSize)
-                throw new InvalidOperationException("ClampTarget(Target) must return 32 bytes.");
+            if (!global::Qado.Blockchain.Difficulty.IsValidTarget(_target))
+                throw new InvalidOperationException("Target out of consensus range.");
 
             var buf = new byte[PowHeaderSize];
             int o = 0;
@@ -86,7 +85,7 @@ namespace Qado.Blockchain
 
             BinaryPrimitives.WriteUInt64BigEndian(buf.AsSpan(o, 8), Timestamp); o += 8;
 
-            targetClamped.AsSpan(0, 32).CopyTo(buf.AsSpan(o, 32)); o += 32;
+            _target.AsSpan(0, 32).CopyTo(buf.AsSpan(o, 32)); o += 32;
 
             BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(o, 4), nonceCandidate); o += 4;
 

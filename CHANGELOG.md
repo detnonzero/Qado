@@ -2,7 +2,33 @@
 
 All notable changes to this project are documented in this file.
 
-## [Unreleased]
+## [0.2.0] - 2026-02-25
+
+### Added
+- Mainnet-readiness review coverage across consensus, P2P networking, storage, API surface, and operational defaults.
+
+### Changed
+- PoW parameter profile is explicitly treated as a design choice for fast validation and low node resource usage:
+- `Argon2id` remains fixed at `memory=4 KiB`, `iterations=1`, `parallelism=1`.
+- Tradeoff is documented: lower validation cost and higher throughput vs. lower attack-cost threshold.
+- Header sync architecture risk documented:
+- Sync currently progresses with one active peer path per pass.
+- Peer-fail/cooldown posture documented:
+- Cooldown enforcement remains opt-in (`QADO_ENFORCE_PEER_COOLDOWN=false` by default).
+- Seed host exemption from fail-ban remains active.
+- API exposure posture documented:
+- Exchange API can bind publicly on `0.0.0.0` and ships without built-in auth/TLS.
+- Networking topology risk documented:
+- Bootstrap remains single-seed anchored (`82.165.63.4`).
+- Network profile switching remains compile-time (`UseTestnet` constant).
+- Storage durability tradeoff documented:
+- SQLite runs with `WAL` and `synchronous=NORMAL`.
+
+### Notes
+- Project lifecycle status remains `alpha / testnet phase`.
+- Mainnet-readiness is tracked as in-progress with open hardening items.
+
+## [0.1.4]
 
 ### Added
 

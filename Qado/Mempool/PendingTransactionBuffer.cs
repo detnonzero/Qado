@@ -51,6 +51,25 @@ namespace Qado.Mempool
                 return _buffer.TryGetValue(senderHex, out var list) ? list.Count : 0;
         }
 
+        public bool Contains(Transaction tx)
+        {
+            if (tx is null) return false;
+
+            byte[] txidBytes;
+            try
+            {
+                txidBytes = tx.ComputeTransactionHash();
+            }
+            catch
+            {
+                return false;
+            }
+
+            string txIdHex = Hex(txidBytes);
+            lock (_sync)
+                return _txIdTimestamps.ContainsKey(txIdHex);
+        }
+
         public bool Add(Transaction tx)
         {
             if (tx is null) return false;
@@ -297,7 +316,8 @@ namespace Qado.Mempool
         {
             lock (_sync)
             {
-                var readyList = new List<Transaction>();
+                // Build nonce-safe ready chains per sender first.
+                var readyBySender = new Dictionary<string, Queue<Transaction>>(StringComparer.Ordinal);
 
                 foreach (var (senderHex, txList) in _buffer)
                 {
@@ -307,23 +327,85 @@ namespace Qado.Mempool
                     if (!TryAddU64(confirmedNonce, 1UL, out ulong expectedNonce))
                         continue;
 
+                    var chain = new Queue<Transaction>();
                     while (txList.TryGetValue(expectedNonce, out var tx))
                     {
                         if (!TryCost(tx.Amount, tx.Fee, out var cost)) break;
                         if (cost > runningBalance) break;
 
                         runningBalance -= cost;
-                        readyList.Add(tx);
+                        chain.Enqueue(tx);
 
                         if (!TryAddU64(expectedNonce, 1UL, out expectedNonce))
                             break;
                     }
+
+                    if (chain.Count > 0)
+                        readyBySender[senderHex] = chain;
                 }
 
-                return readyList
-                    .OrderByDescending(tx => tx.Fee)
-                    .ThenBy(tx => tx.TxNonce)
-                    .ToList();
+                if (readyBySender.Count == 0)
+                    return new List<Transaction>();
+
+                // Merge sender chains by fee while preserving strict per-sender nonce order.
+                var senderOrder = readyBySender.Keys.OrderBy(k => k, StringComparer.Ordinal).ToList();
+                int total = 0;
+                for (int i = 0; i < senderOrder.Count; i++)
+                    total += readyBySender[senderOrder[i]].Count;
+
+                var merged = new List<Transaction>(total);
+                while (true)
+                {
+                    string? bestSender = null;
+                    Transaction? bestTx = null;
+
+                    for (int i = 0; i < senderOrder.Count; i++)
+                    {
+                        string sender = senderOrder[i];
+                        var queue = readyBySender[sender];
+                        if (queue.Count == 0)
+                            continue;
+
+                        var candidate = queue.Peek();
+                        if (bestTx == null)
+                        {
+                            bestTx = candidate;
+                            bestSender = sender;
+                            continue;
+                        }
+
+                        if (candidate.Fee > bestTx.Fee)
+                        {
+                            bestTx = candidate;
+                            bestSender = sender;
+                            continue;
+                        }
+
+                        if (candidate.Fee == bestTx.Fee)
+                        {
+                            if (candidate.TxNonce < bestTx.TxNonce)
+                            {
+                                bestTx = candidate;
+                                bestSender = sender;
+                                continue;
+                            }
+
+                            if (candidate.TxNonce == bestTx.TxNonce &&
+                                string.CompareOrdinal(sender, bestSender) < 0)
+                            {
+                                bestTx = candidate;
+                                bestSender = sender;
+                            }
+                        }
+                    }
+
+                    if (bestSender == null)
+                        break;
+
+                    merged.Add(readyBySender[bestSender].Dequeue());
+                }
+
+                return merged;
             }
         }
 

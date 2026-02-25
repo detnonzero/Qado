@@ -59,8 +59,8 @@ namespace Qado.Serialization
             Validate32(h.PreviousBlockHash, nameof(h.PreviousBlockHash));
             Validate32(h.MerkleRoot, nameof(h.MerkleRoot));
             Validate32(h.Target, nameof(h.Target));
-
-            var target = Difficulty.ClampTarget(h.Target);
+            if (!Difficulty.IsValidTarget(h.Target))
+                throw new ArgumentException("Block header target out of consensus range.", nameof(block));
 
             int txCount = block.Transactions?.Count ?? 0;
             if (txCount < 0 || txCount > MaxTxCount)
@@ -75,7 +75,7 @@ namespace Qado.Serialization
 
             BinaryPrimitives.WriteUInt64BigEndian(dst.Slice(o, 8), h.Timestamp); o += 8;
 
-            target.AsSpan().CopyTo(dst.Slice(o, 32)); o += 32;
+            h.Target!.AsSpan().CopyTo(dst.Slice(o, 32)); o += 32;
 
             BinaryPrimitives.WriteUInt32BigEndian(dst.Slice(o, 4), h.Nonce); o += 4;
 
@@ -120,7 +120,8 @@ namespace Qado.Serialization
             ulong ts = BinaryPrimitives.ReadUInt64BigEndian(src.Slice(o, 8)); o += 8;
 
             byte[] target = src.Slice(o, 32).ToArray(); o += 32;
-            target = Difficulty.ClampTarget(target);
+            if (!Difficulty.IsValidTarget(target))
+                throw new ArgumentException("Block header target out of consensus range.", nameof(src));
 
             uint nonce = BinaryPrimitives.ReadUInt32BigEndian(src.Slice(o, 4)); o += 4;
 

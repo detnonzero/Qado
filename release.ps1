@@ -51,8 +51,8 @@ try {
             $Project,
             "-c", $Configuration,
             "-r", $rid,
-            "--self-contained", "true",
-            "/p:PublishSingleFile=true",
+            "--self-contained", "false",
+            "/p:PublishSingleFile=false",
             "-o", $outDir
         )
 
@@ -82,6 +82,7 @@ try {
 
     Write-Host ""
     Write-Host "Release build completed."
+    Write-Host "Deployment mode: framework-dependent, normal multi-file binaries (requires installed .NET 10 runtime)."
     Write-Host "Output folder:   $rootPath"
     Write-Host "SHA256 sums:     $sumsPath"
 }

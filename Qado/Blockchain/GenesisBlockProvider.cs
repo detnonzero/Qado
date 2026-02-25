@@ -80,9 +80,8 @@ namespace Qado.Blockchain
             if (!BytesEqual32(expectedHash, block.BlockHash)) { reason = "blockHash mismatch"; return false; }
 
             if (header.Target is not { Length: 32 }) { reason = "target malformed"; return false; }
-            var haveTarget = Difficulty.ClampTarget(header.Target);
-            var wantTarget = Difficulty.ClampTarget(GENESIS_TARGET);
-            if (!BytesEqual32(haveTarget, wantTarget)) { reason = "target mismatch"; return false; }
+            if (!Difficulty.IsValidTarget(header.Target)) { reason = "target out of range"; return false; }
+            if (!BytesEqual32(header.Target, GENESIS_TARGET)) { reason = "target mismatch"; return false; }
 
             if (header.Nonce != GENESIS_NONCE) { reason = "nonce mismatch"; return false; }
             if (header.PreviousBlockHash is not { Length: 32 } || !IsZero32(header.PreviousBlockHash))
