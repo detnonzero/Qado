@@ -21,20 +21,25 @@ namespace Qado.Blockchain
         private static readonly Dictionary<string, DateTime> AdoptionCooldownByTip = new(StringComparer.Ordinal);
         private static readonly TimeSpan AdoptionCooldownTtl = TimeSpan.FromMinutes(15);
         private const int MaxAdoptionCooldownEntries = 4096;
+        private static readonly object PrefetchFailureGate = new();
+        private static DateTime _prefetchFailureCooldownUntilUtc = DateTime.MinValue;
+        private static readonly TimeSpan PrefetchFailureCooldown = TimeSpan.FromSeconds(3);
 
         public static void MaybeAdoptNewTip(byte[] candidateTipHash, ILogSink? log = null, MempoolManager? mempool = null)
         {
             if (candidateTipHash is not { Length: 32 })
                 return;
 
+            try
+            {
+            if (IsInPrefetchFailureCooldown(out _))
+                return;
+
             if (BlockIndexStore.IsBadOrHasBadAncestor(candidateTipHash))
                 return;
 
-            if (IsInAdoptionCooldown(candidateTipHash, out var cooldownRemaining))
-            {
-                log?.Info("ChainSel", $"Candidate tip in cooldown ({(int)Math.Ceiling(cooldownRemaining.TotalSeconds)}s remaining).");
+            if (IsInAdoptionCooldown(candidateTipHash, out _))
                 return;
-            }
 
             var canonTipHeight = BlockStore.GetLatestHeight();
             var canonTipHash = BlockStore.GetCanonicalHashAtHeight(canonTipHeight);
@@ -57,7 +62,7 @@ namespace Qado.Blockchain
             if (currentWork != 0 && candidateWork <= currentWork)
                 return;
 
-            log?.Warn("ChainSel", $"Adopting stronger chain (oldTip={ToHex(canonTipHash, 16)} → newTip={ToHex(candidateTipHash, 16)}).");
+            log?.Warn("ChainSel", $"Adopting stronger chain (oldTip={ToHex(canonTipHash, 16)} -> newTip={ToHex(candidateTipHash, 16)}).");
 
             if (!TryBuildCandidateHeightMap(candidateTipHash, out var candTipHeight, out var candByHeight, log))
             {
@@ -66,6 +71,8 @@ namespace Qado.Blockchain
             }
 
             ulong fromHeight = FindFirstDivergingHeight(candTipHeight, candByHeight);
+            if (fromHeight > candTipHeight)
+                return;
 
             var newCanonAsc = new List<(ulong Height, byte[] Hash)>(checked((int)Math.Min((candTipHeight - fromHeight) + 1, 5_000_000)));
             for (ulong h = fromHeight; h <= candTipHeight; h++)
@@ -89,6 +96,8 @@ namespace Qado.Blockchain
             {
                 if (!TryPrefetchBlocksAscending(newCanonAsc, out newBlocksAsc, log))
                 {
+                    RememberAdoptionCooldown_NoThrow(candidateTipHash);
+                    RememberPrefetchFailure_NoThrow();
                     log?.Warn("ChainSel", "Failed to prefetch candidate blocks; skipping adoption.");
                     return;
                 }
@@ -97,12 +106,13 @@ namespace Qado.Blockchain
                 {
                     using var tx = Db.Connection.BeginTransaction();
 
-                    if (!TryPrefetchOldCanonDescending(fromHeight, rollbackTop, tx, out var oldCanonDesc, log))
-                    {
-                        log?.Warn("ChainSel", "Failed to prefetch old canonical hashes; skipping adoption.");
-                        tx.Rollback();
-                        return;
-                    }
+                if (!TryPrefetchOldCanonDescending(fromHeight, rollbackTop, tx, out var oldCanonDesc, log))
+                {
+                    RememberAdoptionCooldown_NoThrow(candidateTipHash);
+                    log?.Warn("ChainSel", "Failed to prefetch old canonical hashes; skipping adoption.");
+                    tx.Rollback();
+                    return;
+                }
 
                     _ = TryPrefetchBlocksDescending(oldCanonDesc, out oldBlocksDesc, log);
 
@@ -171,6 +181,12 @@ namespace Qado.Blockchain
             }
 
             TryNotifyUiReload();
+            }
+            catch (Exception ex)
+            {
+                RememberAdoptionCooldown_NoThrow(candidateTipHash);
+                log?.Warn("ChainSel", $"Unhandled adoption error: {ex.Message}");
+            }
         }
 
 
@@ -602,6 +618,34 @@ namespace Qado.Blockchain
             }
         }
 
+        private static bool IsInPrefetchFailureCooldown(out TimeSpan remaining)
+        {
+            remaining = TimeSpan.Zero;
+            lock (PrefetchFailureGate)
+            {
+                var now = DateTime.UtcNow;
+                if (_prefetchFailureCooldownUntilUtc <= now)
+                    return false;
+
+                remaining = _prefetchFailureCooldownUntilUtc - now;
+                return true;
+            }
+        }
+
+        private static void RememberPrefetchFailure_NoThrow()
+        {
+            try
+            {
+                lock (PrefetchFailureGate)
+                {
+                    _prefetchFailureCooldownUntilUtc = DateTime.UtcNow + PrefetchFailureCooldown;
+                }
+            }
+            catch
+            {
+            }
+        }
+
 
         private static void TryNotifyUiReload()
         {
@@ -646,7 +690,7 @@ namespace Qado.Blockchain
         {
             if (data is null || data.Length == 0) return "";
             var hex = Convert.ToHexString(data).ToLowerInvariant();
-            if (takeChars > 0 && hex.Length > takeChars) return hex[..takeChars] + "…";
+            if (takeChars > 0 && hex.Length > takeChars) return hex[..takeChars] + "...";
             return hex;
         }
 

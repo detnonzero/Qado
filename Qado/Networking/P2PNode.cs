@@ -25,7 +25,11 @@ namespace Qado.Networking
         private static readonly int MaxFramePayloadBytes =
             Math.Max(
                 ConsensusRules.MaxBlockSizeBytes,
-                Math.Max(BlockDownloadManager.MaxHashListPayloadBytes, HeaderSyncManager.MaxHeadersPayloadBytes));
+                Math.Max(
+                    BlockDownloadManager.MaxHashListPayloadBytes,
+                    Math.Max(HeaderSyncManager.MaxHeadersPayloadBytes, MaxBlocksBatchPayloadBytes)));
+        private const int MaxBlocksPerBatch = 1440;
+        private const int MaxBlocksBatchPayloadBytes = 32 * 1024 * 1024;
         private const int MaxSessions = 128;
         private const int OutboundTargetConnections = 10; // bounded by [8..12]
         private const int OutboundMinConnections = 8;
@@ -72,6 +76,7 @@ namespace Qado.Networking
         private readonly ConcurrentDictionary<string, RateBucket> _blockRateByPeer = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<string, RateBucket> _txRateByPeer = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<string, byte> _publicPeerEndpoints = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, byte> _nonPublicPeerEndpoints = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<string, byte> _publicClaimsByPex = new(StringComparer.Ordinal);
         private readonly ConcurrentQueue<byte[]> _pendingRecoveryRevalidate = new();
         private readonly object _badChainGate = new();
@@ -381,14 +386,6 @@ namespace Qado.Networking
                     {
                     }
 
-                    try
-                    {
-                        await ProbePublicClaimsAsync(ct).ConfigureAwait(false);
-                    }
-                    catch
-                    {
-                    }
-
                     var baseDelay = HasAnyHandshakePeerConnected()
                         ? ReconnectSteadyDelay
                         : ReconnectWhenDisconnectedDelay;
@@ -635,6 +632,10 @@ namespace Qado.Networking
                         _log?.Warn("Sync", "Validation queue full. Dropping inbound block payload.");
                     return;
 
+                case MsgType.BlocksBatch:
+                    _blockDownloadManager.OnBlocksBatch(s, payload);
+                    return;
+
                 case MsgType.InvBlock:
                     if (payload.Length == 0)
                         await HandleInvRequest(s, ct).ConfigureAwait(false);
@@ -658,6 +659,10 @@ namespace Qado.Networking
 
                 case MsgType.GetBlock:
                     await HandleGetBlock(payload, s, ct).ConfigureAwait(false);
+                    return;
+
+                case MsgType.GetBlocksRange:
+                    await HandleGetBlocksRange(payload, s, ct).ConfigureAwait(false);
                     return;
 
                 case MsgType.GetTip:
@@ -750,12 +755,21 @@ namespace Qado.Networking
             }
             else if (s.IsInbound && claimsListening && IsPublicRoutableIPv4Literal(ip))
             {
-                // Inbound session is only a claim; keep it for outbound probe verification.
-                _log?.Info(
-                    "P2P",
-                    $"inbound public claim registered: remoteEndpoint={EndpointLogFormatter.FormatEndpoint(s.RemoteEndpoint)}, detectedIp={EndpointLogFormatter.FormatHost(ip)}, advertisedPort={port}");
-                NotePeerPublicClaim(ip, port);
-                _ = TryProbePublicClaimImmediatelyAsync(ip, port);
+                if (IsPeerMarkedNonPublic(ip, port))
+                {
+                    _log?.Info(
+                        "P2P",
+                        $"inbound public claim ignored (probe previously failed): remoteEndpoint={EndpointLogFormatter.FormatEndpoint(s.RemoteEndpoint)}, detectedIp={EndpointLogFormatter.FormatHost(ip)}, advertisedPort={port}");
+                }
+                else
+                {
+                    // Inbound session is only a claim; verify exactly once via immediate outbound probe.
+                    _log?.Info(
+                        "P2P",
+                        $"inbound public claim registered: remoteEndpoint={EndpointLogFormatter.FormatEndpoint(s.RemoteEndpoint)}, detectedIp={EndpointLogFormatter.FormatHost(ip)}, advertisedPort={port}");
+                    NotePeerPublicClaim(ip, port);
+                    _ = TryProbePublicClaimImmediatelyAsync(ip, port);
+                }
             }
 
             if (claimsListening && IsPublicRoutableIPv4Literal(ip))
@@ -856,8 +870,10 @@ namespace Qado.Networking
             if (blk.BlockHash is not { Length: 32 } || IsZero32(blk.BlockHash))
                 blk.BlockHash = blk.ComputeBlockHash();
 
+            var arrivalKind = _blockDownloadManager.MarkBlockArrived(s, blk.BlockHash!);
+            bool isInActivePlan = _blockDownloadManager.IsHashInActivePlan(blk.BlockHash!);
             bool enforceRateLimit = enforceRateLimitOverride ??
-                                    (_blockDownloadManager.MarkBlockArrived(s, blk.BlockHash!) != BlockArrivalKind.Requested);
+                                    (arrivalKind != BlockArrivalKind.Requested && !isInActivePlan);
 
             bool replayedInternally = enforceRateLimitOverride.HasValue;
             if (!replayedInternally && !_blockDownloadManager.IsHashInActivePlan(blk.BlockHash!))
@@ -867,10 +883,15 @@ namespace Qado.Networking
 
                 bool outOfPlanPrevKnown = false;
                 bool prevIsTip = false;
+                ulong tipH = 0;
+                ulong prevHeightKnown = 0;
                 try
                 {
                     outOfPlanPrevKnown = BlockIndexStore.ContainsHash(prevHash);
-                    ulong tipH = BlockStore.GetLatestHeight();
+                    if (outOfPlanPrevKnown)
+                        _ = BlockIndexStore.TryGetMeta(prevHash, out prevHeightKnown, out _, out _);
+
+                    tipH = BlockStore.GetLatestHeight();
                     var tipHash = BlockStore.GetCanonicalHashAtHeight(tipH);
                     prevIsTip = tipHash is { Length: 32 } && BytesEqual32(prevHash, tipHash);
                 }
@@ -879,18 +900,19 @@ namespace Qado.Networking
                 if (_headerSyncManager.IsCompleted && !headerKnown)
                     _headerSyncManager.RequestResync("block-out-of-plan-missing-header");
 
-                bool allowOutOfPlan = headerKnown || outOfPlanPrevKnown || prevIsTip;
+                ulong candidateHeight = blk.BlockHeight;
+                if (outOfPlanPrevKnown && prevHeightKnown < ulong.MaxValue)
+                    candidateHeight = prevHeightKnown + 1UL;
+
+                bool nearTip = candidateHeight >= tipH || (tipH - candidateHeight) <= 32UL;
+                bool allowOutOfPlan = prevIsTip ||
+                                      (!_headerSyncManager.IsCompleted &&
+                                       nearTip &&
+                                       (headerKnown || outOfPlanPrevKnown));
                 if (!allowOutOfPlan)
                 {
-                    _log?.Info(
-                        "Sync",
-                        $"Ignoring out-of-plan block {Hex16(blk.BlockHash!)} from {peerKey} (headerKnown={headerKnown}).");
                     return;
                 }
-
-                _log?.Info(
-                    "Sync",
-                    $"Accepting out-of-plan block {Hex16(blk.BlockHash!)} from {peerKey} (headerKnown={headerKnown}, prevKnown={outOfPlanPrevKnown}, prevIsTip={prevIsTip}).");
             }
 
             if (enforceRateLimit && !AllowInboundBlock(peerKey))
@@ -1103,13 +1125,25 @@ namespace Qado.Networking
 
             if (!extendedCanon)
             {
+                bool shouldAttemptAdopt = false;
                 try
                 {
-                    ChainSelector.MaybeAdoptNewTip(blk.BlockHash!, _log, _mempool);
-                    if (BlockIndexStore.TryGetStatus(blk.BlockHash!, out var afterStatus) &&
-                        BlockIndexStore.IsValidatedStatus(afterStatus))
+                    ulong canonTipNow = BlockStore.GetLatestHeight();
+                    shouldAttemptAdopt = blk.BlockHeight >= canonTipNow;
+                    if (!shouldAttemptAdopt && canonTipNow > blk.BlockHeight)
                     {
-                        stateValidated = true;
+                        shouldAttemptAdopt = (canonTipNow - blk.BlockHeight) <= 4UL;
+                    }
+
+                    bool parentPayloadAvailable = BlockIndexStore.GetLocation(prevHash) != null;
+                    if (shouldAttemptAdopt && isInActivePlan && parentPayloadAvailable)
+                    {
+                        ChainSelector.MaybeAdoptNewTip(blk.BlockHash!, _log, _mempool);
+                        if (BlockIndexStore.TryGetStatus(blk.BlockHash!, out var afterStatus) &&
+                            BlockIndexStore.IsValidatedStatus(afterStatus))
+                        {
+                            stateValidated = true;
+                        }
                     }
                 }
                 catch (Exception ex)
@@ -1147,11 +1181,6 @@ namespace Qado.Networking
             if (ShouldRelayInv(blk.BlockHash!))
                 await BroadcastInvAsync(blk.BlockHash!, exceptEndpoint: s.RemoteEndpoint, ct: ct).ConfigureAwait(false);
 
-            if (extendedCanon)
-                _log?.Info("P2P", $"Block stored + canon-extended: h={newCanonHeight} {Hex16(blk.BlockHash!)}");
-            else
-                _log?.Info("P2P", $"Block stored (side/reorg candidate): h={blk.BlockHeight} {Hex16(blk.BlockHash!)}");
-
             PeerFailTracker.ReportSuccess(peerKey);
             if (stateValidated)
                 _blockDownloadManager.MarkBlockValidated(blk.BlockHash!, valid: true);
@@ -1173,6 +1202,62 @@ namespace Qado.Networking
             _ = BlockBinarySerializer.Write(buf, blk);
 
             await WriteFrame(s.Stream, MsgType.BlockAt, buf, ct).ConfigureAwait(false);
+        }
+
+        private async Task HandleGetBlocksRange(byte[] payload, PeerSession s, CancellationToken ct)
+        {
+            if (payload.Length != 12)
+                return;
+
+            ulong startHeight = BinaryPrimitives.ReadUInt64LittleEndian(payload.AsSpan(0, 8));
+            uint requested = BinaryPrimitives.ReadUInt32LittleEndian(payload.AsSpan(8, 4));
+            if (requested == 0)
+                return;
+
+            int want = Math.Clamp((int)requested, 1, MaxBlocksPerBatch);
+            var blocksPayload = new List<byte[]>(want);
+            int totalBytes = 12; // start(8) + count(4)
+
+            for (int i = 0; i < want; i++)
+            {
+                if (ct.IsCancellationRequested)
+                    return;
+
+                ulong h = startHeight + (ulong)i;
+                var blk = BlockStore.GetBlockByHeight(h);
+                if (blk == null)
+                    break;
+
+                int size = BlockBinarySerializer.GetSize(blk);
+                var buf = new byte[size];
+                _ = BlockBinarySerializer.Write(buf, blk);
+
+                int projected = totalBytes + 4 + size;
+                if (projected > MaxBlocksBatchPayloadBytes)
+                    break;
+
+                blocksPayload.Add(buf);
+                totalBytes = projected;
+            }
+
+            if (blocksPayload.Count == 0)
+                return;
+
+            var outPayload = new byte[totalBytes];
+            BinaryPrimitives.WriteUInt64LittleEndian(outPayload.AsSpan(0, 8), startHeight);
+            BinaryPrimitives.WriteUInt32LittleEndian(outPayload.AsSpan(8, 4), (uint)blocksPayload.Count);
+
+            int o = 12;
+            for (int i = 0; i < blocksPayload.Count; i++)
+            {
+                var b = blocksPayload[i];
+                BinaryPrimitives.WriteUInt32LittleEndian(outPayload.AsSpan(o, 4), (uint)b.Length);
+                o += 4;
+                b.AsSpan().CopyTo(outPayload.AsSpan(o, b.Length));
+                o += b.Length;
+            }
+
+            await WriteFrame(s.Stream, MsgType.BlocksBatch, outPayload, ct).ConfigureAwait(false);
         }
 
         private async Task HandleInvRequest(PeerSession s, CancellationToken ct)
@@ -1265,7 +1350,8 @@ namespace Qado.Networking
             var prev = blk.Header?.PreviousBlockHash;
             if (prev is not { Length: 32 }) return false;
 
-            ulong tipH = BlockStore.GetLatestHeight(tx);
+            if (!BlockStore.TryGetLatestHeight(out var tipH, tx))
+                return false;
             var tipHash = BlockStore.GetCanonicalHashAtHeight(tipH, tx);
             if (tipHash is not { Length: 32 }) return false;
 
@@ -1306,7 +1392,19 @@ namespace Qado.Networking
 
             try
             {
-                MarkBadChainAndReplan(blockHash, reason, context);
+                bool isSideInvalidContext = context.StartsWith("side-invalid:", StringComparison.Ordinal);
+                bool inActivePlan = _blockDownloadManager.IsHashInActivePlan(blockHash);
+                if (inActivePlan && !isSideInvalidContext)
+                {
+                    MarkBadChainAndReplan(blockHash, reason, context);
+                    return;
+                }
+
+                // For unsolicited/out-of-plan side candidates mark only the block itself as invalid.
+                // This avoids poisoning large descendant sets on transient/malicious side branches.
+                int affected = BlockIndexStore.MarkBadSelf(blockHash, (int)reason);
+                if (affected > 0)
+                    _log?.Warn("Sync", $"Marked bad block (self-only): root={Hex16(blockHash)} reason={(int)reason} ({context})");
             }
             catch
             {
@@ -1615,6 +1713,63 @@ namespace Qado.Networking
             return false;
         }
 
+        public bool? GetPeerPublicStatus(string ip, int port)
+        {
+            if (string.IsNullOrWhiteSpace(ip)) return null;
+            if (port <= 0 || port > 65535) return null;
+
+            if (IsPeerMarkedNonPublic(ip, port))
+                return false;
+            if (IsPeerMarkedPublic(ip, port))
+                return true;
+
+            string wantedIp = NormalizeBanKey(ip);
+
+            foreach (var kv in _sessions)
+            {
+                var s = kv.Value;
+                if (!s.HandshakeOk) continue;
+
+                string sessionIp = "";
+                int sessionPort = 0;
+
+                if (!string.IsNullOrWhiteSpace(s.RemoteIpAdvertised))
+                    sessionIp = NormalizeBanKey(s.RemoteIpAdvertised!);
+
+                if (s.RemotePortAdvertised is int advPort && advPort > 0 && advPort <= 65535)
+                    sessionPort = advPort;
+
+                if (sessionIp.Length == 0 || sessionPort == 0)
+                {
+                    try
+                    {
+                        if (s.Client?.Client?.RemoteEndPoint is IPEndPoint iep)
+                        {
+                            if (sessionIp.Length == 0)
+                                sessionIp = NormalizeBanKey(iep.Address.ToString());
+                            if (sessionPort == 0)
+                                sessionPort = iep.Port;
+                        }
+                    }
+                    catch { }
+                }
+
+                if (sessionPort == 0 && TryParsePortFromEndpoint(s.RemoteEndpoint, out int parsedPort))
+                    sessionPort = parsedPort;
+
+                if (sessionIp.Length == 0)
+                    sessionIp = EndpointToBanKey(s.Client?.Client?.RemoteEndPoint);
+
+                if (sessionIp.Length == 0)
+                    sessionIp = NormalizeBanKey(s.RemoteEndpoint);
+
+                if (sessionIp == wantedIp && sessionPort == port)
+                    return s.RemoteIsPublic;
+            }
+
+            return null;
+        }
+
         private async Task ProcessValidationWorkItemAsync(ValidationWorkItem item, CancellationToken ct)
         {
             await _validationSerializeGate.WaitAsync(ct).ConfigureAwait(false);
@@ -1663,6 +1818,8 @@ namespace Qado.Networking
                 if (!probe.reachable)
                 {
                     _log?.Info("P2P", $"public claim probe failed for {EndpointLogFormatter.FormatHostPort(ip, port)}: {probe.reason}");
+                    MarkPeerAsNonPublic(ip, port);
+                    _publicClaimsByPex.TryRemove(key, out _);
                     continue;
                 }
 
@@ -1701,6 +1858,8 @@ namespace Qado.Networking
             if (!probe.reachable)
             {
                 _log?.Info("P2P", $"immediate public claim probe failed for {EndpointLogFormatter.FormatHostPort(ip, port)}: {probe.reason}");
+                MarkPeerAsNonPublic(ip, port);
+                _publicClaimsByPex.TryRemove(key, out _);
                 return;
             }
 
@@ -1766,6 +1925,7 @@ namespace Qado.Networking
         {
             if (!IsPublicRoutableIPv4Literal(ip)) return;
             if (port <= 0 || port > 65535) return;
+            if (IsPeerMarkedNonPublic(ip, port)) return;
             if (TryBuildPeerEndpointKey(ip, port, out var key))
                 _publicClaimsByPex[key] = 0;
         }
@@ -1788,6 +1948,7 @@ namespace Qado.Networking
                 if (s.RemotePortAdvertised is not int p || p <= 0 || p > 65535) continue;
                 if (!IsPublicRoutableIPv4Literal(s.RemoteIpAdvertised!)) continue;
                 if (SelfPeerGuard.IsSelf(s.RemoteIpAdvertised!, p)) continue;
+                if (IsPeerMarkedNonPublic(s.RemoteIpAdvertised!, p)) continue;
 
                 if (!TryBuildPeerEndpointKey(s.RemoteIpAdvertised!, p, out var key)) continue;
                 if (!seen.Add(key)) continue;
@@ -1801,6 +1962,7 @@ namespace Qado.Networking
                 if (!TryParsePeerEndpointKey(kv.Key, out var ip, out var port)) continue;
                 if (!IsPublicRoutableIPv4Literal(ip)) continue;
                 if (SelfPeerGuard.IsSelf(ip, port)) continue;
+                if (IsPeerMarkedNonPublic(ip, port)) continue;
                 list.Add((ip, port));
             }
 
@@ -1845,6 +2007,7 @@ namespace Qado.Networking
                 if (!IsPublicRoutableIPv4Literal(ip)) continue;
                 if (SelfPeerGuard.IsSelf(ip, p)) continue;
                 if (IsPeerMarkedPublic(ip, p)) continue;
+                if (IsPeerMarkedNonPublic(ip, p)) continue;
                 if (!TryBuildPeerEndpointKey(ip, p, out var key)) continue;
                 if (!seen.Add(key)) continue;
 
@@ -1866,6 +2029,7 @@ namespace Qado.Networking
 
                 if (!IsPublicRoutableIPv4Literal(ip)) continue;
                 if (SelfPeerGuard.IsSelf(ip, p)) continue;
+                if (IsPeerMarkedNonPublic(ip, p)) continue;
                 if (!TryBuildPeerEndpointKey(ip, p, out var key)) continue;
                 if (!seen.Add(key)) continue;
 
@@ -1882,6 +2046,7 @@ namespace Qado.Networking
             if (!TryBuildPeerEndpointKey(ip, port, out var key)) return;
 
             _publicPeerEndpoints[key] = 0;
+            _nonPublicPeerEndpoints.TryRemove(key, out _);
 
             foreach (var kv in _sessions)
             {
@@ -1894,11 +2059,41 @@ namespace Qado.Networking
             }
         }
 
+        private void MarkPeerAsNonPublic(string ip, int port)
+        {
+            if (!IsPublicRoutableIPv4Literal(ip)) return;
+            if (port <= 0 || port > 65535) return;
+            if (!TryBuildPeerEndpointKey(ip, port, out var key)) return;
+
+            _publicPeerEndpoints.TryRemove(key, out _);
+            _publicClaimsByPex.TryRemove(key, out _);
+            _nonPublicPeerEndpoints[key] = 0;
+
+            foreach (var kv in _sessions)
+            {
+                var s = kv.Value;
+                if (string.IsNullOrWhiteSpace(s.RemoteIpAdvertised)) continue;
+                if (s.RemotePortAdvertised is not int p || p <= 0 || p > 65535) continue;
+                if (!TryBuildPeerEndpointKey(s.RemoteIpAdvertised!, p, out var skey)) continue;
+                if (string.Equals(skey, key, StringComparison.Ordinal))
+                    s.RemoteIsPublic = false;
+            }
+        }
+
         private bool IsPeerMarkedPublic(string ip, int port)
         {
             if (!TryBuildPeerEndpointKey(ip, port, out var key))
                 return false;
+            if (_nonPublicPeerEndpoints.ContainsKey(key))
+                return false;
             return _publicPeerEndpoints.ContainsKey(key);
+        }
+
+        private bool IsPeerMarkedNonPublic(string ip, int port)
+        {
+            if (!TryBuildPeerEndpointKey(ip, port, out var key))
+                return false;
+            return _nonPublicPeerEndpoints.ContainsKey(key);
         }
 
         private static bool TryBuildPeerEndpointKey(string ip, int port, out string key)

@@ -107,9 +107,22 @@ ON CONFLICT(hash) DO UPDATE SET
                 cmd.Parameters.AddWithValue("$h", hash);
                 using var r = cmd.ExecuteReader();
                 if (!r.Read()) return null;
-                int fileId = r.GetInt32(0);
-                long offset = r.GetInt64(1);
-                int size = r.GetInt32(2);
+                if (r.FieldCount < 3)
+                    return null;
+
+                int fileId;
+                long offset;
+                int size;
+                try
+                {
+                    fileId = r.GetInt32(0);
+                    offset = r.GetInt64(1);
+                    size = r.GetInt32(2);
+                }
+                catch
+                {
+                    return null;
+                }
 
                 if (fileId < 0 || offset < 0 || size <= 0)
                     return null;
@@ -385,22 +398,29 @@ ON CONFLICT(hash) DO UPDATE SET
 
             lock (Db.Sync)
             {
-                using var cmd = (tx?.Connection ?? Conn).CreateCommand();
-                cmd.Transaction = tx;
-                cmd.CommandText = @"
+                try
+                {
+                    using var cmd = (tx?.Connection ?? Conn).CreateCommand();
+                    cmd.Transaction = tx;
+                    cmd.CommandText = @"
 SELECT is_bad, bad_ancestor, bad_reason
 FROM block_index
 WHERE hash=$h
 LIMIT 1;";
-                cmd.Parameters.AddWithValue("$h", hash);
-                using var r = cmd.ExecuteReader();
-                if (!r.Read())
-                    return false;
+                    cmd.Parameters.AddWithValue("$h", hash);
+                    using var r = cmd.ExecuteReader();
+                    if (!r.Read())
+                        return false;
 
-                isBad = r.GetInt64(0) != 0;
-                badAncestor = r.GetInt64(1) != 0;
-                badReason = (int)r.GetInt64(2);
-                return true;
+                    isBad = r.GetInt64(0) != 0;
+                    badAncestor = r.GetInt64(1) != 0;
+                    badReason = (int)r.GetInt64(2);
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
             }
         }
 
@@ -498,6 +518,48 @@ WHERE hash = $h
                     localTx!.Commit();
 
                 return affected;
+            }
+        }
+
+        public static int MarkBadSelf(byte[] hash, int badReason, SqliteTransaction? tx = null)
+        {
+            if (hash is not { Length: 32 })
+                return 0;
+
+            if (badReason < 0)
+                badReason = BadReasonNone;
+
+            lock (Db.Sync)
+            {
+                using var cmd = (tx?.Connection ?? Conn).CreateCommand();
+                cmd.Transaction = tx;
+                cmd.CommandText = @"
+UPDATE block_index
+SET is_bad = 1,
+    bad_reason = CASE WHEN bad_reason = 0 THEN $reason ELSE bad_reason END,
+    status = $invalidStatus
+WHERE hash = $h;";
+                cmd.Parameters.AddWithValue("$reason", badReason);
+                cmd.Parameters.AddWithValue("$invalidStatus", StatusSideStateInvalid);
+                cmd.Parameters.AddWithValue("$h", hash);
+                return cmd.ExecuteNonQuery();
+            }
+        }
+
+        public static int ClearBadFlagsForNonCanonical(SqliteTransaction? tx = null)
+        {
+            lock (Db.Sync)
+            {
+                using var cmd = (tx?.Connection ?? Conn).CreateCommand();
+                cmd.Transaction = tx;
+                cmd.CommandText = @"
+UPDATE block_index
+SET is_bad = 0,
+    bad_ancestor = 0,
+    bad_reason = 0
+WHERE (is_bad <> 0 OR bad_ancestor <> 0)
+  AND hash NOT IN (SELECT hash FROM canon);";
+                return cmd.ExecuteNonQuery();
             }
         }
 

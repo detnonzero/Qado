@@ -2,6 +2,31 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.2.2] - 2026-02-27
+
+### Changed
+- Header sync batch size increased from `2000` to `144000` headers per message (`HeaderSyncManager.MaxHeadersPerMessage`), with header response timeout increased to `60s`.
+- Block sync switched to `Range-first` behavior:
+  - `GetBlocksRange` is now preferred for contiguous and sparse-gap fetches
+  - small gap spans are requested as bounded ranges (`SparseGapRangeMaxSpan = 64`)
+  - `GetData` remains as compatibility fallback when range is unavailable
+- `BlocksBatch` handling hardened:
+  - range timeout uses a dedicated longer timeout path
+  - invalid range payloads mark peer as range-unsupported for a cooldown window and fall back to `GetData`
+- Public claim handling tightened:
+  - inbound public claims are probed immediately exactly once
+  - failed probes mark peers as non-public
+  - non-public peers are excluded from sync/header candidate usage
+- Peer status in GUI now distinguishes:
+  - `Connected (public)`
+  - `Connected (non-public)`
+- Node header UI now shows sync progress as `synced/target` tip height and refreshes continuously (1s poll).
+- Reduced noisy per-block sync logging by removing repetitive canonical-extension/side-candidate info spam.
+- Side-invalid handling made safer:
+  - unsolicited/out-of-plan invalid side blocks are marked self-only
+  - full bad-descendant propagation remains reserved for active-plan invalidation paths
+- Added defensive DB access guards in hot sync paths (`BlockStore`, `BlockIndexStore`, UI snapshot readers) to reduce transient `Index out of range` exceptions from concurrent SQLite command disposal/reads.
+
 ## [0.2.1] - 2026-02-27
 
 ### Changed

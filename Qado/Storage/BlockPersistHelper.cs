@@ -14,7 +14,6 @@ namespace Qado.Storage
             EnsureBlockHash(block);
 
             bool canonExtended = false;
-            ulong newHeight = 0;
 
             lock (Db.Sync)
             {
@@ -22,10 +21,9 @@ namespace Qado.Storage
 
                 BlockStore.SaveBlock(block, tx, BlockIndexStore.StatusSideStatelessAccepted);
 
-                if (TryExtendCanonTipWithState(block, tx, out newHeight))
+                if (TryExtendCanonTipWithState(block, tx, out _))
                 {
                     canonExtended = true;
-                    log?.Info("Persist", $"Stored + canon-extended: h={newHeight}");
                 }
                 else
                 {

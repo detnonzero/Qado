@@ -45,6 +45,7 @@ namespace Qado
         private Timer? _blockExplorerTimer;
         private Timer? _peerReloadDebounceTimer;
         private Timer? _nodeStatusDebounceTimer;
+        private Timer? _nodeStatusPollTimer;
 
         private CancellationTokenSource? _p2pCts;
         private P2PNode? _p2pNode;
@@ -57,6 +58,7 @@ namespace Qado
         private const int BlockExplorerRefreshDebounceMs = 5000;
         private static readonly TimeSpan TrySyncCooldown = TimeSpan.FromSeconds(5);
         private static readonly TimeSpan MempoolCleanupInterval = TimeSpan.FromSeconds(15);
+        private static readonly TimeSpan TipAdoptionWarnCooldown = TimeSpan.FromSeconds(10);
         private const int MempoolCleanupMaxAgeSeconds = 3600;
         private static readonly TimeSpan PeerSeenRecentlyWindow = TimeSpan.FromMinutes(5);
 
@@ -74,6 +76,7 @@ namespace Qado
         private int _nodeStatusRefreshWorkerRunning;
         private int _blockExplorerRefreshRequested;
         private DateTime _lastTrySyncUtc = DateTime.MinValue;
+        private DateTime _nextTipAdoptionWarnUtc = DateTime.MinValue;
 
         private readonly HashSet<ulong> _displayedHeights = new();
 
@@ -202,6 +205,13 @@ namespace Qado
                 LoadAccounts();
                 ReloadPeers();
                 ScheduleNodeStatusRefresh();
+                StartUiTimer(ScheduleNodeStatusRefresh);
+                _nodeStatusPollTimer?.Dispose();
+                _nodeStatusPollTimer = new Timer(_ =>
+                {
+                    if (_isClosing) return;
+                    RefreshNodeStatusHeader();
+                }, null, TimeSpan.Zero, TimeSpan.FromSeconds(1));
 
                 Info("Startup", "Qado UI initialized.");
             };
@@ -218,6 +228,8 @@ namespace Qado
             _peerReloadDebounceTimer = null;
             _nodeStatusDebounceTimer?.Dispose();
             _nodeStatusDebounceTimer = null;
+            _nodeStatusPollTimer?.Dispose();
+            _nodeStatusPollTimer = null;
             PeerStore.PeerListChanged -= OnPeerListChanged;
             MiningHelper.StopMiningForShutdown();
             MempoolPreviewHelper.StopMempoolUiUpdater();
@@ -303,6 +315,7 @@ namespace Qado
 
         public void StartUiTimer(Action updateAction)
         {
+            _uiTimer?.Dispose();
             _uiTimer = new Timer(_ => Dispatcher.Invoke(updateAction), null, 1000, 1000);
         }
 
@@ -403,7 +416,12 @@ namespace Qado
             }
             catch (Exception ex)
             {
-                Warn("ChainSel", $"Tip adoption attempt failed: {ex.Message}");
+                var now = DateTime.UtcNow;
+                if (now >= _nextTipAdoptionWarnUtc)
+                {
+                    _nextTipAdoptionWarnUtc = now + TipAdoptionWarnCooldown;
+                    Warn("ChainSel", $"Tip adoption attempt failed: {ex.Message}");
+                }
             }
         }
 
@@ -735,8 +753,10 @@ namespace Qado
 
             try
             {
-                using var cmd = Db.Connection.CreateCommand();
-                cmd.CommandText = @"
+                lock (Db.Sync)
+                {
+                    using var cmd = Db.Connection.CreateCommand();
+                    cmd.CommandText = @"
 SELECT p.ip, p.port, p.last_seen, IFNULL(a.announced_at, 0)
 FROM peers p
 LEFT JOIN peer_announced a ON a.id = p.id
@@ -748,43 +768,44 @@ ORDER BY
   p.ip ASC,
   p.port ASC
 LIMIT 200;";
-                using var r = cmd.ExecuteReader();
-                while (r.Read())
-                {
-                    string ip = r.GetString(0);
-                    int port = r.GetInt32(1);
-                    if (SelfPeerGuard.IsSelf(ip, port)) continue;
-
-                    long lastSeenTs = r.GetInt64(2);
-                    long announcedTs = r.GetInt64(3);
-
-                    bool hasSeen = lastSeenTs > 0;
-                    long displayTs = hasSeen ? lastSeenTs : announcedTs;
-                    bool hasAnyTimestamp = displayTs > 0;
-                    var seenAt = hasAnyTimestamp ? DateTimeOffset.FromUnixTimeSeconds(displayTs) : DateTimeOffset.UnixEpoch;
-
-                    string lastSeenText;
-                    if (!hasAnyTimestamp)
+                    using var r = cmd.ExecuteReader();
+                    while (r.Read())
                     {
-                        lastSeenText = "-";
+                        string ip = r.GetString(0);
+                        int port = r.GetInt32(1);
+                        if (SelfPeerGuard.IsSelf(ip, port)) continue;
+
+                        long lastSeenTs = r.GetInt64(2);
+                        long announcedTs = r.GetInt64(3);
+
+                        bool hasSeen = lastSeenTs > 0;
+                        long displayTs = hasSeen ? lastSeenTs : announcedTs;
+                        bool hasAnyTimestamp = displayTs > 0;
+                        var seenAt = hasAnyTimestamp ? DateTimeOffset.FromUnixTimeSeconds(displayTs) : DateTimeOffset.UnixEpoch;
+
+                        string lastSeenText;
+                        if (!hasAnyTimestamp)
+                        {
+                            lastSeenText = "-";
+                        }
+                        else if (hasSeen)
+                        {
+                            lastSeenText = $"{seenAt.UtcDateTime:yyyy-MM-dd HH:mm:ss} UTC";
+                        }
+                        else
+                        {
+                            lastSeenText = $"{seenAt.UtcDateTime:yyyy-MM-dd HH:mm:ss} UTC (announced)";
+                        }
+
+                        rows.Add(new PeerRow
+                        {
+                            Endpoint = $"{ip}:{port}",
+                            LastSeenUtc = lastSeenText,
+                            Status = hasSeen
+                                ? GetPeerStatus(ip, port, seenAt)
+                                : GetAnnouncedPeerStatus(ip, port, seenAt, hasAnyTimestamp)
+                        });
                     }
-                    else if (hasSeen)
-                    {
-                        lastSeenText = $"{seenAt.UtcDateTime:yyyy-MM-dd HH:mm:ss} UTC";
-                    }
-                    else
-                    {
-                        lastSeenText = $"{seenAt.UtcDateTime:yyyy-MM-dd HH:mm:ss} UTC (announced)";
-                    }
-
-                    rows.Add(new PeerRow
-                    {
-                        Endpoint = $"{ip}:{port}",
-                        LastSeenUtc = lastSeenText,
-                        Status = hasSeen
-                            ? GetPeerStatus(ip, port, seenAt)
-                            : GetAnnouncedPeerStatus(ip, port, seenAt, hasAnyTimestamp)
-                    });
                 }
 
                 if (rows.Count == 0)
@@ -807,7 +828,7 @@ LIMIT 200;";
         private string GetPeerStatus(string ip, int port, DateTimeOffset seenAt)
         {
             if (_p2pNode?.IsPeerConnected(ip, port) == true)
-                return "Connected";
+                return GetConnectedPeerStatus(ip, port);
 
             bool coolingDown = PeerFailTracker.ShouldBan(ip);
 
@@ -829,7 +850,7 @@ LIMIT 200;";
         private string GetAnnouncedPeerStatus(string ip, int port, DateTimeOffset announcedAt, bool hasTimestamp)
         {
             if (_p2pNode?.IsPeerConnected(ip, port) == true)
-                return "Connected";
+                return GetConnectedPeerStatus(ip, port);
 
             bool coolingDown = PeerFailTracker.ShouldBan(ip);
             if (!hasTimestamp)
@@ -844,6 +865,16 @@ LIMIT 200;";
                 return "Announced (cooling down)";
 
             return stale ? "Unverified" : "Announced";
+        }
+
+        private string GetConnectedPeerStatus(string ip, int port)
+        {
+            bool? isPublic = _p2pNode?.GetPeerPublicStatus(ip, port);
+            if (isPublic == true)
+                return "Connected (public)";
+            if (isPublic == false)
+                return "Connected (non-public)";
+            return "Connected";
         }
 
         private void RefreshNodeStatusHeader()
@@ -884,9 +915,10 @@ LIMIT 200;";
             });
         }
 
-        private (ulong tipHeight, string tipHashText, int mempoolCount) ReadNodeStatusSnapshot()
+        private (ulong tipHeight, ulong targetTipHeight, string tipHashText, int mempoolCount) ReadNodeStatusSnapshot()
         {
             ulong tipHeight = 0;
+            ulong targetTipHeight = 0;
             string tipHashText = "-";
             int mempoolCount = 0;
 
@@ -901,12 +933,24 @@ LIMIT 200;";
             {
             }
 
+            try
+            {
+                if (BlockIndexStore.TryGetBestHeaderTip(out _, out var bestHeaderHeight, out _))
+                    targetTipHeight = bestHeaderHeight;
+            }
+            catch
+            {
+            }
+
+            if (targetTipHeight < tipHeight)
+                targetTipHeight = tipHeight;
+
             try { mempoolCount = _mempool?.Count ?? 0; } catch { }
 
-            return (tipHeight, tipHashText, mempoolCount);
+            return (tipHeight, targetTipHeight, tipHashText, mempoolCount);
         }
 
-        private void ApplyNodeStatusSnapshot((ulong tipHeight, string tipHashText, int mempoolCount) snap)
+        private void ApplyNodeStatusSnapshot((ulong tipHeight, ulong targetTipHeight, string tipHashText, int mempoolCount) snap)
         {
             if (_isClosing) return;
 
@@ -923,7 +967,7 @@ LIMIT 200;";
             {
             }
 
-            TipHeightText.Text = snap.tipHeight.ToString();
+            TipHeightText.Text = $"{snap.tipHeight}/{snap.targetTipHeight}";
             TipHashText.Text = snap.tipHashText;
             MempoolCountText.Text = snap.mempoolCount.ToString();
             PeerCountText.Text = peerCount.ToString();
@@ -995,22 +1039,40 @@ LIMIT 200;";
 
             try
             {
-                using var cmd = Db.Connection.CreateCommand();
-                cmd.CommandText = "SELECT addr, balance, nonce FROM accounts WHERE 1 LIMIT 1000;";
-                using var r = cmd.ExecuteReader();
-                while (r.Read())
+                lock (Db.Sync)
                 {
-                    var addr = Convert.ToHexString((byte[])r[0]).ToLowerInvariant();
-
-                    ulong balance = ReadU64Blob(r.GetValue(1));
-                    ulong nonce = ReadU64IntegerOrBlob(r.GetValue(2));
-
-                    rows.Add(new AccountStateViewModel
+                    using var cmd = Db.Connection.CreateCommand();
+                    cmd.CommandText = "SELECT addr, balance, nonce FROM accounts WHERE 1 LIMIT 1000;";
+                    using var r = cmd.ExecuteReader();
+                    if (r.FieldCount < 3)
                     {
-                        PublicKey = addr,
-                        Balance = balance,
-                        Nonce = nonce
-                    });
+                        errorMessage = $"LoadAccounts failed: accounts schema mismatch (expected 3 columns, got {r.FieldCount}).";
+                        return rows;
+                    }
+
+                    while (r.Read())
+                    {
+                        byte[]? addrBytes = null;
+                        try { addrBytes = r.GetValue(0) as byte[]; } catch { }
+                        if (addrBytes is not { Length: > 0 })
+                            continue;
+
+                        object balanceRaw;
+                        object nonceRaw;
+                        try { balanceRaw = r.IsDBNull(1) ? DBNull.Value : r.GetValue(1); } catch { balanceRaw = DBNull.Value; }
+                        try { nonceRaw = r.IsDBNull(2) ? DBNull.Value : r.GetValue(2); } catch { nonceRaw = DBNull.Value; }
+
+                        var addr = Convert.ToHexString(addrBytes).ToLowerInvariant();
+                        ulong balance = ReadU64Blob(balanceRaw);
+                        ulong nonce = ReadU64IntegerOrBlob(nonceRaw);
+
+                        rows.Add(new AccountStateViewModel
+                        {
+                            PublicKey = addr,
+                            Balance = balance,
+                            Nonce = nonce
+                        });
+                    }
                 }
 
                 rows.Sort(static (a, b) =>

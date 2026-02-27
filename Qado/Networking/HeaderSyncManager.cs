@@ -21,9 +21,9 @@ namespace Qado.Networking
     public sealed class HeaderSyncManager : IDisposable
     {
         public const int MaxHeaderSyncPeers = 2;
-        public const int MaxHeadersPerMessage = 2000;
+        public const int MaxHeadersPerMessage = 144000;
         public const int MaxLocatorHashes = 64;
-        public static readonly TimeSpan HeaderResponseTimeout = TimeSpan.FromSeconds(20);
+        public static readonly TimeSpan HeaderResponseTimeout = TimeSpan.FromSeconds(60);
         public static readonly int MaxHeadersPayloadBytes = 4 + (MaxHeadersPerMessage * BlockHeader.PowHeaderSize);
 
         private const int MedianTimePastWindow = 11;
@@ -461,6 +461,11 @@ namespace Qado.Networking
                         if (!TryValidateAndCommitBatch(headers, out var committed, out var reason))
                         {
                             _log?.Warn("HeaderSync", $"header batch rejected: {reason}");
+                            if (string.Equals(reason, "parent marked invalid", StringComparison.Ordinal) &&
+                                TryRecoverFromInvalidParent_NoThrow())
+                            {
+                                continue;
+                            }
                             FailPeer(frame.PeerKey);
                             continue;
                         }
@@ -510,6 +515,32 @@ namespace Qado.Networking
             }
 
             RequestTick();
+        }
+
+        private bool TryRecoverFromInvalidParent_NoThrow()
+        {
+            try
+            {
+                int cleared = BlockIndexStore.ClearBadFlagsForNonCanonical();
+                if (cleared <= 0)
+                    return false;
+
+                lock (_gate)
+                {
+                    _completed = false;
+                    _awaitingByPeerKey.Clear();
+                    _noProgressPeerKeys.Clear();
+                }
+
+                _log?.Warn("HeaderSync", $"recovery: cleared {cleared} non-canonical bad flags after invalid-parent rejection; retrying sync.");
+                RequestTick();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _log?.Warn("HeaderSync", $"recovery failed after invalid-parent rejection: {ex.Message}");
+                return false;
+            }
         }
 
         private byte[] BuildLocatorPayload()

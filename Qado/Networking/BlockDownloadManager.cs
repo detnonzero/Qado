@@ -4,6 +4,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
+using Qado.Blockchain;
 using Qado.Logging;
 using Qado.Storage;
 
@@ -11,16 +12,21 @@ namespace Qado.Networking
 {
     public sealed class BlockDownloadManager : IDisposable
     {
-        public const int MaxInflightGlobal = 512;
-        public const int MaxInflightPerPeer = 64;
-        public const int MaxDownloadPeersPerPump = 4;
+        public const int MaxInflightGlobal = 4096;
+        public const int MaxInflightPerPeer = 2048;
         public const int MaxInvHashes = 50_000;
         public const int GetDataBatchSize = 128;
+        public const int RangeBatchSize = 1440;
+        public const int SequentialChunkSize = 1440;
+        public const int SparseGapRangeMaxSpan = 64;
         public static readonly TimeSpan RequestedTimeout = TimeSpan.FromSeconds(20);
+        public static readonly TimeSpan RequestedTimeoutRange = TimeSpan.FromSeconds(75);
         public static readonly int MaxHashListPayloadBytes = 4 + (MaxInvHashes * 32);
 
         private const int MaxInvSeenEntries = 200_000;
         private static readonly TimeSpan InvSeenTtl = TimeSpan.FromMinutes(30);
+        private static readonly TimeSpan PeerFailureCooldown = TimeSpan.FromSeconds(8);
+        private static readonly TimeSpan RangeUnsupportedTtl = TimeSpan.FromMinutes(10);
 
         private readonly object _gate = new();
         private readonly Queue<byte[]> _missingQueue = new();
@@ -29,6 +35,8 @@ namespace Qado.Networking
         private readonly Dictionary<string, InflightRequest> _inflightByHash = new(StringComparer.Ordinal);
         private readonly Dictionary<string, HashSet<string>> _inflightByPeer = new(StringComparer.Ordinal);
         private readonly Dictionary<string, DateTime> _invSeenByHash = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, DateTime> _peerCooldownUntilUtc = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, DateTime> _peerRangeUnsupportedUntilUtc = new(StringComparer.Ordinal);
         private readonly Queue<(string key, DateTime seenUtc)> _invSeenOrder = new();
         private readonly ConcurrentDictionary<string, BlockSyncItemState> _stateByHash = new(StringComparer.Ordinal);
 
@@ -43,14 +51,20 @@ namespace Qado.Networking
 
         private readonly SemaphoreSlim _pumpSignal = new(0, 1);
         private readonly CancellationTokenSource _disposeCts = new();
+        private int _haveBlockCheckErrorLogged;
+        private int _candidateCheckErrorLogged;
         private int _started;
         private bool _downloadStarted;
+        private string? _activeChunkPeerKey;
+        private string? _lastChunkPeerKey;
+        private int _activeChunkRequested;
 
         private sealed class InflightRequest
         {
             public byte[] Hash = Array.Empty<byte>();
             public string PeerKey = string.Empty;
             public DateTime RequestedUtc;
+            public bool RequestedViaRange;
         }
 
         public BlockDownloadManager(
@@ -98,6 +112,8 @@ namespace Qado.Networking
             lock (_gate)
             {
                 _downloadStarted = true;
+                _activeChunkPeerKey = null;
+                _activeChunkRequested = 0;
                 ReplaceActivePlan_NoLock(hashesToDownload, hashesToRevalidate);
                 added = EnqueueMissingHashes_NoLock(hashesToDownload, source: "plan");
             }
@@ -124,6 +140,8 @@ namespace Qado.Networking
             lock (_gate)
             {
                 _downloadStarted = true;
+                _activeChunkPeerKey = null;
+                _activeChunkRequested = 0;
                 ReplaceActivePlan_NoLock(hashesToDownload, hashesToRevalidate);
                 TrimQueuedToActivePlan_NoLock();
                 TrimInflightToActivePlan_NoLock();
@@ -177,6 +195,14 @@ namespace Qado.Networking
 
             lock (_gate)
             {
+                if (string.Equals(_activeChunkPeerKey, peerKey, StringComparison.Ordinal))
+                {
+                    _activeChunkPeerKey = null;
+                    _activeChunkRequested = 0;
+                    _lastChunkPeerKey = peerKey;
+                    _peerCooldownUntilUtc[peerKey] = DateTime.UtcNow + PeerFailureCooldown;
+                }
+
                 if (!_inflightByPeer.TryGetValue(peerKey, out var hashes) || hashes.Count == 0)
                     return;
 
@@ -201,6 +227,9 @@ namespace Qado.Networking
 
         public void OnInv(PeerSession peer, byte[] payload)
         {
+            if (peer == null || !peer.RemoteIsPublic)
+                return;
+
             if (payload == null || payload.Length == 0)
                 return;
 
@@ -240,7 +269,7 @@ namespace Qado.Networking
             for (int i = 0; i < outOfPlanUnknown.Count; i++)
             {
                 var hash = outOfPlanUnknown[i];
-                if (_haveBlock(hash))
+                if (SafeHaveBlock(hash))
                     continue;
                 if (BlockIndexStore.ContainsHash(hash))
                     continue;
@@ -258,6 +287,39 @@ namespace Qado.Networking
 
             if (inPlan.Count > 0)
                 EnqueueMissingHashes(inPlan, source: "inv");
+        }
+
+        public void OnBlocksBatch(PeerSession peer, byte[] payload)
+        {
+            if (peer == null || payload == null || payload.Length == 0)
+                return;
+
+            bool downloadStarted;
+            lock (_gate)
+                downloadStarted = _downloadStarted;
+            if (!downloadStarted)
+                return;
+
+            if (!TryParseBlocksBatchPayload(payload, RangeBatchSize, out _, out var blocksPayload, out var error))
+            {
+                _log?.Warn("Sync", $"Invalid blocks batch payload ignored: {error}");
+                string peerKey = NormalizePeerKey(peer.SessionKey);
+                lock (_gate)
+                {
+                    MarkPeerRangeUnsupported_NoLock(peerKey, DateTime.UtcNow, $"invalid batch payload: {error}");
+                    _peerCooldownUntilUtc[peerKey] = DateTime.UtcNow + PeerFailureCooldown;
+                }
+                return;
+            }
+
+            for (int i = 0; i < blocksPayload.Count; i++)
+            {
+                if (peer == null || !EnqueueBlockPayload(peer, blocksPayload[i], enforceRateLimitOverride: false))
+                {
+                    _log?.Warn("Sync", "Validation queue full. Dropping inbound blocks batch payload.");
+                    break;
+                }
+            }
         }
 
         public BlockArrivalKind MarkBlockArrived(PeerSession peer, byte[] blockHash)
@@ -362,76 +424,152 @@ namespace Qado.Networking
             if (peers == null || peers.Count == 0)
                 return;
 
-            var sendJobs = new List<(PeerSession peer, List<byte[]> hashes)>();
+            PeerSession? selectedPeer = null;
+            string? selectedPeerKey = null;
+            List<byte[]>? selectedHashes = null;
+            bool useRangeRequest = false;
+            ulong rangeStartHeight = 0;
+            int rangeCount = 0;
             DateTime now = DateTime.UtcNow;
+            bool rotated = false;
 
             lock (_gate)
             {
-                RequeueTimedOut_NoLock(now);
+                var timedOutPeers = RequeueTimedOut_NoLock(now);
+                if (timedOutPeers.Count > 0)
+                {
+                    for (int i = 0; i < timedOutPeers.Count; i++)
+                        _peerCooldownUntilUtc[timedOutPeers[i]] = now + PeerFailureCooldown;
+                }
 
                 if (_missingQueue.Count == 0)
                     return;
 
-                foreach (var peer in peers)
+                var orderedPeers = BuildOrderedDownloadPeers_NoLock(peers, now);
+                if (orderedPeers.Count == 0)
+                    return;
+
+                selectedPeer = ResolveActiveChunkPeer_NoLock(orderedPeers, now, allowRotate: true);
+                if (selectedPeer == null)
+                    return;
+
+                selectedPeerKey = NormalizePeerKey(selectedPeer.SessionKey);
+                bool peerSupportsRange = IsRangeAllowedForPeer_NoLock(selectedPeerKey, now);
+
+                int peerInflight = GetPeerInflightCount_NoLock(selectedPeerKey);
+                int chunkRemaining = SequentialChunkSize - _activeChunkRequested;
+                if (chunkRemaining <= 0 && peerInflight <= 0)
                 {
-                    if (sendJobs.Count >= MaxDownloadPeersPerPump)
-                        break;
+                    _lastChunkPeerKey = selectedPeerKey;
+                    _activeChunkPeerKey = null;
+                    _activeChunkRequested = 0;
+                    rotated = true;
 
-                    if (peer == null || !peer.HandshakeOk || !peer.Client.Connected)
-                        continue;
+                    selectedPeer = ResolveActiveChunkPeer_NoLock(orderedPeers, now, allowRotate: true);
+                    if (selectedPeer == null)
+                        return;
 
-                    int globalFree = MaxInflightGlobal - _inflightByHash.Count;
-                    if (globalFree <= 0)
-                        break;
-
-                    string peerKey = NormalizePeerKey(peer.SessionKey);
-                    int peerInflight = GetPeerInflightCount_NoLock(peerKey);
-                    int peerFree = MaxInflightPerPeer - peerInflight;
-                    if (peerFree <= 0)
-                        continue;
-
-                    int toTake = Math.Min(GetDataBatchSize, Math.Min(peerFree, globalFree));
-                    if (toTake <= 0)
-                        continue;
-
-                    var hashes = TakeQueuedHashes_NoLock(toTake);
-                    if (hashes.Count == 0)
-                        continue;
-
-                    ReserveInflight_NoLock(hashes, peerKey, now);
-                    sendJobs.Add((peer, hashes));
-
-                    if (_missingQueue.Count == 0 || _inflightByHash.Count >= MaxInflightGlobal)
-                        break;
+                    selectedPeerKey = NormalizePeerKey(selectedPeer.SessionKey);
+                    peerInflight = GetPeerInflightCount_NoLock(selectedPeerKey);
+                    chunkRemaining = SequentialChunkSize - _activeChunkRequested;
                 }
+
+                if (chunkRemaining <= 0)
+                    return;
+
+                int globalFree = MaxInflightGlobal - _inflightByHash.Count;
+                if (globalFree <= 0)
+                    return;
+
+                int peerFree = MaxInflightPerPeer - peerInflight;
+                if (peerFree <= 0)
+                    return;
+
+                int toTake = Math.Min(RangeBatchSize, Math.Min(peerFree, Math.Min(globalFree, chunkRemaining)));
+                if (toTake <= 0)
+                    return;
+
+                selectedHashes = TakeQueuedHashes_NoLock(toTake);
+                if (selectedHashes.Count == 0)
+                    return;
+
+                if (peerSupportsRange &&
+                    TryBuildRangeRequest_NoLock(selectedHashes, out var startHeight, out var plannedRangeCount, out var selectedCountForRange))
+                {
+                    useRangeRequest = true;
+                    rangeStartHeight = startHeight;
+                    rangeCount = plannedRangeCount;
+
+                    if (selectedCountForRange < selectedHashes.Count)
+                    {
+                        for (int i = selectedCountForRange; i < selectedHashes.Count; i++)
+                        {
+                            var overflowHash = selectedHashes[i];
+                            if (overflowHash is { Length: 32 })
+                                RequeueHash_NoLock(overflowHash, ToHex(overflowHash));
+                        }
+
+                        selectedHashes = selectedHashes.GetRange(0, selectedCountForRange);
+                    }
+                }
+                else if (selectedHashes.Count > GetDataBatchSize)
+                {
+                    for (int i = GetDataBatchSize; i < selectedHashes.Count; i++)
+                    {
+                        var overflowHash = selectedHashes[i];
+                        if (overflowHash is { Length: 32 })
+                            RequeueHash_NoLock(overflowHash, ToHex(overflowHash));
+                    }
+
+                    selectedHashes = selectedHashes.GetRange(0, GetDataBatchSize);
+                }
+
+                ReserveInflight_NoLock(selectedHashes, selectedPeerKey, now, useRangeRequest);
+                _activeChunkRequested += selectedHashes.Count;
             }
 
-            for (int i = 0; i < sendJobs.Count; i++)
+            if (rotated && selectedPeer != null)
+                _log?.Info("Sync", $"Rotated download peer -> {selectedPeer.RemoteEndpoint} (chunk={SequentialChunkSize}).");
+
+            if (selectedPeer == null || selectedHashes == null || selectedHashes.Count == 0)
+                return;
+
+            byte[] payload;
+            MsgType requestType;
+            try
             {
-                var (peer, hashes) = sendJobs[i];
-                if (hashes.Count == 0)
-                    continue;
+                if (useRangeRequest && rangeCount > 0)
+                {
+                    payload = BuildBlocksRangePayload(rangeStartHeight, rangeCount);
+                    requestType = MsgType.GetBlocksRange;
+                }
+                else
+                {
+                    payload = BuildHashListPayload(selectedHashes, selectedHashes.Count);
+                    requestType = MsgType.GetData;
+                }
+            }
+            catch
+            {
+                OnPeerDisconnected(selectedPeer);
+                return;
+            }
 
-                byte[] payload;
-                try
+            try
+            {
+                await _sendFrameAsync(selectedPeer, requestType, payload, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _log?.Warn("Sync", $"{requestType} send failed for {selectedPeer.RemoteEndpoint}: {ex.Message}");
+                if (selectedPeerKey != null)
                 {
-                    payload = BuildHashListPayload(hashes, GetDataBatchSize);
+                    lock (_gate)
+                    {
+                        _peerCooldownUntilUtc[selectedPeerKey] = DateTime.UtcNow + PeerFailureCooldown;
+                    }
                 }
-                catch
-                {
-                    OnPeerDisconnected(peer);
-                    continue;
-                }
-
-                try
-                {
-                    await _sendFrameAsync(peer, MsgType.GetData, payload, ct).ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    _log?.Warn("Sync", $"getdata send failed for {peer.RemoteEndpoint}: {ex.Message}");
-                    OnPeerDisconnected(peer);
-                }
+                OnPeerDisconnected(selectedPeer);
             }
 
             bool shouldRepump;
@@ -496,7 +634,7 @@ namespace Qado.Networking
                     continue;
                 }
 
-                if (_haveBlock(hash))
+                if (SafeHaveBlock(hash))
                 {
                     _stateByHash[hex] = BlockSyncItemState.HaveBlock;
                     continue;
@@ -554,15 +692,18 @@ namespace Qado.Networking
             return duplicate;
         }
 
-        private void RequeueTimedOut_NoLock(DateTime now)
+        private List<string> RequeueTimedOut_NoLock(DateTime now)
         {
+            var timedOutPeers = new HashSet<string>(StringComparer.Ordinal);
+            var timedOutRangePeers = new HashSet<string>(StringComparer.Ordinal);
             if (_inflightByHash.Count == 0)
-                return;
+                return new List<string>();
 
             var timedOut = new List<string>();
             foreach (var kv in _inflightByHash)
             {
-                if ((now - kv.Value.RequestedUtc) > RequestedTimeout)
+                var timeout = kv.Value.RequestedViaRange ? RequestedTimeoutRange : RequestedTimeout;
+                if ((now - kv.Value.RequestedUtc) > timeout)
                     timedOut.Add(kv.Key);
             }
 
@@ -573,6 +714,9 @@ namespace Qado.Networking
                     continue;
 
                 _inflightByHash.Remove(hex);
+                timedOutPeers.Add(req.PeerKey);
+                if (req.RequestedViaRange)
+                    timedOutRangePeers.Add(req.PeerKey);
 
                 if (_inflightByPeer.TryGetValue(req.PeerKey, out var set))
                 {
@@ -583,6 +727,114 @@ namespace Qado.Networking
 
                 RequeueHash_NoLock(req.Hash, hex);
             }
+
+            foreach (var peerKey in timedOutRangePeers)
+                MarkPeerRangeUnsupported_NoLock(peerKey, now, "range timeout");
+
+            if (_activeChunkPeerKey != null && timedOutPeers.Contains(_activeChunkPeerKey))
+            {
+                _lastChunkPeerKey = _activeChunkPeerKey;
+                _activeChunkPeerKey = null;
+                _activeChunkRequested = 0;
+            }
+
+            return new List<string>(timedOutPeers);
+        }
+
+        private List<PeerSession> BuildOrderedDownloadPeers_NoLock(IReadOnlyCollection<PeerSession> peers, DateTime now)
+        {
+            var ordered = new List<PeerSession>(peers.Count);
+            foreach (var peer in peers)
+            {
+                if (peer == null || !peer.HandshakeOk || !peer.Client.Connected)
+                    continue;
+                if (!peer.RemoteIsPublic)
+                    continue;
+
+                string peerKey = NormalizePeerKey(peer.SessionKey);
+                if (_peerCooldownUntilUtc.TryGetValue(peerKey, out var until))
+                {
+                    if (until > now)
+                        continue;
+                    _peerCooldownUntilUtc.Remove(peerKey);
+                }
+
+                ordered.Add(peer);
+            }
+
+            ordered.Sort((a, b) => a.ConnectedUtc.CompareTo(b.ConnectedUtc));
+            return ordered;
+        }
+
+        private bool IsRangeAllowedForPeer_NoLock(string peerKey, DateTime now)
+        {
+            if (!_peerRangeUnsupportedUntilUtc.TryGetValue(peerKey, out var until))
+                return true;
+
+            if (until <= now)
+            {
+                _peerRangeUnsupportedUntilUtc.Remove(peerKey);
+                return true;
+            }
+
+            return false;
+        }
+
+        private void MarkPeerRangeUnsupported_NoLock(string peerKey, DateTime now, string reason)
+        {
+            if (string.IsNullOrWhiteSpace(peerKey))
+                return;
+
+            _peerRangeUnsupportedUntilUtc[peerKey] = now + RangeUnsupportedTtl;
+            _log?.Info("Sync", $"Range disabled for {peerKey} ({reason}); fallback to GetData for {RangeUnsupportedTtl.TotalMinutes:0}m.");
+        }
+
+        private PeerSession? ResolveActiveChunkPeer_NoLock(List<PeerSession> orderedPeers, DateTime now, bool allowRotate)
+        {
+            if (orderedPeers.Count == 0)
+                return null;
+
+            if (!string.IsNullOrWhiteSpace(_activeChunkPeerKey))
+            {
+                for (int i = 0; i < orderedPeers.Count; i++)
+                {
+                    var p = orderedPeers[i];
+                    if (string.Equals(NormalizePeerKey(p.SessionKey), _activeChunkPeerKey, StringComparison.Ordinal))
+                        return p;
+                }
+
+                _lastChunkPeerKey = _activeChunkPeerKey;
+                _activeChunkPeerKey = null;
+                _activeChunkRequested = 0;
+            }
+
+            int start = 0;
+            if (allowRotate && !string.IsNullOrWhiteSpace(_lastChunkPeerKey))
+            {
+                for (int i = 0; i < orderedPeers.Count; i++)
+                {
+                    if (string.Equals(NormalizePeerKey(orderedPeers[i].SessionKey), _lastChunkPeerKey, StringComparison.Ordinal))
+                    {
+                        start = (i + 1) % orderedPeers.Count;
+                        break;
+                    }
+                }
+            }
+
+            for (int i = 0; i < orderedPeers.Count; i++)
+            {
+                var candidate = orderedPeers[(start + i) % orderedPeers.Count];
+                string key = NormalizePeerKey(candidate.SessionKey);
+                if (_peerCooldownUntilUtc.TryGetValue(key, out var until) && until > now)
+                    continue;
+
+                _activeChunkPeerKey = key;
+                _lastChunkPeerKey = key;
+                _activeChunkRequested = 0;
+                return candidate;
+            }
+
+            return null;
         }
 
         private List<byte[]> TakeQueuedHashes_NoLock(int count)
@@ -603,7 +855,7 @@ namespace Qado.Networking
                     continue;
                 }
 
-                if (_haveBlock(hash))
+                if (SafeHaveBlock(hash))
                 {
                     _stateByHash[hex] = BlockSyncItemState.HaveBlock;
                     continue;
@@ -624,7 +876,7 @@ namespace Qado.Networking
             return result;
         }
 
-        private void ReserveInflight_NoLock(List<byte[]> hashes, string peerKey, DateTime now)
+        private void ReserveInflight_NoLock(List<byte[]> hashes, string peerKey, DateTime now, bool requestedViaRange)
         {
             if (!_inflightByPeer.TryGetValue(peerKey, out var set))
             {
@@ -643,7 +895,8 @@ namespace Qado.Networking
                 {
                     Hash = (byte[])hash.Clone(),
                     PeerKey = peerKey,
-                    RequestedUtc = now
+                    RequestedUtc = now,
+                    RequestedViaRange = requestedViaRange
                 };
 
                 set.Add(hex);
@@ -668,7 +921,7 @@ namespace Qado.Networking
                 return;
             }
 
-            if (_haveBlock(hash))
+            if (SafeHaveBlock(hash))
             {
                 _stateByHash[hashHex] = BlockSyncItemState.HaveBlock;
                 return;
@@ -778,6 +1031,17 @@ LIMIT 50000;";
             return payload;
         }
 
+        public static byte[] BuildBlocksRangePayload(ulong startHeight, int count)
+        {
+            if (count <= 0)
+                throw new ArgumentOutOfRangeException(nameof(count));
+
+            var payload = new byte[12];
+            BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(0, 8), startHeight);
+            BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(8, 4), (uint)count);
+            return payload;
+        }
+
         public static bool TryParseHashListPayload(byte[] payload, int maxHashes, out List<byte[]> hashes)
         {
             hashes = new List<byte[]>();
@@ -829,6 +1093,72 @@ LIMIT 50000;";
             return true;
         }
 
+        public static bool TryParseBlocksBatchPayload(
+            byte[] payload,
+            int maxBlocks,
+            out ulong startHeight,
+            out List<byte[]> blocksPayload,
+            out string error)
+        {
+            startHeight = 0;
+            blocksPayload = new List<byte[]>();
+            error = string.Empty;
+
+            if (payload == null || payload.Length < 12)
+            {
+                error = "payload too short";
+                return false;
+            }
+
+            startHeight = BinaryPrimitives.ReadUInt64LittleEndian(payload.AsSpan(0, 8));
+            uint declaredU = BinaryPrimitives.ReadUInt32LittleEndian(payload.AsSpan(8, 4));
+            if (declaredU == 0 || declaredU > maxBlocks)
+            {
+                error = $"invalid block count: {declaredU}";
+                return false;
+            }
+
+            int declared = (int)declaredU;
+            int o = 12;
+            blocksPayload = new List<byte[]>(declared);
+
+            for (int i = 0; i < declared; i++)
+            {
+                if (o + 4 > payload.Length)
+                {
+                    error = "truncated length prefix";
+                    return false;
+                }
+
+                uint lenU = BinaryPrimitives.ReadUInt32LittleEndian(payload.AsSpan(o, 4));
+                o += 4;
+
+                if (lenU == 0 || lenU > (uint)ConsensusRules.MaxBlockSizeBytes)
+                {
+                    error = $"invalid block payload size: {lenU}";
+                    return false;
+                }
+
+                int len = (int)lenU;
+                if (o + len > payload.Length)
+                {
+                    error = "truncated block payload";
+                    return false;
+                }
+
+                blocksPayload.Add(payload.AsSpan(o, len).ToArray());
+                o += len;
+            }
+
+            if (o != payload.Length)
+            {
+                error = "trailing bytes in payload";
+                return false;
+            }
+
+            return true;
+        }
+
         private bool IsHashDownloadCandidate(byte[] hash)
         {
             if (hash is not { Length: 32 })
@@ -847,9 +1177,98 @@ LIMIT 50000;";
                 return false;
 
             if (_isDownloadCandidate != null)
-                return _isDownloadCandidate(hash);
+            {
+                try
+                {
+                    return _isDownloadCandidate(hash);
+                }
+                catch (Exception ex)
+                {
+                    if (Interlocked.CompareExchange(ref _candidateCheckErrorLogged, 1, 0) == 0)
+                        _log?.Warn("Sync", $"download-candidate check failed; suppressing repeats: {ex.Message}");
+                    return false;
+                }
+            }
 
-            return !BlockIndexStore.IsBadOrHasBadAncestor(hash);
+            try
+            {
+                return !BlockIndexStore.IsBadOrHasBadAncestor(hash);
+            }
+            catch (Exception ex)
+            {
+                if (Interlocked.CompareExchange(ref _candidateCheckErrorLogged, 1, 0) == 0)
+                    _log?.Warn("Sync", $"download-candidate fallback check failed; suppressing repeats: {ex.Message}");
+                return false;
+            }
+        }
+
+        private bool TryBuildRangeRequest_NoLock(
+            IReadOnlyList<byte[]> selectedHashes,
+            out ulong startHeight,
+            out int rangeCount,
+            out int selectedCountForRange)
+        {
+            startHeight = 0;
+            rangeCount = 0;
+            selectedCountForRange = 0;
+            if (selectedHashes == null || selectedHashes.Count == 0)
+                return false;
+
+            var firstHash = selectedHashes[0];
+            if (firstHash is not { Length: 32 })
+                return false;
+            if (!BlockIndexStore.TryGetMeta(firstHash, out var firstHeight, out _, out _))
+                return false;
+
+            startHeight = firstHeight;
+            ulong lastIncludedHeight = firstHeight;
+            selectedCountForRange = 1;
+            rangeCount = 1;
+            bool sawGap = false;
+
+            for (int i = 1; i < selectedHashes.Count && selectedCountForRange < RangeBatchSize; i++)
+            {
+                var hash = selectedHashes[i];
+                if (hash is not { Length: 32 })
+                    break;
+
+                if (!BlockIndexStore.TryGetMeta(hash, out var height, out _, out _))
+                    break;
+
+                if (height < lastIncludedHeight)
+                    break;
+
+                ulong span = checked(height - startHeight + 1UL);
+                if (span > (ulong)RangeBatchSize)
+                    break;
+
+                bool gapDetected = height != checked(lastIncludedHeight + 1UL);
+                if (gapDetected)
+                    sawGap = true;
+
+                if (sawGap && span > (ulong)SparseGapRangeMaxSpan)
+                    break;
+
+                selectedCountForRange++;
+                lastIncludedHeight = height;
+                rangeCount = (int)span;
+            }
+
+            return selectedCountForRange > 0 && rangeCount > 0;
+        }
+
+        private bool SafeHaveBlock(byte[] hash)
+        {
+            try
+            {
+                return _haveBlock(hash);
+            }
+            catch (Exception ex)
+            {
+                if (Interlocked.CompareExchange(ref _haveBlockCheckErrorLogged, 1, 0) == 0)
+                    _log?.Warn("Sync", $"have-block check failed; suppressing repeats: {ex.Message}");
+                return false;
+            }
         }
 
         private void ReplaceActivePlan_NoLock(IReadOnlyList<byte[]>? hashesToDownload, IReadOnlyList<byte[]>? hashesToRevalidate)

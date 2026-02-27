@@ -115,12 +115,19 @@ namespace Qado.Storage
         {
             lock (Db.Sync)
             {
-                using var cmd = (tx?.Connection ?? Conn).CreateCommand();
-                cmd.Transaction = tx;
-                cmd.CommandText = "SELECT hash FROM canon WHERE height=$h LIMIT 1;";
-                cmd.Parameters.AddWithValue("$h", (long)height);
-                var v = cmd.ExecuteScalar() as byte[];
-                return v is { Length: 32 } ? v : null;
+                try
+                {
+                    using var cmd = (tx?.Connection ?? Conn).CreateCommand();
+                    cmd.Transaction = tx;
+                    cmd.CommandText = "SELECT hash FROM canon WHERE height=$h LIMIT 1;";
+                    cmd.Parameters.AddWithValue("$h", (long)height);
+                    var v = cmd.ExecuteScalar() as byte[];
+                    return v is { Length: 32 } ? v : null;
+                }
+                catch
+                {
+                    return null;
+                }
             }
         }
 
@@ -146,21 +153,56 @@ ON CONFLICT(height) DO UPDATE SET hash = excluded.hash;";
         {
             lock (Db.Sync)
             {
-                using var cmd = (tx?.Connection ?? Conn).CreateCommand();
-                cmd.Transaction = tx;
-                cmd.CommandText = "SELECT MAX(height) FROM canon;";
-                var v = cmd.ExecuteScalar();
-                if (v == null || v is DBNull)
+                try
                 {
+                    using var cmd = (tx?.Connection ?? Conn).CreateCommand();
+                    cmd.Transaction = tx;
+                    cmd.CommandText = "SELECT MAX(height) FROM canon;";
+                    var v = cmd.ExecuteScalar();
+                    if (v == null || v is DBNull)
+                    {
+                        height = 0;
+                        return false;
+                    }
+
+                    long l = Convert.ToInt64(v);
+                    if (l < 0)
+                    {
+                        height = 0;
+                        return false;
+                    }
+
+                    height = (ulong)l;
+                    return true;
+                }
+                catch
+                {
+                    // In transactional callers we must not guess heights from metadata.
+                    if (tx != null)
+                    {
+                        height = 0;
+                        return false;
+                    }
+
+                    try
+                    {
+                        using var fallback = Conn.CreateCommand();
+                        fallback.CommandText = "SELECT value FROM meta WHERE key='LatestHeight' LIMIT 1;";
+                        var raw = fallback.ExecuteScalar();
+                        if (raw != null && raw is not DBNull &&
+                            ulong.TryParse(Convert.ToString(raw), out var parsed))
+                        {
+                            height = parsed;
+                            return true;
+                        }
+                    }
+                    catch
+                    {
+                    }
+
                     height = 0;
                     return false;
                 }
-
-                long l = (long)v;
-                if (l < 0) { height = 0; return false; }
-
-                height = (ulong)l;
-                return true;
             }
         }
 

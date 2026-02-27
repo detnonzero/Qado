@@ -18,7 +18,9 @@ namespace Qado.Networking
     public static class BlockSyncStarter
     {
         private const int DefaultP2PPort = GenesisConfig.P2PPort;
-        private const int MaxFramePayloadBytes = ConsensusRules.MaxBlockSizeBytes;
+        private const int MaxBlocksBatchPayloadBytes = 32 * 1024 * 1024;
+        private const int MaxBlocksPerBatch = 1440;
+        private const int MaxFramePayloadBytes = MaxBlocksBatchPayloadBytes;
         private const int MinBlockFetchWindow = 360;
         private const int MaxBlockFetchWindow = 1440;
         private const int DefaultBlockFetchWindow = 720;
@@ -579,7 +581,157 @@ namespace Qado.Networking
                 return (false, GetLatestHeightDirect(), null, false);
 
             fetchWindow = Math.Clamp(fetchWindow, 1, MaxBlockFetchWindow);
+            int requestBatchCount = Math.Clamp(fetchWindow, 1, MaxBlocksPerBatch);
 
+            ulong nextToProcess = fromHeight;
+            ulong lastStoredHeight = GetLatestHeightDirect();
+            byte[]? lastBlockHash = null;
+            bool madeProgress = false;
+            DateTime lastProgressLogUtc = DateTime.UtcNow;
+
+            while (!ct.IsCancellationRequested && nextToProcess <= toHeight)
+            {
+                ulong remaining = (toHeight - nextToProcess) + 1UL;
+                int want = (int)Math.Min((ulong)requestBatchCount, remaining);
+                var req = new byte[12];
+                BinaryPrimitives.WriteUInt64LittleEndian(req.AsSpan(0, 8), nextToProcess);
+                BinaryPrimitives.WriteUInt32LittleEndian(req.AsSpan(8, 4), (uint)want);
+                await WriteFrame(ns, MsgType.GetBlocksRange, req, ct).ConfigureAwait(false);
+
+                var fr = await ReadFrameWithTimeout(ns, ct).ConfigureAwait(false);
+                if (fr.payload == null || fr.type != MsgType.BlocksBatch)
+                {
+                    log?.Info("BlockSync", "Peer does not support batch range sync. Falling back to legacy block-at mode.");
+                    var legacy = await DownloadRangeWindowedLegacyAsync(
+                        ns,
+                        nextToProcess,
+                        toHeight,
+                        expectedPrevHash,
+                        fetchWindow,
+                        log,
+                        ct).ConfigureAwait(false);
+
+                    if (legacy.lastStoredHeight > lastStoredHeight)
+                        lastStoredHeight = legacy.lastStoredHeight;
+                    if (legacy.madeProgress)
+                        madeProgress = true;
+                    if (legacy.lastBlockHash is { Length: 32 })
+                        lastBlockHash = legacy.lastBlockHash;
+
+                    return legacy;
+                }
+
+                if (!TryParseBlocksBatchPayload(fr.payload, out ulong batchStart, out var blocks, out var parseError))
+                {
+                    log?.Warn("BlockSync", $"BlocksBatch parse failed: {parseError}");
+                    return (false, lastStoredHeight, lastBlockHash, madeProgress);
+                }
+
+                if (batchStart != nextToProcess)
+                {
+                    log?.Warn("BlockSync", $"BlocksBatch start mismatch: expected h={nextToProcess}, got h={batchStart}.");
+                    return (false, lastStoredHeight, lastBlockHash, madeProgress);
+                }
+
+                if (blocks.Count == 0)
+                {
+                    log?.Warn("BlockSync", $"BlocksBatch returned empty payload at h={nextToProcess}.");
+                    return (false, lastStoredHeight, lastBlockHash, madeProgress);
+                }
+
+                for (int i = 0; i < blocks.Count; i++)
+                {
+                    var ready = blocks[i];
+                    ulong h = nextToProcess;
+
+                    if (ready.BlockHeight != 0 && ready.BlockHeight != h)
+                    {
+                        log?.Warn("BlockSync", $"BlocksBatch response height mismatch: expected h={h}, got h={ready.BlockHeight}.");
+                        return (false, lastStoredHeight, lastBlockHash, madeProgress);
+                    }
+
+                    var prev = ready.Header?.PreviousBlockHash;
+                    if (prev is not { Length: 32 } || !BytesEqual(prev, expectedPrevHash))
+                    {
+                        log?.Warn("BlockSync", $"BlocksBatch linkage mismatch at h={h}.");
+                        return (false, lastStoredHeight, lastBlockHash, madeProgress);
+                    }
+
+                    ready.BlockHeight = h;
+                    if (!BlockValidator.ValidateNetworkSideBlockStateless(ready, out var reason))
+                    {
+                        log?.Warn("BlockSync", $"Fetched block h={h} failed validation: {reason}");
+                        return (false, lastStoredHeight, lastBlockHash, madeProgress);
+                    }
+
+                    try
+                    {
+                        var txOffsets = ComputeTxOffsets(ready);
+
+                        lock (Db.Sync)
+                        {
+                            using var trx = Db.Connection!.BeginTransaction();
+
+                            BlockStore.SaveBlock(ready, trx, BlockIndexStore.StatusSideStatelessAccepted);
+
+                            for (int j = 0; j < txOffsets.Length; j++)
+                            {
+                                var (id, off, size) = txOffsets[j];
+                                TxIndexStore.Insert(id, ready.BlockHash!, ready.BlockHeight, off, size, trx);
+                            }
+
+                            trx.Commit();
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        log?.Warn("BlockSync", $"Store h={h} failed: {ex.Message}");
+                        return (false, lastStoredHeight, lastBlockHash, madeProgress);
+                    }
+
+                    expectedPrevHash = ready.BlockHash!;
+                    lastBlockHash = ready.BlockHash!;
+
+                    var after = GetLatestHeightDirect();
+                    ulong remainingAfter = toHeight > h ? (toHeight - h) : 0UL;
+                    var nowUtc = DateTime.UtcNow;
+                    bool progressLogByTime = (nowUtc - lastProgressLogUtc) >= SyncProgressLogInterval;
+                    bool isFinalProgressLog = h >= toHeight;
+                    if (isFinalProgressLog || progressLogByTime)
+                    {
+                        log?.Info("BlockSync", $"Synced {h}/{toHeight} (dbMax={after}, remaining={remainingAfter})");
+                        lastProgressLogUtc = nowUtc;
+                    }
+
+                    if (after < h)
+                    {
+                        log?.Error("BlockSync",
+                            $"DB did not retain inserts: after commit MAX(height)={after}, expected >= {h}.");
+                        return (false, lastStoredHeight, lastBlockHash, madeProgress);
+                    }
+
+                    if (after > lastStoredHeight)
+                    {
+                        lastStoredHeight = after;
+                        madeProgress = true;
+                    }
+
+                    nextToProcess++;
+                }
+            }
+
+            return (nextToProcess > toHeight, lastStoredHeight, lastBlockHash, madeProgress);
+        }
+
+        private static async Task<(bool ok, ulong lastStoredHeight, byte[]? lastBlockHash, bool madeProgress)> DownloadRangeWindowedLegacyAsync(
+            NetworkStream ns,
+            ulong fromHeight,
+            ulong toHeight,
+            byte[] expectedPrevHash,
+            int fetchWindow,
+            ILogSink? log,
+            CancellationToken ct)
+        {
             ulong nextToRequest = fromHeight;
             ulong nextToProcess = fromHeight;
             var pendingByHeight = new Dictionary<ulong, Block>(capacity: Math.Min(fetchWindow * 2, 4096));
@@ -721,6 +873,82 @@ namespace Qado.Networking
             }
 
             return (nextToProcess > toHeight, lastStoredHeight, lastBlockHash, madeProgress);
+        }
+
+        private static bool TryParseBlocksBatchPayload(
+            byte[] payload,
+            out ulong startHeight,
+            out List<Block> blocks,
+            out string error)
+        {
+            startHeight = 0;
+            blocks = new List<Block>();
+            error = "";
+
+            if (payload == null || payload.Length < 12)
+            {
+                error = "payload too short";
+                return false;
+            }
+
+            startHeight = BinaryPrimitives.ReadUInt64LittleEndian(payload.AsSpan(0, 8));
+            uint declaredU = BinaryPrimitives.ReadUInt32LittleEndian(payload.AsSpan(8, 4));
+            if (declaredU > MaxBlocksPerBatch)
+            {
+                error = $"declared count too large: {declaredU}";
+                return false;
+            }
+
+            int declared = (int)declaredU;
+            int o = 12;
+            blocks = new List<Block>(declared);
+
+            for (int i = 0; i < declared; i++)
+            {
+                if (o + 4 > payload.Length)
+                {
+                    error = "truncated length prefix";
+                    return false;
+                }
+
+                uint lenU = BinaryPrimitives.ReadUInt32LittleEndian(payload.AsSpan(o, 4));
+                o += 4;
+
+                if (lenU > (uint)ConsensusRules.MaxBlockSizeBytes)
+                {
+                    error = $"block payload too large: {lenU}";
+                    return false;
+                }
+
+                int len = (int)lenU;
+                if (o + len > payload.Length)
+                {
+                    error = "truncated block payload";
+                    return false;
+                }
+
+                try
+                {
+                    var block = BlockBinarySerializer.Read(payload.AsSpan(o, len));
+                    EnsureCanonicalBlockHash(block);
+                    blocks.Add(block);
+                }
+                catch (Exception ex)
+                {
+                    error = $"block decode failed: {ex.Message}";
+                    return false;
+                }
+
+                o += len;
+            }
+
+            if (o != payload.Length)
+            {
+                error = "trailing bytes in payload";
+                return false;
+            }
+
+            return true;
         }
 
         private static async Task<ulong> FindCommonAncestorAsync(

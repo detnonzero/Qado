@@ -278,7 +278,7 @@ namespace Qado.CodeBehindHelper
                 }
 
                 logSink.Info("Mining", extendedCanon
-                    ? $"✅ Mined + stored + canon-extended: h={newCanonHeight}"
+                    ? $"✅ Mined + stored: h={newCanonHeight}"
                     : $"✅ Mined + stored (side/reorg candidate): h={block.BlockHeight}");
 
                 if (!extendedCanon)
