@@ -8,9 +8,12 @@ namespace Qado.Storage
 {
     public static class KeyStore
     {
+        private const string KeystoreModeEnv = "QADO_KEYSTORE_MODE";
+        private const string PortablePlaintextMode = "portable_plaintext";
         private static readonly byte[] PrivBlobMagic = { (byte)'Q', (byte)'K', 1 };
         private static readonly byte[] PrivBlobEntropy =
             SHA256.HashData(Encoding.UTF8.GetBytes("Qado.KeyStore.PrivateKey.V1"));
+        public static readonly bool IsPortablePlaintextModeEnabled = ReadPortablePlaintextMode();
 
         public static void AddKey(string privHex, string pubHex, SqliteTransaction? tx = null)
         {
@@ -21,7 +24,9 @@ namespace Qado.Storage
             byte[] pub = Convert.FromHexString(pubHex);
             if (priv.Length != 32) throw new ArgumentException("priv must be 32 bytes", nameof(privHex));
             if (pub.Length != 32) throw new ArgumentException("pub must be 32 bytes", nameof(pubHex));
-            byte[] privBlob = ProtectPrivateKey(priv);
+            byte[] privBlob = IsPortablePlaintextModeEnabled
+                ? (byte[])priv.Clone()
+                : ProtectPrivateKey(priv);
 
             if (tx != null)
             {
@@ -127,6 +132,22 @@ namespace Qado.Storage
             for (int i = 0; i < PrivBlobMagic.Length; i++)
                 if (blob[i] != PrivBlobMagic[i]) return false;
             return true;
+        }
+
+        private static bool ReadPortablePlaintextMode()
+        {
+            try
+            {
+                string? raw = Environment.GetEnvironmentVariable(KeystoreModeEnv);
+                if (string.IsNullOrWhiteSpace(raw))
+                    return false;
+
+                return string.Equals(raw.Trim(), PortablePlaintextMode, StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return false;
+            }
         }
     }
 }

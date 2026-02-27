@@ -9,7 +9,7 @@ namespace Qado.Networking
             public const byte NetworkId = 0x01;
             public const int P2PPort = 34001;
             public const int ApiPort = 18080;
-            public const string GenesisHost = "82.165.63.4";
+            public const string GenesisHost = "212.227.21.183";
             public const string GenesisMinerHex = "6A37C7D48887658C233C80ED6D1F8A28753E1F9E209867ABE9278D714033BA80";
             public const ulong GenesisTimestamp = 1772055600UL;
             public const uint GenesisNonce = 0u;
@@ -26,7 +26,7 @@ namespace Qado.Networking
             public const byte NetworkId = 0x10;
             public const int P2PPort = 34001;
             public const int ApiPort = 19080;
-            public const string GenesisHost = "82.165.63.4";
+            public const string GenesisHost = "212.227.21.183";
             public const string GenesisMinerHex = Mainnet.GenesisMinerHex;
             public const ulong GenesisTimestamp = Mainnet.GenesisTimestamp;
             public const uint GenesisNonce = Mainnet.GenesisNonce;

@@ -55,6 +55,7 @@ namespace Qado
         private const int PeerReloadDebounceMs = 300;
         private const int NodeStatusDebounceMs = 400;
         private const int BlockExplorerRefreshDebounceMs = 5000;
+        private static readonly TimeSpan TrySyncCooldown = TimeSpan.FromSeconds(5);
         private static readonly TimeSpan MempoolCleanupInterval = TimeSpan.FromSeconds(15);
         private const int MempoolCleanupMaxAgeSeconds = 3600;
         private static readonly TimeSpan PeerSeenRecentlyWindow = TimeSpan.FromMinutes(5);
@@ -72,6 +73,7 @@ namespace Qado
         private int _nodeStatusRefreshRequested;
         private int _nodeStatusRefreshWorkerRunning;
         private int _blockExplorerRefreshRequested;
+        private DateTime _lastTrySyncUtc = DateTime.MinValue;
 
         private readonly HashSet<ulong> _displayedHeights = new();
 
@@ -128,6 +130,8 @@ namespace Qado
 
                 ReloadBlocksButton.Click -= ReloadBlocksButton_Click;
                 ReloadBlocksButton.Click += ReloadBlocksButton_Click;
+                TrySyncButton.Click -= TrySyncButton_Click;
+                TrySyncButton.Click += TrySyncButton_Click;
 
                 ConnectPeerButton.Click -= ConnectPeerButton_Click;
                 ConnectPeerButton.Click += ConnectPeerButton_Click;
@@ -164,6 +168,10 @@ namespace Qado
                 }, null, MempoolCleanupInterval, MempoolCleanupInterval);
 
                 PopulateKeyDropdown();
+                if (KeyStore.IsPortablePlaintextModeEnabled)
+                {
+                    Warn("Security", "Portable plaintext keystore mode is enabled (QADO_KEYSTORE_MODE=portable_plaintext). Private keys are stored unencrypted.");
+                }
 
                 if (_isClosing) return;
 
@@ -523,7 +531,17 @@ namespace Qado
         {
             if (GuiUtils.IsDesignMode) return;
 
-            var keys = KeyStorage.LoadAllPrivateKeys();
+            List<string> keys;
+            try
+            {
+                keys = KeyStorage.LoadAllPrivateKeys();
+            }
+            catch (Exception ex)
+            {
+                Warn("Keys", $"Could not load private keys from key store: {ex.Message}");
+                keys = new List<string>();
+            }
+
             PrivateKeyComboBox.Items.Clear();
             PrivateKeyComboBox.Items.Add("New");
 
@@ -1134,6 +1152,38 @@ LIMIT 200;";
         private void ReloadBlocksButton_Click(object sender, RoutedEventArgs e)
         {
             ReloadAllBlocks();
+        }
+
+        private void TrySyncButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (_isClosing) return;
+
+            var now = DateTime.UtcNow;
+            var elapsed = now - _lastTrySyncUtc;
+            if (elapsed < TrySyncCooldown)
+            {
+                int waitSec = (int)Math.Ceiling((TrySyncCooldown - elapsed).TotalSeconds);
+                Info("Sync", $"Try Sync ignored (cooldown {waitSec}s).");
+                return;
+            }
+
+            _lastTrySyncUtc = now;
+
+            try
+            {
+                if (_p2pNode == null)
+                {
+                    Warn("Sync", "Try Sync failed: P2P node is not initialized.");
+                    return;
+                }
+
+                _p2pNode.RequestSyncNow("ui-try-sync");
+                Info("Sync", "Try Sync requested.");
+            }
+            catch (Exception ex)
+            {
+                Warn("Sync", $"Try Sync failed: {ex.Message}");
+            }
         }
 
         public void ReloadAllBlocks()

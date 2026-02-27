@@ -36,15 +36,15 @@ The app starts:
 
 ## Network Defaults (current source defaults)
 
-- P2P port: `34000`
-- API port: `18080` (override via `QADO_API_PORT`)
-- Seed host: `82.165.63.4`
+- P2P port: `34001`
+- API port: `19080` (override via `QADO_API_PORT`)
+- Seed host: `212.227.21.183`
 
 Important: verify network parameters for each release/tag before joining a network.
 
 ## API
 
-- Base URL (local): `http://127.0.0.1:18080`
+- Base URL (local): `http://127.0.0.1:19080`
 - Docs: `docs/EXCHANGE_INTEGRATION.md`
 - OpenAPI: `docs/exchange-api-v1.openapi.yaml`
 

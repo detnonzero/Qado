@@ -34,8 +34,8 @@ namespace Qado.Networking
         private static readonly TimeSpan ReconnectWhenDisconnectedDelay = TimeSpan.FromSeconds(8);
         private static readonly TimeSpan ReconnectSteadyDelay = TimeSpan.FromSeconds(25);
         private const double ReconnectJitterFraction = 0.20;
-        private static readonly TimeSpan PublicClaimProbeTimeout = TimeSpan.FromSeconds(4);
-        private const int MaxPublicClaimProbesPerReconnectTick = 2;
+        private static readonly TimeSpan PublicClaimProbeTimeout = TimeSpan.FromSeconds(8);
+        private const int MaxPublicClaimProbesPerReconnectTick = 12;
         private static readonly TimeSpan BlockRateWindow = TimeSpan.FromSeconds(10);
         private const int MaxInboundBlocksPerWindowPerPeer = 120;
         private static readonly TimeSpan TxRateWindow = TimeSpan.FromSeconds(10);
@@ -751,7 +751,11 @@ namespace Qado.Networking
             else if (s.IsInbound && claimsListening && IsPublicRoutableIPv4Literal(ip))
             {
                 // Inbound session is only a claim; keep it for outbound probe verification.
+                _log?.Info(
+                    "P2P",
+                    $"inbound public claim registered: remoteEndpoint={EndpointLogFormatter.FormatEndpoint(s.RemoteEndpoint)}, detectedIp={EndpointLogFormatter.FormatHost(ip)}, advertisedPort={port}");
                 NotePeerPublicClaim(ip, port);
+                _ = TryProbePublicClaimImmediatelyAsync(ip, port);
             }
 
             if (claimsListening && IsPublicRoutableIPv4Literal(ip))
@@ -773,7 +777,7 @@ namespace Qado.Networking
             if (firstHandshakeForSession)
             {
                 _log?.Info("P2P",
-                    $"handshake from {EndpointLogFormatter.FormatHostPort(ip, port)} (v{ver}, inbound={s.IsInbound}, public={s.RemoteIsPublic})");
+                    $"handshake from {EndpointLogFormatter.FormatHostPort(ip, port)} (v{ver}, inbound={s.IsInbound}, public={s.RemoteIsPublic}, claimsListening={claimsListening}, advertisedPort={port})");
 
                 try { await WriteFrame(s.Stream, MsgType.GetPeers, Array.Empty<byte>(), ct).ConfigureAwait(false); } catch { }
                 try { await WriteFrame(s.Stream, MsgType.InvBlock, Array.Empty<byte>(), ct).ConfigureAwait(false); } catch { }
@@ -1477,6 +1481,15 @@ namespace Qado.Networking
         private static bool IsHeaderCandidateDownloadable(byte[] hash)
             => hash is { Length: 32 } && !BlockIndexStore.IsBadOrHasBadAncestor(hash);
 
+        public void RequestSyncNow(string reason = "manual")
+        {
+            if (Volatile.Read(ref _stopped) != 0)
+                return;
+
+            _headerSyncManager.RequestResync(reason);
+            TryReplanFromBestHeader(reason);
+        }
+
         private void OnHeaderSyncCompleted(HeaderSyncPlan plan)
         {
             if (_blockDownloadManager.IsDownloadStarted)
@@ -1643,11 +1656,15 @@ namespace Qado.Networking
                     continue;
                 }
 
-                bool reachable = await TryTcpReachabilityProbeAsync(ip, port, ct).ConfigureAwait(false);
+                _log?.Info("P2P", $"probing public claim (periodic): {EndpointLogFormatter.FormatHostPort(ip, port)}");
+                var probe = await TryTcpReachabilityProbeAsync(ip, port, ct).ConfigureAwait(false);
                 probed++;
 
-                if (!reachable)
+                if (!probe.reachable)
+                {
+                    _log?.Info("P2P", $"public claim probe failed for {EndpointLogFormatter.FormatHostPort(ip, port)}: {probe.reason}");
                     continue;
+                }
 
                 MarkPeerAsPublic(ip, port);
                 _publicClaimsByPex.TryRemove(key, out _);
@@ -1662,12 +1679,49 @@ namespace Qado.Networking
             }
         }
 
-        private static async Task<bool> TryTcpReachabilityProbeAsync(string ip, int port, CancellationToken ct)
+        private async Task TryProbePublicClaimImmediatelyAsync(string ip, int port)
+        {
+            if (Volatile.Read(ref _stopped) != 0)
+                return;
+            if (!IsPublicRoutableIPv4Literal(ip))
+                return;
+            if (port <= 0 || port > 65535)
+                return;
+            if (SelfPeerGuard.IsSelf(ip, port))
+                return;
+            if (IsPeerMarkedPublic(ip, port))
+                return;
+            if (!TryBuildPeerEndpointKey(ip, port, out var key))
+                return;
+            if (!_publicClaimsByPex.ContainsKey(key))
+                return;
+
+            _log?.Info("P2P", $"probing public claim (immediate): {EndpointLogFormatter.FormatHostPort(ip, port)}");
+            var probe = await TryTcpReachabilityProbeAsync(ip, port, CancellationToken.None).ConfigureAwait(false);
+            if (!probe.reachable)
+            {
+                _log?.Info("P2P", $"immediate public claim probe failed for {EndpointLogFormatter.FormatHostPort(ip, port)}: {probe.reason}");
+                return;
+            }
+
+            MarkPeerAsPublic(ip, port);
+            _publicClaimsByPex.TryRemove(key, out _);
+
+            try
+            {
+                PeerStore.MarkSeen(ip, port, (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds(), GenesisConfig.NetworkId);
+            }
+            catch { }
+
+            _log?.Info("P2P", $"public reachability proven via immediate outbound probe: {EndpointLogFormatter.FormatHostPort(ip, port)}");
+        }
+
+        private static async Task<(bool reachable, string reason)> TryTcpReachabilityProbeAsync(string ip, int port, CancellationToken ct)
         {
             if (!IsPublicRoutableIPv4Literal(ip))
-                return false;
+                return (false, "non-public IPv4");
             if (port <= 0 || port > 65535)
-                return false;
+                return (false, "invalid port");
 
             using var client = new TcpClient(AddressFamily.InterNetwork)
             {
@@ -1687,14 +1741,24 @@ namespace Qado.Networking
                 var connectTask = client.ConnectAsync(ip, port);
                 var done = await Task.WhenAny(connectTask, Task.Delay(PublicClaimProbeTimeout, timeoutCts.Token)).ConfigureAwait(false);
                 if (!ReferenceEquals(done, connectTask))
-                    return false;
+                    return (false, $"timeout after {(int)PublicClaimProbeTimeout.TotalSeconds}s");
                 await connectTask.ConfigureAwait(false);
 #endif
-                return client.Connected;
+                return client.Connected
+                    ? (true, "connected")
+                    : (false, "connect call returned disconnected");
+            }
+            catch (OperationCanceledException)
+            {
+                return (false, $"timeout after {(int)PublicClaimProbeTimeout.TotalSeconds}s");
+            }
+            catch (SocketException se)
+            {
+                return (false, $"socket error: {se.SocketErrorCode}");
             }
             catch
             {
-                return false;
+                return (false, "connection failed");
             }
         }
 
@@ -1741,6 +1805,74 @@ namespace Qado.Networking
             }
 
             return list;
+        }
+
+        public List<(string ip, int port)> GetPeerCandidatesForPex(int maxPeers, int unverifiedPercent = 20)
+        {
+            if (maxPeers <= 0)
+                return new List<(string ip, int port)>();
+
+            unverifiedPercent = Math.Clamp(unverifiedPercent, 0, 100);
+            int reserveForUnverified = (int)Math.Ceiling(maxPeers * (unverifiedPercent / 100.0));
+
+            var result = new List<(string ip, int port)>(maxPeers);
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+
+            var verified = GetPublicPeerCandidates(maxPeers);
+            var verifiedDeferred = new List<(string ip, int port)>();
+            int verifiedDirectLimit = Math.Max(0, maxPeers - reserveForUnverified);
+
+            for (int i = 0; i < verified.Count; i++)
+            {
+                var (ip, port) = verified[i];
+                if (!TryBuildPeerEndpointKey(ip, port, out var key)) continue;
+                if (!seen.Add(key)) continue;
+
+                if (result.Count < verifiedDirectLimit)
+                    result.Add((ip, port));
+                else
+                    verifiedDeferred.Add((ip, port));
+            }
+
+            var recent = PeerStore.GetRecentPeers(limit: Math.Max(64, maxPeers * 4));
+            int unverifiedAdded = 0;
+
+            for (int i = 0; i < recent.Count && result.Count < maxPeers; i++)
+            {
+                var (ip, port, _) = recent[i];
+                int p = (port <= 0 || port > 65535) ? DefaultPort : port;
+
+                if (!IsPublicRoutableIPv4Literal(ip)) continue;
+                if (SelfPeerGuard.IsSelf(ip, p)) continue;
+                if (IsPeerMarkedPublic(ip, p)) continue;
+                if (!TryBuildPeerEndpointKey(ip, p, out var key)) continue;
+                if (!seen.Add(key)) continue;
+
+                result.Add((ip, p));
+                unverifiedAdded++;
+                if (unverifiedAdded >= reserveForUnverified)
+                    break;
+            }
+
+            for (int i = 0; i < verifiedDeferred.Count && result.Count < maxPeers; i++)
+            {
+                result.Add(verifiedDeferred[i]);
+            }
+
+            for (int i = 0; i < recent.Count && result.Count < maxPeers; i++)
+            {
+                var (ip, port, _) = recent[i];
+                int p = (port <= 0 || port > 65535) ? DefaultPort : port;
+
+                if (!IsPublicRoutableIPv4Literal(ip)) continue;
+                if (SelfPeerGuard.IsSelf(ip, p)) continue;
+                if (!TryBuildPeerEndpointKey(ip, p, out var key)) continue;
+                if (!seen.Add(key)) continue;
+
+                result.Add((ip, p));
+            }
+
+            return result;
         }
 
         private void MarkPeerAsPublic(string ip, int port)

@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$Project = ".\Qado\Qado.csproj",
     [string]$Configuration = "Release",
     [string[]]$Runtimes = @("win-x64"),
@@ -43,6 +43,9 @@ try {
         }
 
         $outDir = Join-Path $OutputRoot $rid
+        if (Test-Path $outDir) {
+            Remove-Item -Path $outDir -Recurse -Force
+        }
         New-Item -Path $outDir -ItemType Directory -Force | Out-Null
 
         Write-Host "Publishing for $rid ..."
@@ -51,8 +54,9 @@ try {
             $Project,
             "-c", $Configuration,
             "-r", $rid,
-            "--self-contained", "false",
-            "/p:PublishSingleFile=false",
+            "--self-contained", "true",
+            "/p:PublishSingleFile=true",
+            "/p:EnableCompressionInSingleFile=true",
             "-o", $outDir
         )
 
@@ -82,10 +86,11 @@ try {
 
     Write-Host ""
     Write-Host "Release build completed."
-    Write-Host "Deployment mode: framework-dependent, normal multi-file binaries (requires installed .NET 10 runtime)."
+    Write-Host "Deployment mode: self-contained single-file binaries (runtime bundled into executable)."
     Write-Host "Output folder:   $rootPath"
     Write-Host "SHA256 sums:     $sumsPath"
 }
 finally {
     Pop-Location
 }
+

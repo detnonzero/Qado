@@ -20,7 +20,7 @@ namespace Qado.Networking
 
     public sealed class HeaderSyncManager : IDisposable
     {
-        public const int MaxHeaderSyncPeers = 1;
+        public const int MaxHeaderSyncPeers = 2;
         public const int MaxHeadersPerMessage = 2000;
         public const int MaxLocatorHashes = 64;
         public static readonly TimeSpan HeaderResponseTimeout = TimeSpan.FromSeconds(20);
@@ -43,9 +43,7 @@ namespace Qado.Networking
         private readonly CancellationTokenSource _disposeCts = new();
         private int _started;
 
-        private string? _activePeerKey;
-        private bool _awaitingHeaders;
-        private DateTime _lastGetHeadersUtc = DateTime.MinValue;
+        private readonly Dictionary<string, DateTime> _awaitingByPeerKey = new(StringComparer.Ordinal);
         private bool _completed;
         private readonly HashSet<string> _noProgressPeerKeys = new(StringComparer.Ordinal);
 
@@ -119,9 +117,7 @@ namespace Qado.Networking
                 if (_completed)
                 {
                     _completed = false;
-                    _activePeerKey = null;
-                    _awaitingHeaders = false;
-                    _lastGetHeadersUtc = DateTime.MinValue;
+                    _awaitingByPeerKey.Clear();
                 }
             }
 
@@ -133,15 +129,13 @@ namespace Qado.Networking
             bool changed = false;
             lock (_gate)
             {
-                if (_completed || _activePeerKey != null || _awaitingHeaders)
+                if (_completed || _awaitingByPeerKey.Count > 0)
                 {
                     changed = true;
                 }
 
                 _completed = false;
-                _activePeerKey = null;
-                _awaitingHeaders = false;
-                _lastGetHeadersUtc = DateTime.MinValue;
+                _awaitingByPeerKey.Clear();
                 _noProgressPeerKeys.Clear();
             }
 
@@ -161,14 +155,9 @@ namespace Qado.Networking
 
             lock (_gate)
             {
-                if (!string.Equals(_activePeerKey, key, StringComparison.Ordinal))
-                    return;
-
-                _noProgressPeerKeys.Add(key);
-                _activePeerKey = null;
-                _awaitingHeaders = false;
-                _lastGetHeadersUtc = DateTime.MinValue;
-                changed = true;
+                changed = _awaitingByPeerKey.Remove(key);
+                if (changed)
+                    _noProgressPeerKeys.Add(key);
             }
 
             if (changed)
@@ -189,8 +178,7 @@ namespace Qado.Networking
             lock (_gate)
             {
                 shouldQueue = !_completed &&
-                              _activePeerKey != null &&
-                              string.Equals(_activePeerKey, key, StringComparison.Ordinal);
+                              _awaitingByPeerKey.ContainsKey(key);
             }
 
             if (!shouldQueue)
@@ -344,8 +332,7 @@ namespace Qado.Networking
             if (peers == null || peers.Count == 0)
                 return;
 
-            PeerSession? peerToQuery = null;
-            bool shouldSend = false;
+            var peersToQuery = new List<(PeerSession Peer, string Key)>(MaxHeaderSyncPeers);
             bool shouldEmitCompletion = false;
 
             lock (_gate)
@@ -353,77 +340,64 @@ namespace Qado.Networking
                 if (_completed)
                     return;
 
-                if (_activePeerKey != null)
+                var staleKeys = new List<string>();
+                foreach (var kv in _awaitingByPeerKey)
                 {
-                    var current = FindPeerByKey(peers, _activePeerKey);
+                    var current = FindPeerByKey(peers, kv.Key);
                     if (current == null ||
                         !current.HandshakeOk ||
                         !current.Client.Connected ||
                         !current.RemoteIsPublic)
                     {
-                        if (_activePeerKey != null)
-                            _noProgressPeerKeys.Add(_activePeerKey);
-                        _activePeerKey = null;
-                        _awaitingHeaders = false;
-                        _lastGetHeadersUtc = DateTime.MinValue;
+                        staleKeys.Add(kv.Key);
                     }
-                    else
+                }
+
+                for (int i = 0; i < staleKeys.Count; i++)
+                {
+                    string stale = staleKeys[i];
+                    _awaitingByPeerKey.Remove(stale);
+                    _noProgressPeerKeys.Add(stale);
+                }
+
+                DateTime now = DateTime.UtcNow;
+                var timedOutKeys = new List<string>();
+                foreach (var kv in _awaitingByPeerKey)
+                {
+                    if ((now - kv.Value) > HeaderResponseTimeout)
+                        timedOutKeys.Add(kv.Key);
+                }
+
+                for (int i = 0; i < timedOutKeys.Count; i++)
+                {
+                    string key = timedOutKeys[i];
+                    _awaitingByPeerKey.Remove(key);
+                    _noProgressPeerKeys.Add(key);
+                    _log?.Warn("HeaderSync", $"headers timeout; rotating peer {key}.");
+                }
+
+                int slots = MaxHeaderSyncPeers - _awaitingByPeerKey.Count;
+                if (slots > 0)
+                {
+                    var selected = SelectPublicPeers(peers, slots, _noProgressPeerKeys, _awaitingByPeerKey.Keys);
+                    for (int i = 0; i < selected.Count; i++)
                     {
-                        peerToQuery = current;
+                        var peer = selected[i];
+                        string key = NormalizePeerKey(peer.SessionKey);
+                        _awaitingByPeerKey[key] = now;
+                        peersToQuery.Add((peer, key));
+                        _log?.Info("HeaderSync", $"selected public peer {peer.RemoteEndpoint}");
                     }
                 }
 
-                if (_activePeerKey == null)
+                if (_awaitingByPeerKey.Count == 0 && peersToQuery.Count == 0)
                 {
-                    var selected = SelectNextPublicPeer(peers, _noProgressPeerKeys);
-                    if (selected == null)
+                    if (_noProgressPeerKeys.Count > 0)
                     {
-                        if (_noProgressPeerKeys.Count > 0)
-                        {
-                            _completed = true;
-                            _noProgressPeerKeys.Clear();
-                            _awaitingHeaders = false;
-                            _lastGetHeadersUtc = DateTime.MinValue;
-                            shouldEmitCompletion = true;
-                        }
-                        else
-                        {
-                            return;
-                        }
+                        _completed = true;
+                        _noProgressPeerKeys.Clear();
+                        shouldEmitCompletion = true;
                     }
-                    else
-                    {
-                        peerToQuery = selected;
-                        _activePeerKey = NormalizePeerKey(selected.SessionKey);
-                        _awaitingHeaders = false;
-                        _lastGetHeadersUtc = DateTime.MinValue;
-                        _log?.Info("HeaderSync", $"selected public peer {selected.RemoteEndpoint}");
-                    }
-                }
-
-                if (shouldEmitCompletion)
-                {
-                    _activePeerKey = null;
-                }
-                else if (_awaitingHeaders)
-                {
-                    if ((DateTime.UtcNow - _lastGetHeadersUtc) <= HeaderResponseTimeout)
-                        return;
-
-                    _log?.Warn("HeaderSync", "headers timeout; rotating peer.");
-                    if (_activePeerKey != null)
-                        _noProgressPeerKeys.Add(_activePeerKey);
-                    _activePeerKey = null;
-                    _awaitingHeaders = false;
-                    _lastGetHeadersUtc = DateTime.MinValue;
-                    return;
-                }
-
-                if (!shouldEmitCompletion)
-                {
-                    shouldSend = true;
-                    _awaitingHeaders = true;
-                    _lastGetHeadersUtc = DateTime.UtcNow;
                 }
             }
 
@@ -437,18 +411,19 @@ namespace Qado.Networking
                 return;
             }
 
-            if (!shouldSend || peerToQuery == null)
-                return;
-
             var locator = BuildLocatorPayload();
-            try
+            for (int i = 0; i < peersToQuery.Count; i++)
             {
-                await _sendFrameAsync(peerToQuery, MsgType.GetHeaders, locator, ct).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                _log?.Warn("HeaderSync", $"getheaders send failed: {ex.Message}");
-                FailActivePeer();
+                var (peerToQuery, peerKey) = peersToQuery[i];
+                try
+                {
+                    await _sendFrameAsync(peerToQuery, MsgType.GetHeaders, locator, ct).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _log?.Warn("HeaderSync", $"getheaders send failed for {peerToQuery.RemoteEndpoint}: {ex.Message}");
+                    FailPeer(peerKey);
+                }
             }
         }
 
@@ -470,10 +445,7 @@ namespace Qado.Networking
                         lock (_gate)
                         {
                             process = !_completed &&
-                                      _activePeerKey != null &&
-                                      string.Equals(_activePeerKey, frame.PeerKey, StringComparison.Ordinal);
-                            if (process)
-                                _awaitingHeaders = false;
+                                      _awaitingByPeerKey.Remove(frame.PeerKey);
                         }
 
                         if (!process)
@@ -482,14 +454,14 @@ namespace Qado.Networking
                         if (!TryParseHeadersPayload(frame.Payload, out var headers))
                         {
                             _log?.Warn("HeaderSync", "invalid headers payload");
-                            FailActivePeer();
+                            FailPeer(frame.PeerKey);
                             continue;
                         }
 
                         if (!TryValidateAndCommitBatch(headers, out var committed, out var reason))
                         {
                             _log?.Warn("HeaderSync", $"header batch rejected: {reason}");
-                            FailActivePeer();
+                            FailPeer(frame.PeerKey);
                             continue;
                         }
 
@@ -500,47 +472,19 @@ namespace Qado.Networking
                         {
                             lock (_gate)
                             {
-                                if (_activePeerKey != null)
-                                    _noProgressPeerKeys.Add(_activePeerKey);
-                                _awaitingHeaders = false;
-                                _activePeerKey = null;
-                                _lastGetHeadersUtc = DateTime.MinValue;
+                                _noProgressPeerKeys.Add(frame.PeerKey);
                             }
-                            _log?.Info("HeaderSync", "no new headers from active peer; rotating.");
+                            _log?.Info("HeaderSync", $"no new headers from peer {frame.PeerKey}; rotating.");
                             RequestTick();
                             continue;
                         }
 
-                        if (headers.Count == MaxHeadersPerMessage)
-                        {
-                            lock (_gate)
-                            {
-                                if (_activePeerKey != null)
-                                    _noProgressPeerKeys.Remove(_activePeerKey);
-                            }
-                            RequestTick();
-                            continue;
-                        }
-
-                        bool shouldEmit;
                         lock (_gate)
                         {
-                            shouldEmit = !_completed;
-                            _completed = true;
-                            _noProgressPeerKeys.Clear();
-                            _awaitingHeaders = false;
-                            _activePeerKey = null;
-                            _lastGetHeadersUtc = DateTime.MinValue;
+                            _noProgressPeerKeys.Remove(frame.PeerKey);
                         }
 
-                        if (shouldEmit)
-                        {
-                            var plan = BuildDownloadPlan();
-                            _log?.Info(
-                                "HeaderSync",
-                                $"complete: best={ShortHex(plan.BestHeaderHash)}, fork={ShortHex(plan.ForkPointHash)}, missing={plan.MissingBlockHashes.Count}, revalidate={plan.RevalidateBlockHashes.Count}");
-                            try { _onSyncCompleted(plan); } catch { }
-                        }
+                        RequestTick();
                     }
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -554,15 +498,15 @@ namespace Qado.Networking
             }
         }
 
-        private void FailActivePeer()
+        private void FailPeer(string peerKey)
         {
+            if (string.IsNullOrWhiteSpace(peerKey))
+                return;
+
             lock (_gate)
             {
-                if (_activePeerKey != null)
-                    _noProgressPeerKeys.Add(_activePeerKey);
-                _activePeerKey = null;
-                _awaitingHeaders = false;
-                _lastGetHeadersUtc = DateTime.MinValue;
+                _awaitingByPeerKey.Remove(peerKey);
+                _noProgressPeerKeys.Add(peerKey);
             }
 
             RequestTick();
@@ -1113,11 +1057,20 @@ namespace Qado.Networking
             return true;
         }
 
-        private static PeerSession? SelectNextPublicPeer(
+        private static List<PeerSession> SelectPublicPeers(
             IReadOnlyCollection<PeerSession> peers,
-            ISet<string>? excludedPeerKeys = null)
+            int maxCount,
+            ISet<string>? excludedPeerKeys = null,
+            IEnumerable<string>? alreadySelectedPeerKeys = null)
         {
-            PeerSession? selected = null;
+            var selected = new List<PeerSession>(Math.Max(0, maxCount));
+            if (maxCount <= 0)
+                return selected;
+
+            HashSet<string>? skip = null;
+            if (alreadySelectedPeerKeys != null)
+                skip = new HashSet<string>(alreadySelectedPeerKeys, StringComparer.Ordinal);
+
             foreach (var peer in peers)
             {
                 if (peer == null || !peer.HandshakeOk || !peer.Client.Connected || !peer.RemoteIsPublic)
@@ -1126,15 +1079,12 @@ namespace Qado.Networking
                 string key = NormalizePeerKey(peer.SessionKey);
                 if (excludedPeerKeys != null && excludedPeerKeys.Contains(key))
                     continue;
-
-                if (selected == null)
-                {
-                    selected = peer;
+                if (skip != null && skip.Contains(key))
                     continue;
-                }
 
-                if (peer.ConnectedUtc < selected.ConnectedUtc)
-                    selected = peer;
+                selected.Add(peer);
+                if (selected.Count >= maxCount)
+                    break;
             }
 
             return selected;

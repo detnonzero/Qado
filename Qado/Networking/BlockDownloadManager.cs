@@ -13,6 +13,7 @@ namespace Qado.Networking
     {
         public const int MaxInflightGlobal = 512;
         public const int MaxInflightPerPeer = 64;
+        public const int MaxDownloadPeersPerPump = 4;
         public const int MaxInvHashes = 50_000;
         public const int GetDataBatchSize = 128;
         public static readonly TimeSpan RequestedTimeout = TimeSpan.FromSeconds(20);
@@ -373,6 +374,9 @@ namespace Qado.Networking
 
                 foreach (var peer in peers)
                 {
+                    if (sendJobs.Count >= MaxDownloadPeersPerPump)
+                        break;
+
                     if (peer == null || !peer.HandshakeOk || !peer.Client.Connected)
                         continue;
 

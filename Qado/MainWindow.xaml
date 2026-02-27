@@ -145,6 +145,8 @@
                         <StackPanel Orientation="Horizontal" Grid.Row="0" Margin="0,0,0,8">
                             <Button x:Name="ReloadBlocksButton" Content="Reload" Width="90"
                                     Click="ReloadBlocksButton_Click"/>
+                            <Button x:Name="TrySyncButton" Content="Try Sync" Width="90" Margin="8,0,0,0"
+                                    Click="TrySyncButton_Click"/>
                             <TextBlock Text="(auto reload on new tip)" Margin="12,4,0,0"/>
                         </StackPanel>
 

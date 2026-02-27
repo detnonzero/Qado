@@ -2,31 +2,57 @@
 
 All notable changes to this project are documented in this file.
 
-## [0.2.0] - 2026-02-25
-
-### Added
-- Mainnet-readiness review coverage across consensus, P2P networking, storage, API surface, and operational defaults.
+## [0.2.1] - 2026-02-27
 
 ### Changed
-- PoW parameter profile is explicitly treated as a design choice for fast validation and low node resource usage:
-- `Argon2id` remains fixed at `memory=4 KiB`, `iterations=1`, `parallelism=1`.
-- Tradeoff is documented: lower validation cost and higher throughput vs. lower attack-cost threshold.
-- Header sync architecture risk documented:
-- Sync currently progresses with one active peer path per pass.
-- Peer-fail/cooldown posture documented:
-- Cooldown enforcement remains opt-in (`QADO_ENFORCE_PEER_COOLDOWN=false` by default).
-- Seed host exemption from fail-ban remains active.
-- API exposure posture documented:
-- Exchange API can bind publicly on `0.0.0.0` and ships without built-in auth/TLS.
-- Networking topology risk documented:
-- Bootstrap remains single-seed anchored (`82.165.63.4`).
-- Network profile switching remains compile-time (`UseTestnet` constant).
-- Storage durability tradeoff documented:
-- SQLite runs with `WAL` and `synchronous=NORMAL`.
+- Header sync now uses up to `2` public peers in parallel (`HeaderSyncManager.MaxHeaderSyncPeers = 2`), with per-peer timeout/rotation and fallback behavior when only one peer is available.
+- Block download dispatch is now capped to up to `4` peers per pump cycle (`BlockDownloadManager.MaxDownloadPeersPerPump = 4`), while remaining fully functional with a single peer.
+- Added a manual `Try Sync` action in the Blocks tab to trigger immediate resync/replan from the UI (`MainWindow` + `P2PNode.RequestSyncNow`), including a short click cooldown to avoid spam.
+- Public-claim probing hardened:
+  - probe timeout increased (`4s` -> `8s`)
+  - probe budget per reconnect tick increased (`2` -> `12`)
+  - immediate probe on inbound public claims added
+  - probe failure reasons are now logged
+- PEX candidate selection updated to mix verified public peers with a controlled unverified share (20%) via `GetPeerCandidatesForPex`.
+- Keystore portability mode added via `QADO_KEYSTORE_MODE=portable_plaintext`:
+  - private keys can be stored plaintext for cross-machine portability
+  - startup warning log added when plaintext mode is active
+  - key list loading now fails gracefully with warning instead of crashing UI startup
+- `release.ps1` switched back to self-contained single-file publish:
+  - `--self-contained true`
+  - `PublishSingleFile=true`
+  - `EnableCompressionInSingleFile=true`
+  - per-RID output directory is cleared before publish
+
+## [0.2.0] - 2026-02-25
+
+### Changed
+- Major sync pipeline refactor across `HeaderSyncManager`, `BlockDownloadManager`, and `ValidationWorker`.
+- Reworked header/block sync flow, active-plan transitions, and state progression.
+- Improved peer selection and sync scheduling behavior.
+- Hardened out-of-order handling and orphan buffering/promotion during sync.
+- Updated replan/recovery logic for partial and in-flight downloads.
+- Reduced redundant sync traffic and duplicate processing paths.
+- Added guardrails for sync queue pressure and malformed/invalid sync payloads.
+
+### Impact
+- More stable catch-up behavior on long/lossy peer sessions.
+- Lower chance of sync stalls and inconsistent in-flight state.
+- Better resilience against malformed or untimely sync messages.
+
+### Security
+- Performed a mainnet-readiness review across consensus, P2P networking, storage, API surface, and operational defaults.
+- PoW profile is intentionally fixed at `Argon2id (4 KiB, 1 iteration, parallelism 1)` for fast validation.
+- Header sync currently progresses through a single active peer path per pass.
+- Peer cooldown/ban enforcement is disabled by default (`QADO_ENFORCE_PEER_COOLDOWN=false`), and the seed host is exempt from fail-ban logic.
+- Exchange/API has no built-in authentication and can bind publicly (`0.0.0.0`).
+- Bootstrap remains seed-centered (`82.165.63.4`), and network profile switching remains compile-time (`UseTestnet`).
+- SQLite is configured with `WAL + synchronous=NORMAL` (durability vs. performance tradeoff).
 
 ### Notes
-- Project lifecycle status remains `alpha / testnet phase`.
-- Mainnet-readiness is tracked as in-progress with open hardening items.
+- Project status remains `alpha / testnet phase`.
+- Mainnet hardening is still in progress.
+
 
 ## [0.1.4]
 
@@ -156,4 +182,3 @@ All notable changes to this project are documented in this file.
 
 - Alpha quality intended for testnet usage and iterative hardening.
 - Mainnet assumptions should not be made from this release.
-

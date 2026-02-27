@@ -92,7 +92,7 @@ namespace Qado.Networking
         {
             if (maxPeers <= 0) return MakeEmpty();
 
-            var peers = P2PNode.Instance?.GetPublicPeerCandidates(maxPeers)
+            var peers = P2PNode.Instance?.GetPeerCandidatesForPex(maxPeers, unverifiedPercent: 20)
                         ?? new List<(string ip, int port)>();
             var chunks = new List<byte[]>(peers.Count);
 
