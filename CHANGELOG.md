@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.2.3] - 2026-03-03
+
+### Changed
+- Sync resync-triggering was throttled to reduce header-sync churn under gossip pressure:
+  - `inv-out-of-plan` resync requests are now cooldown-gated (`12s`) while download is active.
+  - `block-out-of-plan-missing-header` resync requests are now cooldown-gated (`12s`).
+- Download-plan retry behavior was hardened:
+  - active-plan hashes previously marked `Invalid` are now eligible for retry on `plan/replan` paths, reducing stalls where `missing` could stay non-zero.
+- `BlocksBatch` backpressure handling was tightened:
+  - when the validation queue is full, the peer is temporarily marked range-unsupported and cooled down, then sync repumps using fallback behavior (`GetData` path).
+
 ## [0.2.2] - 2026-02-27
 
 ### Changed

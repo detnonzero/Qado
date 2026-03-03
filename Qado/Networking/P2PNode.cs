@@ -55,6 +55,7 @@ namespace Qado.Networking
         private const int MaxOrphanPromotionsPerPass = 256;
         private static readonly TimeSpan KnownBlockLogCooldown = TimeSpan.FromSeconds(12);
         private const int MaxKnownBlockLogEntries = 4096;
+        private static readonly TimeSpan MissingHeaderResyncCooldown = TimeSpan.FromSeconds(12);
         private static readonly TimeSpan InvRelayCooldown = TimeSpan.FromMinutes(2);
         private const int MaxInvRelayEntries = 8192;
 
@@ -86,6 +87,8 @@ namespace Qado.Networking
         private readonly Dictionary<string, int> _orphansByPeer = new(StringComparer.Ordinal);
         private readonly object _knownBlockLogGate = new();
         private readonly Dictionary<string, DateTime> _knownBlockLogByHash = new(StringComparer.Ordinal);
+        private readonly object _missingHeaderResyncGate = new();
+        private DateTime _nextMissingHeaderResyncAllowedUtc = DateTime.MinValue;
         private readonly object _invRelayGate = new();
         private readonly Dictionary<string, DateTime> _invRelayByHash = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<string, byte> _dialInFlight = new(StringComparer.Ordinal);
@@ -897,7 +900,7 @@ namespace Qado.Networking
                 }
                 catch { }
 
-                if (_headerSyncManager.IsCompleted && !headerKnown)
+                if (_headerSyncManager.IsCompleted && !headerKnown && ShouldRequestMissingHeaderResync())
                     _headerSyncManager.RequestResync("block-out-of-plan-missing-header");
 
                 ulong candidateHeight = blk.BlockHeight;
@@ -2414,6 +2417,19 @@ namespace Qado.Networking
                     }
                 }
 
+                return true;
+            }
+        }
+
+        private bool ShouldRequestMissingHeaderResync()
+        {
+            var now = DateTime.UtcNow;
+            lock (_missingHeaderResyncGate)
+            {
+                if (now < _nextMissingHeaderResyncAllowedUtc)
+                    return false;
+
+                _nextMissingHeaderResyncAllowedUtc = now + MissingHeaderResyncCooldown;
                 return true;
             }
         }

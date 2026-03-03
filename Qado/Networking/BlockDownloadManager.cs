@@ -27,6 +27,7 @@ namespace Qado.Networking
         private static readonly TimeSpan InvSeenTtl = TimeSpan.FromMinutes(30);
         private static readonly TimeSpan PeerFailureCooldown = TimeSpan.FromSeconds(8);
         private static readonly TimeSpan RangeUnsupportedTtl = TimeSpan.FromMinutes(10);
+        private static readonly TimeSpan OutOfPlanResyncCooldown = TimeSpan.FromSeconds(12);
 
         private readonly object _gate = new();
         private readonly Queue<byte[]> _missingQueue = new();
@@ -58,6 +59,7 @@ namespace Qado.Networking
         private string? _activeChunkPeerKey;
         private string? _lastChunkPeerKey;
         private int _activeChunkRequested;
+        private DateTime _nextOutOfPlanResyncAllowedUtc = DateTime.MinValue;
 
         private sealed class InflightRequest
         {
@@ -282,7 +284,25 @@ namespace Qado.Networking
 
             if (shouldResync)
             {
-                _requestResync?.Invoke(downloadStarted ? "inv-out-of-plan" : "inv-before-download");
+                bool allowResync = true;
+                if (downloadStarted)
+                {
+                    lock (_gate)
+                    {
+                        DateTime now = DateTime.UtcNow;
+                        if (now < _nextOutOfPlanResyncAllowedUtc)
+                        {
+                            allowResync = false;
+                        }
+                        else
+                        {
+                            _nextOutOfPlanResyncAllowedUtc = now + OutOfPlanResyncCooldown;
+                        }
+                    }
+                }
+
+                if (allowResync)
+                    _requestResync?.Invoke(downloadStarted ? "inv-out-of-plan" : "inv-before-download");
             }
 
             if (inPlan.Count > 0)
@@ -317,6 +337,17 @@ namespace Qado.Networking
                 if (peer == null || !EnqueueBlockPayload(peer, blocksPayload[i], enforceRateLimitOverride: false))
                 {
                     _log?.Warn("Sync", "Validation queue full. Dropping inbound blocks batch payload.");
+                    string peerKey = NormalizePeerKey(peer?.SessionKey ?? string.Empty);
+                    lock (_gate)
+                    {
+                        if (!string.IsNullOrWhiteSpace(peerKey))
+                        {
+                            DateTime now = DateTime.UtcNow;
+                            MarkPeerRangeUnsupported_NoLock(peerKey, now, "validator backpressure");
+                            _peerCooldownUntilUtc[peerKey] = now + PeerFailureCooldown;
+                        }
+                    }
+                    RequestPump();
                     break;
                 }
             }
@@ -615,6 +646,7 @@ namespace Qado.Networking
             int added = 0;
             DateTime now = nowOverride ?? DateTime.UtcNow;
             bool applyInvDedup = string.Equals(source, "inv", StringComparison.OrdinalIgnoreCase);
+            bool allowInvalidRetry = !applyInvDedup;
 
             for (int i = 0; i < hashes.Count; i++)
             {
@@ -642,10 +674,16 @@ namespace Qado.Networking
 
                 if (_stateByHash.TryGetValue(hex, out var state))
                 {
-                    if (state == BlockSyncItemState.Requested ||
-                        state == BlockSyncItemState.HaveBlock ||
-                        state == BlockSyncItemState.Validated ||
-                        state == BlockSyncItemState.Invalid)
+                    if (state == BlockSyncItemState.Invalid)
+                    {
+                        if (!allowInvalidRetry)
+                            continue;
+
+                        _stateByHash.TryRemove(hex, out _);
+                    }
+                    else if (state == BlockSyncItemState.Requested ||
+                             state == BlockSyncItemState.HaveBlock ||
+                             state == BlockSyncItemState.Validated)
                         continue;
                 }
 
@@ -865,8 +903,11 @@ namespace Qado.Networking
                 {
                     if (state == BlockSyncItemState.Requested ||
                         state == BlockSyncItemState.HaveBlock ||
-                        state == BlockSyncItemState.Validated ||
-                        state == BlockSyncItemState.Invalid)
+                        state == BlockSyncItemState.Validated)
+                        continue;
+
+                    if (state == BlockSyncItemState.Invalid &&
+                        !_activePlanHashes.Contains(hex))
                         continue;
                 }
 
