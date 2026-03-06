@@ -21,6 +21,7 @@ namespace Qado.Networking
 
             node.StartPeerExchangeLoop(ct);
             node.StartReconnectLoop(ct);
+            node.StartLatencyProbeLoop(ct);
 
             log?.Info("Bootstrap", "P2P started, seed+known peers dialed, reconnect + sync manager triggered.");
             return Task.FromResult(node);

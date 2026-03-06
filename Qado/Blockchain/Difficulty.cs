@@ -8,7 +8,7 @@ namespace Qado.Blockchain
         public const int HashSize = 32;
 
         private static readonly byte[] _powLimit =
-            Convert.FromHexString("00000" + new string('F', 59)); // 32-byte big-endian target
+            Convert.FromHexString("0000000" + new string('F', 57)); // 32-byte big-endian target
 
         private static readonly byte[] _minTarget =
             Convert.FromHexString("0000000000000000000000000000000000000000000000000000000000000001");

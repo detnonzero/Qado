@@ -2,7 +2,7 @@
 
 Qado is a from-scratch account-based blockchain node with a built-in WPF wallet UI, P2P networking, block sync, mining, mempool, and exchange API endpoints.
 
-Current status: **alpha / testnet phase**.
+Current status: **alpha / mainnet-first defaults**.
 
 ## Repository Layout
 
@@ -36,19 +36,22 @@ The app starts:
 
 ## Network Defaults (current source defaults)
 
-- P2P port: `34001`
-- API port: `19080` (override via `QADO_API_PORT`)
+- Active profile: `mainnet` (compile-time switch in `Qado/Networking/NetworkParams.cs`)
+- Chain ID: `1`
+- Network ID: `0x01`
+- P2P port: `33000`
+- API port: `18080` (override via `QADO_API_PORT`)
 - Seed host: `212.227.21.183`
 
 Important: verify network parameters for each release/tag before joining a network.
 
 ## API
 
-- Base URL (local): `http://127.0.0.1:19080`
+- Base URL (local): `http://127.0.0.1:18080`
 - Docs: `docs/EXCHANGE_INTEGRATION.md`
 - OpenAPI: `docs/exchange-api-v1.openapi.yaml`
 
-## Testnet Release Expectations
+## Release Expectations
 
 A release should include:
 

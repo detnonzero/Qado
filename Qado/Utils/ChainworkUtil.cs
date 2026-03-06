@@ -31,7 +31,19 @@ namespace Qado.Utils
             return v == 0 ? 1 : v;
         }
 
-        public static UInt128 Add(UInt128 parentWork, UInt128 delta) => parentWork + delta;
+        public static UInt128 Add(UInt128 parentWork, UInt128 delta)
+        {
+            if (delta == 0)
+                delta = 1;
+
+            UInt128 sum = parentWork + delta;
+
+            // UInt128 overflow wraps around; saturate instead to preserve total ordering.
+            if (sum < parentWork)
+                return UInt128.MaxValue;
+
+            return sum;
+        }
     }
 }
 

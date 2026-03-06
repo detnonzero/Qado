@@ -77,7 +77,7 @@ namespace Qado.Serialization
 
             h.Target!.AsSpan().CopyTo(dst.Slice(o, 32)); o += 32;
 
-            BinaryPrimitives.WriteUInt32BigEndian(dst.Slice(o, 4), h.Nonce); o += 4;
+            BinaryPrimitives.WriteUInt64BigEndian(dst.Slice(o, 8), h.Nonce); o += 8;
 
             h.Miner!.AsSpan().CopyTo(dst.Slice(o, 32)); o += 32;
 
@@ -123,7 +123,7 @@ namespace Qado.Serialization
             if (!Difficulty.IsValidTarget(target))
                 throw new ArgumentException("Block header target out of consensus range.", nameof(src));
 
-            uint nonce = BinaryPrimitives.ReadUInt32BigEndian(src.Slice(o, 4)); o += 4;
+            ulong nonce = BinaryPrimitives.ReadUInt64BigEndian(src.Slice(o, 8)); o += 8;
 
             byte[] miner = src.Slice(o, 32).ToArray(); o += 32;
 

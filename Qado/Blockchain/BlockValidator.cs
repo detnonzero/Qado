@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using Qado.Networking;
 using Qado.Storage;
+using Microsoft.Data.Sqlite;
 
 namespace Qado.Blockchain
 {
@@ -14,50 +15,54 @@ namespace Qado.Blockchain
         private const uint ChainId = NetworkParams.ChainId;
 
 
-        public static bool ValidateNetworkBlock(Block block, out string reason)
-            => ValidateNetworkTipBlock(block, out reason);
+        public static bool ValidateNetworkBlock(Block block, out string reason, SqliteTransaction? tx = null)
+            => ValidateNetworkTipBlock(block, out reason, tx);
 
-        public static bool ValidateNetworkBlockStateless(Block block, out string reason)
-            => ValidateNetworkSideBlockStateless(block, out reason);
+        public static bool ValidateNetworkBlockStateless(Block block, out string reason, SqliteTransaction? tx = null)
+            => ValidateNetworkSideBlockStateless(block, out reason, tx);
 
-        public static bool ValidateNetworkBlockStateless(Block block, bool requirePrevKnown, out string reason)
+        public static bool ValidateNetworkBlockStateless(Block block, bool requirePrevKnown, out string reason, SqliteTransaction? tx = null)
             => ValidateCommon(
                 block,
                 strictTxChecks: true,
                 requirePrevKnown: requirePrevKnown,
                 enforceTipExtending: false,
                 validateStateAgainstCanonical: false,
+                tx: tx,
                 out reason);
 
-        public static bool ValidateNetworkBlockStatelessCandidate(Block block, out string reason)
-            => ValidateNetworkSideBlockStateless(block, out reason);
+        public static bool ValidateNetworkBlockStatelessCandidate(Block block, out string reason, SqliteTransaction? tx = null)
+            => ValidateNetworkSideBlockStateless(block, out reason, tx);
 
 
-        public static bool ValidateSelfMinedBlock(Block block, out string reason)
+        public static bool ValidateSelfMinedBlock(Block block, out string reason, SqliteTransaction? tx = null)
             => ValidateCommon(
                 block,
                 strictTxChecks: false, // locally mined block: skip strict tx checks
                 requirePrevKnown: true,
                 enforceTipExtending: true,
                 validateStateAgainstCanonical: true,
+                tx: tx,
                 out reason);
 
-        public static bool ValidateNetworkTipBlock(Block block, out string reason)
+        public static bool ValidateNetworkTipBlock(Block block, out string reason, SqliteTransaction? tx = null)
             => ValidateCommon(
                 block,
                 strictTxChecks: true,
                 requirePrevKnown: true,
                 enforceTipExtending: true,
                 validateStateAgainstCanonical: true,
+                tx: tx,
                 out reason);
 
-        public static bool ValidateNetworkSideBlockStateless(Block block, out string reason)
+        public static bool ValidateNetworkSideBlockStateless(Block block, out string reason, SqliteTransaction? tx = null)
             => ValidateCommon(
                 block,
                 strictTxChecks: true,
                 requirePrevKnown: true,
                 enforceTipExtending: false,
                 validateStateAgainstCanonical: false,
+                tx: tx,
                 out reason);
 
 
@@ -67,6 +72,7 @@ namespace Qado.Blockchain
             bool requirePrevKnown,
             bool enforceTipExtending,
             bool validateStateAgainstCanonical,
+            SqliteTransaction? tx,
             out string reason)
         {
             reason = "OK";
@@ -128,7 +134,7 @@ namespace Qado.Blockchain
 
                 if (enforceTipExtending)
                 {
-                    var tip = BlockStore.GetLatestBlock();
+                    var tip = BlockStore.GetLatestBlock(tx);
                     if (tip?.BlockHash is not { Length: 32 })
                     {
                         reason = "Local tip unknown";
@@ -144,7 +150,7 @@ namespace Qado.Blockchain
 
                 if (requirePrevKnown)
                 {
-                    prevBlock = BlockStore.GetBlockByHash(header.PreviousBlockHash);
+                    prevBlock = BlockStore.GetBlockByHash(header.PreviousBlockHash, tx);
                     if (prevBlock == null)
                     {
                         reason = "Previous block missing";
@@ -157,7 +163,7 @@ namespace Qado.Blockchain
                         return false;
                     }
 
-                    ulong mtp = ComputeMedianTimePast(prevBlock, MedianTimePastWindow);
+                    ulong mtp = ComputeMedianTimePast(prevBlock, MedianTimePastWindow, tx);
                     if (header.Timestamp <= mtp)
                     {
                         reason = "Timestamp must be greater than median time past";
@@ -184,7 +190,7 @@ namespace Qado.Blockchain
 
             if (block.BlockHeight > 0 && prevBlock != null)
             {
-                var expectedTarget = ComputeExpectedTargetForThisBlock(block, prevBlock);
+                var expectedTarget = ComputeExpectedTargetForThisBlock(block, prevBlock, tx);
                 if (expectedTarget is null || expectedTarget.Length != 32) { reason = "Expected target computation failed"; return false; }
                 if (!BytesEqual32(haveTarget, expectedTarget))
                 {
@@ -221,31 +227,31 @@ namespace Qado.Blockchain
 
             for (int i = 1; i < txs.Count; i++)
             {
-                var tx = txs[i];
-                if (tx is null) { reason = $"TX[{i}] is null"; return false; }
+                var transaction = txs[i];
+                if (transaction is null) { reason = $"TX[{i}] is null"; return false; }
 
-                if (TransactionValidator.IsCoinbase(tx))
+                if (TransactionValidator.IsCoinbase(transaction))
                 {
                     reason = $"TX[{i}] must not be coinbase";
                     return false;
                 }
 
-                if (tx.Sender is null || tx.Sender.Length != 32 || tx.Recipient is null || tx.Recipient.Length != 32)
+                if (transaction.Sender is null || transaction.Sender.Length != 32 || transaction.Recipient is null || transaction.Recipient.Length != 32)
                 {
                     reason = $"TX[{i}] invalid endpoints";
                     return false;
                 }
 
-                if (tx.Amount == 0) { reason = $"TX[{i}] amount must be > 0"; return false; }
-                if (tx.ChainId != ChainId) { reason = $"TX[{i}] invalid ChainId"; return false; }
+                if (transaction.Amount == 0) { reason = $"TX[{i}] amount must be > 0"; return false; }
+                if (transaction.ChainId != ChainId) { reason = $"TX[{i}] invalid ChainId"; return false; }
 
-                var txid = tx.ComputeTransactionHash();
+                var txid = transaction.ComputeTransactionHash();
                 if (txid is null || txid.Length != 32) { reason = $"TX[{i}] txid invalid"; return false; }
                 if (!seen.Add(txid)) { reason = $"TX[{i}] duplicate txid"; return false; }
 
                 if (strictTxChecks)
                 {
-                    if (!TransactionValidator.ValidateBasic(tx, out var txReason))
+                    if (!TransactionValidator.ValidateBasic(transaction, out var txReason))
                     {
                         reason = $"TX[{i}] invalid: {txReason}";
                         return false;
@@ -286,14 +292,14 @@ namespace Qado.Blockchain
                     return false;
                 }
 
-                if (!ValidateAgainstCanonicalState(block, out reason))
+                if (!ValidateAgainstCanonicalState(block, tx, out reason))
                     return false;
             }
 
             return true;
         }
 
-        private static bool ValidateAgainstCanonicalState(Block block, out string reason)
+        private static bool ValidateAgainstCanonicalState(Block block, SqliteTransaction? tx, out string reason)
         {
             reason = "OK";
 
@@ -303,7 +309,7 @@ namespace Qado.Blockchain
             ulong GetBal(string a)
             {
                 if (bal.TryGetValue(a, out var v)) return v;
-                var v0 = StateStore.GetBalanceU64(a);
+                var v0 = StateStore.GetBalance(a, tx);
                 bal[a] = v0;
                 return v0;
             }
@@ -311,7 +317,7 @@ namespace Qado.Blockchain
             ulong GetNonce(string a)
             {
                 if (nonce.TryGetValue(a, out var v)) return v;
-                var v0 = StateStore.GetNonceU64(a);
+                var v0 = StateStore.GetNonce(a, tx);
                 nonce[a] = v0;
                 return v0;
             }
@@ -331,27 +337,27 @@ namespace Qado.Blockchain
 
             for (int i = 1; i < txs.Count; i++)
             {
-                var tx = txs[i];
+                var transaction = txs[i];
 
-                string s = Hex32Lower(tx.Sender);
-                string r = Hex32Lower(tx.Recipient);
+                string s = Hex32Lower(transaction.Sender);
+                string r = Hex32Lower(transaction.Recipient);
 
                 var sb = GetBal(s);
                 var sn = GetNonce(s);
 
-                if (tx.TxNonce != sn + 1)
+                if (transaction.TxNonce != sn + 1)
                 {
-                    reason = $"TX[{i}] nonce mismatch (have {tx.TxNonce}, expected {sn + 1})";
+                    reason = $"TX[{i}] nonce mismatch (have {transaction.TxNonce}, expected {sn + 1})";
                     return false;
                 }
 
-                if (ulong.MaxValue - tx.Amount < tx.Fee)
+                if (ulong.MaxValue - transaction.Amount < transaction.Fee)
                 {
                     reason = $"TX[{i}] cost overflow";
                     return false;
                 }
 
-                ulong cost = tx.Amount + tx.Fee;
+                ulong cost = transaction.Amount + transaction.Fee;
 
                 if (sb < cost)
                 {
@@ -360,32 +366,32 @@ namespace Qado.Blockchain
                 }
 
                 SetBal(s, sb - cost);
-                SetNonce(s, tx.TxNonce);
+                SetNonce(s, transaction.TxNonce);
 
                 var rb = GetBal(r);
-                if (ulong.MaxValue - rb < tx.Amount)
+                if (ulong.MaxValue - rb < transaction.Amount)
                 {
                     reason = $"TX[{i}] recipient balance overflow";
                     return false;
                 }
 
-                SetBal(r, rb + tx.Amount);
+                SetBal(r, rb + transaction.Amount);
             }
 
             return true;
         }
 
-        private static byte[] ComputeExpectedTargetForThisBlock(Block block, Block prevBlock)
+        private static byte[] ComputeExpectedTargetForThisBlock(Block block, Block prevBlock, SqliteTransaction? tx)
         {
             ulong nextHeight = block.BlockHeight;
 
-            var map = BuildAncestorMap(prevBlock, maxBlocks: 256);
+            var map = BuildAncestorMap(prevBlock, maxBlocks: 256, tx);
             Block? Getter(ulong h) => map.TryGetValue(h, out var b) ? b : null;
 
             return DifficultyCalculator.GetNextTarget(nextHeight, Getter);
         }
 
-        private static Dictionary<ulong, Block> BuildAncestorMap(Block tipPrev, int maxBlocks)
+        private static Dictionary<ulong, Block> BuildAncestorMap(Block tipPrev, int maxBlocks, SqliteTransaction? tx)
         {
             var map = new Dictionary<ulong, Block>(capacity: Math.Max(16, maxBlocks));
             Block? cur = tipPrev;
@@ -399,7 +405,7 @@ namespace Qado.Blockchain
                 var ph = cur.Header?.PreviousBlockHash;
                 if (ph is not { Length: 32 }) break;
 
-                cur = BlockStore.GetBlockByHash(ph);
+                cur = BlockStore.GetBlockByHash(ph, tx);
             }
 
             return map;
@@ -426,7 +432,7 @@ namespace Qado.Blockchain
         private static string Hex32Lower(byte[] b32)
             => Convert.ToHexString(b32).ToLowerInvariant();
 
-        private static ulong ComputeMedianTimePast(Block prevBlock, int window)
+        private static ulong ComputeMedianTimePast(Block prevBlock, int window, SqliteTransaction? tx)
         {
             var values = new List<ulong>(Math.Max(1, window));
             Block? cur = prevBlock;
@@ -442,7 +448,7 @@ namespace Qado.Blockchain
                 if (ph is not { Length: 32 })
                     break;
 
-                cur = BlockStore.GetBlockByHash(ph);
+                cur = BlockStore.GetBlockByHash(ph, tx);
             }
 
             if (values.Count == 0)

@@ -25,9 +25,6 @@ namespace Qado
                 var dbPath = Path.Combine(dataDir, NetworkParams.DbFileName);
                 Db.Initialize(dbPath);
 
-                var blocksPath = Path.Combine(dataDir, NetworkParams.BlockLogFileName);
-                BlockLog.Initialize(blocksPath);
-
                 GenesisBlockProvider.EnsureGenesisBlockStored();
             }
             catch (Exception ex)
@@ -44,7 +41,6 @@ namespace Qado
         protected override void OnExit(ExitEventArgs e)
         {
             try { MiningHelper.StopMiningForShutdown(); } catch { }
-            try { BlockLog.Shutdown(); } catch { }
             try { Db.Shutdown(); } catch { }
 
             base.OnExit(e);

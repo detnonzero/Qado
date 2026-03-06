@@ -53,8 +53,8 @@ namespace Qado.CodeBehindHelper
                             {
                                 From = ToHex(tx.Sender),
                                 To = ToHex(tx.Recipient),
-                                AmountQado = QadoAmountParser.FormatNanoToQado(tx.Amount) + " QADO",
-                                FeeQado = QadoAmountParser.FormatNanoToQado(tx.Fee) + " QADO",
+                                AmountQado = QadoAmountParser.FormatNanoToQado(tx.Amount),
+                                FeeQado = QadoAmountParser.FormatNanoToQado(tx.Fee),
                                 Nonce = tx.TxNonce
                             });
                         }

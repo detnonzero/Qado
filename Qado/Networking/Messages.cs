@@ -26,8 +26,12 @@ namespace Qado.Networking
         Headers = 16,
         GetHeaders = 17,
 
-        GetBlocksRange = 18,
-        BlocksBatch = 19
+        GetBlocksByLocator = 18,
+        GetBlocksFrom = 19,
+        BlocksBegin = 20,
+        BlockChunk = 21,
+        BlocksEnd = 22,
+        NoCommonAncestor = 23
     }
 }
 

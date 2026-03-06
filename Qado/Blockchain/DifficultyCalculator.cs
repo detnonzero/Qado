@@ -14,7 +14,7 @@ namespace Qado.Blockchain
 
         public static byte[] GetTargetForHeight(ulong height, Func<ulong, Block?>? getBlock = null)
         {
-            getBlock ??= BlockStore.GetBlockByHeight;
+            getBlock ??= h => BlockStore.GetBlockByHeight(h);
             return GetNextTarget(height, getBlock);
         }
 

@@ -230,12 +230,6 @@ namespace Qado.CodeBehindHelper
         {
             try
             {
-                if (!BlockValidator.ValidateSelfMinedBlock(block, out var reason))
-                {
-                    logSink.Warn("Mining", $"Rejecting mined block: {reason}");
-                    return;
-                }
-
                 if (Db.Connection == null)
                 {
                     logSink.Error("Mining", "Db.Connection is null (cannot persist block).");
@@ -244,6 +238,7 @@ namespace Qado.CodeBehindHelper
 
                 bool extendedCanon = false;
                 ulong newCanonHeight = 0;
+                string? rejectReason = null;
 
                 lock (Db.Sync)
                 {
@@ -255,6 +250,13 @@ namespace Qado.CodeBehindHelper
 
                         if (block.BlockHash is not { Length: 32 } || IsZero32(block.BlockHash))
                             block.BlockHash = block.ComputeBlockHash();
+
+                        if (!BlockValidator.ValidateNetworkTipBlock(block, out var tipReason, tx))
+                        {
+                            rejectReason = tipReason;
+                            tx.Rollback();
+                            goto PersistDone;
+                        }
 
                         BlockStore.SaveBlock(block, tx, BlockIndexStore.StatusCanonicalStateValidated);
 
@@ -271,10 +273,24 @@ namespace Qado.CodeBehindHelper
                         if (block.BlockHash is not { Length: 32 } || IsZero32(block.BlockHash))
                             block.BlockHash = block.ComputeBlockHash();
 
+                        if (!BlockValidator.ValidateNetworkSideBlockStateless(block, out var sideReason, tx))
+                        {
+                            rejectReason = sideReason;
+                            tx.Rollback();
+                            goto PersistDone;
+                        }
+
                         BlockStore.SaveBlock(block, tx, BlockIndexStore.StatusSideStatelessAccepted);
                     }
 
                     tx.Commit();
+                }
+
+            PersistDone:
+                if (!string.IsNullOrWhiteSpace(rejectReason))
+                {
+                    logSink.Warn("Mining", $"Rejecting mined block (current state): {rejectReason}");
+                    return;
                 }
 
                 logSink.Info("Mining", extendedCanon
@@ -427,10 +443,10 @@ namespace Qado.CodeBehindHelper
         }
 
 
-        private static uint GetCurrentNonceUnsafe()
+        private static ulong GetCurrentNonceUnsafe()
         {
             lock (_gate)
-                return _currentMiner?.CurrentNonce ?? 0u;
+                return _currentMiner?.CurrentNonce ?? 0UL;
         }
 
         private static void UiInvoke(Action a)

@@ -12,8 +12,6 @@ namespace Qado.Storage
             if (block is null) throw new ArgumentNullException(nameof(block));
             if (tx is null) throw new ArgumentNullException(nameof(tx));
             if (block.BlockHash is not { Length: 32 }) throw new ArgumentException("block.BlockHash missing", nameof(block));
-            if (!BlockValidator.ValidateNetworkSideBlockStateless(block, out var reason))
-                throw new InvalidOperationException($"Block stateless validation failed: {reason}");
 
             StateUndoStore.EnsureSchema(tx);
 
@@ -128,11 +126,10 @@ namespace Qado.Storage
                 var senderHex = ToHex(t.Sender);
                 var recipHex2 = ToHex(t.Recipient);
 
-                var (sBal, sNonce) = GetAccount(senderHex, tx);
-                var (rBal, rNonce) = GetAccount(recipHex2, tx);
-
                 if (!TryAddU64(t.Amount, t.Fee, out ulong totalCost))
                     throw new OverflowException("cost overflow");
+
+                var (sBal, sNonce) = GetAccount(senderHex, tx);
 
                 if (sBal < totalCost)
                     throw new OverflowException("balance underflow");
@@ -143,6 +140,17 @@ namespace Qado.Storage
                 sBal -= totalCost;
                 sNonce = t.TxNonce;
 
+                if (senderHex == recipHex2)
+                {
+                    if (ulong.MaxValue - sBal < t.Amount)
+                        throw new OverflowException("self-transfer balance overflow");
+
+                    sBal += t.Amount;
+                    SetAccount(senderHex, sBal, sNonce, tx);
+                    continue;
+                }
+
+                var (rBal, rNonce) = GetAccount(recipHex2, tx);
                 if (ulong.MaxValue - rBal < t.Amount)
                     throw new OverflowException("recipient balance overflow");
 

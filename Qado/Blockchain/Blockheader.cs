@@ -8,7 +8,7 @@ namespace Qado.Blockchain
     {
         public const int HashSize = 32;
 
-        public const int PowHeaderSize = 1 + 32 + 32 + 8 + 32 + 4 + 32;
+        public const int PowHeaderSize = 1 + 32 + 32 + 8 + 32 + 8 + 32;
 
         public byte Version { get; set; } = 1;
 
@@ -32,7 +32,7 @@ namespace Qado.Blockchain
             set => _target = Ensure32(value, nameof(Target));
         }
 
-        public uint Nonce { get; set; }
+        public ulong Nonce { get; set; }
 
         public byte[] Miner
         {
@@ -70,7 +70,7 @@ namespace Qado.Blockchain
 
         public byte[] ToHashBytes() => ToHashBytesWithNonce(Nonce);
 
-        public byte[] ToHashBytesWithNonce(uint nonceCandidate)
+        public byte[] ToHashBytesWithNonce(ulong nonceCandidate)
         {
             if (!global::Qado.Blockchain.Difficulty.IsValidTarget(_target))
                 throw new InvalidOperationException("Target out of consensus range.");
@@ -87,7 +87,7 @@ namespace Qado.Blockchain
 
             _target.AsSpan(0, 32).CopyTo(buf.AsSpan(o, 32)); o += 32;
 
-            BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(o, 4), nonceCandidate); o += 4;
+            BinaryPrimitives.WriteUInt64BigEndian(buf.AsSpan(o, 8), nonceCandidate); o += 8;
 
             _miner.AsSpan(0, 32).CopyTo(buf.AsSpan(o, 32)); o += 32;
 

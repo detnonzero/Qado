@@ -2,6 +2,43 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.3.0] - 2026-03-05
+
+### Changed
+- Consensus hashing switched to `BLAKE3`:
+  - PoW/block hashing now uses the BLAKE3-based header hash path
+  - transaction IDs now use BLAKE3
+  - Merkle roots now use BLAKE3-based hashing with domain separation
+- Block storage moved fully into SQLite:
+  - serialized blocks are now stored as BLOBs in `block_payloads`
+  - `blocks.dat` is no longer used/created
+  - sync serving now streams serialized block payloads directly from SQLite
+- Data directory layout simplified:
+  - both mainnet and testnet now use the single `data/` directory
+  - `data-mainnet/` and `data-testnet/` are no longer active storage targets
+- Block header nonce widened from `uint32` to `ulong` to expand miner nonce space.
+- Consensus block size limit increased by `4` bytes (`18045` -> `18049`) to preserve effective transaction capacity after the 64-bit nonce change.
+- Initial/catch-up block sync was redesigned to direct block batches instead of header-first sync:
+  - locator-driven forkpoint discovery
+  - continuation via `GetBlocksFrom(last_committed_hash, max_blocks)`
+  - streamed chunk delivery (`64` blocks per chunk, up to `1440` blocks per batch)
+  - strict sequential validation/commit with resume/fallback behavior on disconnects or invalid batches
+
+### Fixed
+- Fixed self-mined block validation inside an open SQLite transaction:
+  - newly mined tip-extending blocks no longer fail with `Rejecting mined block (current state): local tip unknown`
+- Fixed self-transfer state application for `sender == recipient`:
+  - old nodes could incorrectly overwrite the debit path and create inflationary balance effects
+  - current nodes now apply self-transfers as net `-fee` plus normal coinbase reward when applicable
+
+### Notes
+- `0.3.0` is consensus-incompatible with earlier releases:
+  - BLAKE3 changes block hashes, txids, and Merkle roots
+  - the 64-bit nonce changes the serialized block header format
+- Existing `data-mainnet/` / `data-testnet/` directories are not migrated automatically; the node now uses `data/` only.
+- SelfTest coverage was expanded for locator/forkpoint sync, chunked batch transfer, disconnect resume, invalid-batch fallback, and the recent state/validation regressions.
+
+
 ## [0.2.3] - 2026-03-03
 
 ### Changed

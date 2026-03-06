@@ -32,13 +32,11 @@ namespace Qado.Storage
         private static void SaveBlock_NoLock(Block block, SqliteTransaction? tx, int statusFlags)
         {
             EnsureCanonicalBlockHash(block);
-            BlockIndexStore.UpsertHeaderBytes(block.BlockHash!, block.Header!.ToHashBytes(), tx);
 
             int payloadSize = BlockBinarySerializer.GetSize(block);
             var payload = new byte[payloadSize];
             _ = BlockBinarySerializer.Write(payload, block);
-
-            var (recOff, recSize, _) = BlockLog.Append(payload, block.BlockHash!);
+            BlockPayloadStore.Upsert(block.BlockHash!, payload, tx);
 
             UInt128 parentWork = 0;
             var prev = block.Header!.PreviousBlockHash;
@@ -51,9 +49,11 @@ namespace Qado.Storage
             var target = (byte[])block.Header.Target.Clone();
             BigInteger diff = Difficulty.TargetToDifficulty(target);
             UInt128 delta = BigToUInt128Sat(diff);
-            UInt128 cw = parentWork + (delta == 0 ? 1 : delta);
+            UInt128 cw = ChainworkUtil.Add(parentWork, delta);
 
             const int fileId = 0;
+            const long recordOffset = 0;
+            int recordSize = payload.Length;
             if (statusFlags <= 0)
                 statusFlags = BlockIndexStore.StatusCanonicalStateValidated;
 
@@ -66,49 +66,93 @@ namespace Qado.Storage
                 miner32: block.Header.Miner,
                 chainwork: cw,
                 fileId: fileId,
-                recordOffset: recOff,
-                recordSize: recSize,
+                recordOffset: recordOffset,
+                recordSize: recordSize,
                 statusFlags: statusFlags,
                 tx: tx);
         }
 
-        public static Block? GetBlockByHash(byte[] hash)
+        public static Block? GetBlockByHash(byte[] hash, SqliteTransaction? tx = null)
         {
             if (hash is not { Length: 32 }) throw new ArgumentException("hash must be 32 bytes", nameof(hash));
 
-            var loc = BlockIndexStore.GetLocation(hash);
+            var loc = BlockIndexStore.GetLocation(hash, tx);
             if (loc == null) return null;
 
-            var (_, recordOffset, _) = loc.Value;
-
-            if (!BlockLog.TryReadPayload(recordOffset, out var payload, out var hdrHash, out _))
+            if (!BlockPayloadStore.TryGet(hash, out var payload, tx))
+            {
+                TryMarkPayloadMissing(hash, tx);
                 return null;
+            }
 
-            if (!BytesEqual(hash, hdrHash)) return null;
-
-            var block = BlockBinarySerializer.Read(payload);
+            Block block;
+            try
+            {
+                block = BlockBinarySerializer.Read(payload);
+            }
+            catch
+            {
+                TryMarkPayloadMissing(hash, tx);
+                return null;
+            }
             block.BlockHash = (byte[])hash.Clone();
 
-            if (BlockIndexStore.TryGetMeta(hash, out var height, out _, out _))
+            if (BlockIndexStore.TryGetMeta(hash, out var height, out _, out _, tx))
                 block.BlockHeight = height;
 
             return block;
         }
 
-        public static Block? GetBlockByHeight(ulong height)
+        public static bool TryGetSerializedBlockByHash(byte[] hash, out byte[] payload, SqliteTransaction? tx = null)
         {
-            byte[]? h = GetCanonicalHashAtHeight(height);
+            payload = Array.Empty<byte>();
+            if (hash is not { Length: 32 })
+                return false;
+
+            var loc = BlockIndexStore.GetLocation(hash, tx);
+            if (loc == null)
+                return false;
+
+            if (!BlockPayloadStore.TryGet(hash, out payload, tx))
+            {
+                TryMarkPayloadMissing(hash, tx);
+                payload = Array.Empty<byte>();
+                return false;
+            }
+
+            return true;
+        }
+
+        public static bool TryGetSerializedCanonicalBlockAtHeight(ulong height, out byte[] payload, SqliteTransaction? tx = null)
+        {
+            payload = Array.Empty<byte>();
+            byte[]? hash = GetCanonicalHashAtHeight(height, tx);
+            if (hash is not { Length: 32 })
+                return false;
+
+            return TryGetSerializedBlockByHash(hash, out payload, tx);
+        }
+
+        private static void TryMarkPayloadMissing(byte[] hash, SqliteTransaction? tx = null)
+        {
+            try { BlockPayloadStore.Delete(hash, tx); } catch { }
+            try { BlockIndexStore.MarkPayloadMissing(hash, tx); } catch { }
+        }
+
+        public static Block? GetBlockByHeight(ulong height, SqliteTransaction? tx = null)
+        {
+            byte[]? h = GetCanonicalHashAtHeight(height, tx);
             if (h == null) return null;
 
-            var b = GetBlockByHash(h);
+            var b = GetBlockByHash(h, tx);
             if (b != null) b.BlockHeight = height;
             return b;
         }
 
-        public static Block? GetLatestBlock()
+        public static Block? GetLatestBlock(SqliteTransaction? tx = null)
         {
-            if (!TryGetLatestHeight(out var h)) return null;
-            return GetBlockByHeight(h);
+            if (!TryGetLatestHeight(out var h, tx)) return null;
+            return GetBlockByHeight(h, tx);
         }
 
         public static byte[]? GetCanonicalHashAtHeight(ulong height, SqliteTransaction? tx = null)
@@ -250,6 +294,28 @@ ON CONFLICT(height) DO UPDATE SET hash = excluded.hash;";
 
         private static void DeleteBlocksFromHeight_NoLock(ulong fromHeight, SqliteTransaction tx)
         {
+            using (var delPayload = tx.Connection!.CreateCommand())
+            {
+                delPayload.Transaction = tx;
+                delPayload.CommandText = @"
+DELETE FROM block_payloads
+WHERE hash IN (SELECT hash FROM block_index WHERE height >= $h);";
+                delPayload.Parameters.AddWithValue("$h", (long)fromHeight);
+                delPayload.ExecuteNonQuery();
+            }
+
+            try
+            {
+                using var delUndo = tx.Connection!.CreateCommand();
+                delUndo.Transaction = tx;
+                delUndo.CommandText = @"
+DELETE FROM state_undo
+WHERE block_hash IN (SELECT hash FROM block_index WHERE height >= $h);";
+                delUndo.Parameters.AddWithValue("$h", (long)fromHeight);
+                delUndo.ExecuteNonQuery();
+            }
+            catch { }
+
             using (var delCanon = tx.Connection!.CreateCommand())
             {
                 delCanon.Transaction = tx;
@@ -273,18 +339,6 @@ ON CONFLICT(height) DO UPDATE SET hash = excluded.hash;";
                 delIdx.Parameters.AddWithValue("$h", (long)fromHeight);
                 delIdx.ExecuteNonQuery();
             }
-
-            try
-            {
-                using var delUndo = tx.Connection!.CreateCommand();
-                delUndo.Transaction = tx;
-                delUndo.CommandText = @"
-DELETE FROM state_undo
-WHERE block_hash IN (SELECT hash FROM block_index WHERE height >= $h);";
-                delUndo.Parameters.AddWithValue("$h", (long)fromHeight);
-                delUndo.ExecuteNonQuery();
-            }
-            catch { }
 
             if (fromHeight == 0)
             {

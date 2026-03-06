@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Numerics;
 using System.Threading;
 using System.Threading.Tasks;
@@ -20,11 +21,9 @@ namespace Qado.Blockchain
         private readonly Action? _onHashIteration;
         private readonly ILogSink? _log;
 
-        public uint CurrentNonce { get; private set; }
+        public ulong CurrentNonce { get; private set; }
 
-        private const uint TimestampRefreshMask = 0xFFF;
-
-        private const uint TipRefreshMask = 0x3FF;
+        private static readonly long MaintenanceIntervalTicks = Stopwatch.Frequency; // 1s
 
         public Miner(
             string privateKeyHex,
@@ -66,7 +65,6 @@ namespace Qado.Blockchain
         {
             try
             {
-
                 var txs = _getReadyTransactions() ?? new List<Transaction>(0);
 
                 ulong tipHeight = BlockStore.GetLatestHeight();
@@ -126,64 +124,60 @@ namespace Qado.Blockchain
 
                 CurrentNonce = 0;
 
-                _log?.Info("Mining",
-                    $"⛏️ Mining h={newHeight} | diff={diff} | target={Hex(target, 16)}… | " +
+                _log?.Info(
+                    "Mining",
+                    $"Mining h={newHeight} | diff={diff} | target={Hex(target, 16)}... | " +
                     $"txs={block.Transactions.Count} | fees={QadoAmountParser.FormatNanoToQado(totalFees)} | " +
                     $"subsidy={QadoAmountParser.FormatNanoToQado(subsidy)}");
 
+                long nextMaintenanceTick = Stopwatch.GetTimestamp();
 
                 while (!token.IsCancellationRequested)
                 {
-                    if ((CurrentNonce & TipRefreshMask) == 0)
+                    long nowTick = Stopwatch.GetTimestamp();
+                    if (nowTick >= nextMaintenanceTick)
                     {
                         ulong curTipH = BlockStore.GetLatestHeight();
                         if (curTipH != tipHeight)
                         {
-                            _log?.Info("Mining", $"❌ Aborted: tip height changed {tipHeight} → {curTipH}.");
+                            _log?.Info("Mining", $"Aborted: tip height changed {tipHeight} -> {curTipH}.");
                             return;
                         }
 
                         byte[]? curTipHashAtH = BlockStore.GetCanonicalHashAtHeight(tipHeight);
                         if (curTipHashAtH is { Length: 32 } && !BytesEqual32(curTipHashAtH, prevHash))
                         {
-                            _log?.Info("Mining", $"❌ Aborted: tip hash changed at height {tipHeight}.");
+                            _log?.Info("Mining", $"Aborted: tip hash changed at height {tipHeight}.");
                             return;
                         }
+
+                        ulong now = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                        if (now > header.Timestamp)
+                            header.Timestamp = now;
+
+                        do
+                        {
+                            nextMaintenanceTick += MaintenanceIntervalTicks;
+                        }
+                        while (nowTick >= nextMaintenanceTick);
                     }
 
                     _onHashIteration?.Invoke();
 
-                    if ((CurrentNonce & TimestampRefreshMask) == 0)
-                    {
-                        ulong now = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-                        if (now > header.Timestamp)
-                            header.Timestamp = now;
-                    }
-
                     var headerBytes = header.ToHashBytesWithNonce(CurrentNonce);
-
-                    var hash = Argon2Util.ComputeHash(
-                        headerBytes,
-                        memoryKb: ConsensusRules.PowMemoryKb,
-                        iterations: ConsensusRules.PowIterations,
-                        parallelism: ConsensusRules.PowParallelism);
+                    var hash = Blake3Util.Hash(headerBytes);
 
                     if (Difficulty.Meets(hash, target))
                     {
                         header.Nonce = CurrentNonce;
                         block.BlockHash = hash;
 
-                        _log?.Info("Mining", $"✅ Block FOUND h={newHeight} nonce={CurrentNonce} hash={Hex(hash, 8)}…");
+                        _log?.Info("Mining", $"Block FOUND h={newHeight} nonce={CurrentNonce} hash={Hex(hash, 8)}...");
 
                         _onBlockAccepted(block);
-
                         _ = Task.Run(() => _onBlockMinedAsync(block));
-
                         return;
                     }
-
-                    if (CurrentNonce % 250_000 == 0)
-                        _log?.Info("Mining", $"⏳ h={newHeight} nonce={CurrentNonce} hash={Hex(hash, 8)}…");
 
                     unchecked { CurrentNonce++; }
                 }
@@ -232,4 +226,3 @@ namespace Qado.Blockchain
         }
     }
 }
-

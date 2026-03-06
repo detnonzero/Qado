@@ -94,6 +94,11 @@ CREATE TABLE IF NOT EXISTS header_store(
   header BLOB NOT NULL
 ) WITHOUT ROWID;
 
+CREATE TABLE IF NOT EXISTS block_payloads(
+  hash    BLOB(32) PRIMARY KEY,
+  payload BLOB NOT NULL
+) WITHOUT ROWID;
+
 CREATE INDEX IF NOT EXISTS idx_bi_height ON block_index(height);
 CREATE INDEX IF NOT EXISTS idx_bi_prev   ON block_index(prev_hash);
 CREATE INDEX IF NOT EXISTS idx_parent    ON block_index(prev_hash);
@@ -130,6 +135,7 @@ CREATE INDEX IF NOT EXISTS idx_tx_txid   ON tx_index(txid);
                 "hash","prev_hash","height","ts","target","miner","chainwork","file_id","file_offset","file_size","status","is_bad","bad_reason","bad_ancestor"
             });
             RequireColumns(tx, "header_store", new[] { "hash", "header" });
+            RequireColumns(tx, "block_payloads", new[] { "hash", "payload" });
 
             RequireColumns(tx, "canon", new[] { "height", "hash" });
             RequireColumns(tx, "meta", new[] { "key", "value" });

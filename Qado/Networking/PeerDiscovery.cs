@@ -18,10 +18,16 @@ namespace Qado.Networking
         private const int DefaultP2PPort = P2PNode.DefaultPort;
         private static readonly object PexLogGate = new();
         private static readonly TimeSpan PexLogWindow = TimeSpan.FromSeconds(10);
+        private static readonly object PexAdvertiseGate = new();
+        private static readonly TimeSpan PexAdvertiseCooldown = TimeSpan.FromMinutes(30);
+        private static readonly TimeSpan PexFallbackResendMinAge = TimeSpan.FromMinutes(5);
+        private static readonly TimeSpan PexAdvertiseRetention = TimeSpan.FromHours(6);
+        private const int PexAdvertiseHistoryCap = 4096;
         private static DateTime _lastPexSentLogUtc = DateTime.MinValue;
         private static DateTime _lastPexReceivedLogUtc = DateTime.MinValue;
         private static int _pexSentSuppressed;
         private static int _pexReceivedSuppressed;
+        private static readonly Dictionary<string, DateTime> _pexAdvertisedAtByEndpoint = new(StringComparer.Ordinal);
 
         public static async Task HandleGetPeersAsync(NetworkStream ns, ILogSink? log, CancellationToken ct)
         {
@@ -91,13 +97,16 @@ namespace Qado.Networking
         public static byte[] BuildPeersPayload(int maxPeers = 64)
         {
             if (maxPeers <= 0) return MakeEmpty();
+            if (maxPeers > MaxPeersInPayload) maxPeers = MaxPeersInPayload;
 
-            var peers = P2PNode.Instance?.GetPublicPeerCandidates(maxPeers)
+            int candidateLimit = Math.Min(MaxPeersInPayload, Math.Max(maxPeers, maxPeers * 4));
+            var peers = P2PNode.Instance?.GetPeerCandidatesForPex(candidateLimit)
                         ?? new List<(string ip, int port)>();
-            var chunks = new List<byte[]>(peers.Count);
+            var selected = SelectPeersForPayload(peers, maxPeers);
+            var chunks = new List<byte[]>(selected.Count);
 
             ushort count = 0;
-            foreach (var (ip, port) in peers)
+            foreach (var (ip, port) in selected)
             {
                 if (!IsPublicRoutableIPv4Literal(ip)) continue;
 
@@ -136,6 +145,92 @@ namespace Qado.Networking
             }
 
             return payload;
+        }
+
+        private static List<(string ip, int port)> SelectPeersForPayload(List<(string ip, int port)> candidates, int maxPeers)
+        {
+            if (candidates.Count == 0 || maxPeers <= 0)
+                return new List<(string ip, int port)>();
+
+            var selected = new List<(string ip, int port)>(maxPeers);
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            var now = DateTime.UtcNow;
+            (string ip, int port, string key, DateTime lastAt)? oldestRecent = null;
+
+            lock (PexAdvertiseGate)
+            {
+                PrunePexAdvertiseHistoryLocked(now);
+
+                for (int i = 0; i < candidates.Count && selected.Count < maxPeers; i++)
+                {
+                    var (ip, port) = candidates[i];
+                    if (!TryBuildEndpointKey(ip, port, out var key)) continue;
+                    if (!seen.Add(key)) continue;
+
+                    if (_pexAdvertisedAtByEndpoint.TryGetValue(key, out var lastAt))
+                    {
+                        var age = now - lastAt;
+                        if (age < PexAdvertiseCooldown)
+                        {
+                            if (!oldestRecent.HasValue || lastAt < oldestRecent.Value.lastAt)
+                                oldestRecent = (ip, port, key, lastAt);
+                            continue;
+                        }
+                    }
+
+                    selected.Add((ip, port));
+                    _pexAdvertisedAtByEndpoint[key] = now;
+                }
+
+                // Deterministic fallback keeps tiny networks discoverable without re-advertising everything on every request.
+                if (selected.Count == 0 && oldestRecent.HasValue && (now - oldestRecent.Value.lastAt) >= PexFallbackResendMinAge)
+                {
+                    selected.Add((oldestRecent.Value.ip, oldestRecent.Value.port));
+                    _pexAdvertisedAtByEndpoint[oldestRecent.Value.key] = now;
+                }
+            }
+
+            return selected;
+        }
+
+        private static void PrunePexAdvertiseHistoryLocked(DateTime now)
+        {
+            if (_pexAdvertisedAtByEndpoint.Count == 0)
+                return;
+
+            var cutoff = now - PexAdvertiseRetention;
+            var toRemove = new List<string>();
+
+            foreach (var kv in _pexAdvertisedAtByEndpoint)
+            {
+                if (kv.Value < cutoff)
+                    toRemove.Add(kv.Key);
+            }
+
+            for (int i = 0; i < toRemove.Count; i++)
+                _pexAdvertisedAtByEndpoint.Remove(toRemove[i]);
+
+            if (_pexAdvertisedAtByEndpoint.Count <= PexAdvertiseHistoryCap)
+                return;
+
+            int overflow = _pexAdvertisedAtByEndpoint.Count - PexAdvertiseHistoryCap;
+            var oldest = new List<KeyValuePair<string, DateTime>>(_pexAdvertisedAtByEndpoint);
+            oldest.Sort(static (a, b) => a.Value.CompareTo(b.Value));
+
+            for (int i = 0; i < overflow && i < oldest.Count; i++)
+                _pexAdvertisedAtByEndpoint.Remove(oldest[i].Key);
+        }
+
+        private static bool TryBuildEndpointKey(string ip, int port, out string key)
+        {
+            key = string.Empty;
+            if (port <= 0 || port > 65535) return false;
+
+            var host = NormalizeHost(ip);
+            if (host.Length == 0) return false;
+
+            key = $"{host}:{port}";
+            return true;
         }
 
 

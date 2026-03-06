@@ -33,12 +33,7 @@ namespace Qado.Blockchain
             if (Header is null) throw new InvalidOperationException("Header is required.");
 
             var headerBytes = Header.ToHashBytes();
-
-            return Argon2Util.ComputeHash(
-                headerBytes,
-                memoryKb: ConsensusRules.PowMemoryKb,
-                iterations: ConsensusRules.PowIterations,
-                parallelism: ConsensusRules.PowParallelism);
+            return Blake3Util.Hash(headerBytes);
         }
 
         public void RecomputeAndSetBlockHash()

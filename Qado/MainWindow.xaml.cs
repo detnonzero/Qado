@@ -3,10 +3,12 @@ using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.IO;
 using System.Numerics;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Data;
 using System.Windows.Input;
 using System.Windows.Media;
 using Microsoft.Data.Sqlite;
@@ -35,6 +37,8 @@ namespace Qado
         private readonly ObservableCollection<AccountStateViewModel> _accounts = new();
 
         private readonly ObservableCollection<TxRow> _txRows = new();
+        private readonly ObservableCollection<PersonalTxRow> _personalTxRows = new();
+        private readonly ObservableCollection<AddressBookRow> _addressBookRows = new();
         private readonly ObservableCollection<BlockRow> _blockRows = new();
 
         private MempoolManager _mempool = null!;
@@ -75,6 +79,10 @@ namespace Qado
         private int _nodeStatusRefreshRequested;
         private int _nodeStatusRefreshWorkerRunning;
         private int _blockExplorerRefreshRequested;
+        private int _personalTxReloadRequested;
+        private int _personalTxReloadWorkerRunning;
+        private string _personalTxTargetPubKey = "";
+        private RightClickCellContext? _lastRightClickCell;
         private DateTime _lastTrySyncUtc = DateTime.MinValue;
         private DateTime _nextTipAdoptionWarnUtc = DateTime.MinValue;
 
@@ -82,6 +90,22 @@ namespace Qado
 
         private static readonly object _appLogFileSync = new();
         private static readonly string _appLogPath = Path.Combine(AppContext.BaseDirectory, "data", "app.log");
+        private static readonly object _addressBookFileSync = new();
+        private static readonly string _addressBookPath = Path.Combine(AppContext.BaseDirectory, "data", "addressbook.txt");
+
+        private sealed class RightClickCellContext
+        {
+            public RightClickCellContext(ListView listView, object item, int columnIndex)
+            {
+                ListView = listView;
+                Item = item;
+                ColumnIndex = columnIndex;
+            }
+
+            public ListView ListView { get; }
+            public object Item { get; }
+            public int ColumnIndex { get; }
+        }
 
         public MainWindow()
         {
@@ -125,6 +149,8 @@ namespace Qado
                 PeersListView.ItemsSource = _peers;
                 StateListView.ItemsSource = _accounts;
                 TxListView.ItemsSource = _txRows;
+                PersonalTxListView.ItemsSource = _personalTxRows;
+                AddressBookListView.ItemsSource = _addressBookRows;
                 BlocksListView.ItemsSource = _blockRows;
                 BlocksListView.AddHandler(ScrollViewer.ScrollChangedEvent, new ScrollChangedEventHandler(BlockScroll_ScrollChanged));
 
@@ -141,6 +167,9 @@ namespace Qado
 
                 CopyKeyButton.Click -= CopyKeyButton_Click;
                 CopyKeyButton.Click += CopyKeyButton_Click;
+                AddressBookAddButton.Click -= AddressBookAddButton_Click;
+                AddressBookAddButton.Click += AddressBookAddButton_Click;
+                InitializeCopySupport();
 
                 _mempool = new MempoolManager(
                     senderHex => StateStore.GetBalanceU64(senderHex),
@@ -203,6 +232,8 @@ namespace Qado
                 InitializeBlockExplorerLazy();
 
                 LoadAccounts();
+                ReloadPersonalTransactions();
+                LoadAddressBook();
                 ReloadPeers();
                 ScheduleNodeStatusRefresh();
                 StartUiTimer(ScheduleNodeStatusRefresh);
@@ -353,6 +384,7 @@ namespace Qado
                 }));
 
                 Dispatcher.BeginInvoke(new Action(LoadAccounts));
+                Dispatcher.BeginInvoke(new Action(ReloadPersonalTransactions));
                 Dispatcher.BeginInvoke(new Action(ReloadPeers));
                 ScheduleNodeStatusRefresh();
 
@@ -440,6 +472,7 @@ namespace Qado
                     GeneratePrivateKeyButton.IsEnabled = true;
                     GeneratePrivateKeyButton.Opacity = 1.0;
                     SpendPublicKeyTextBox.Text = "";
+                    ReloadPersonalTransactions();
                 }
                 else
                 {
@@ -452,6 +485,7 @@ namespace Qado
                     GeneratePrivateKeyButton.Opacity = 0.5;
 
                     BalanceHelper.UpdateBalanceUI(BalanceTextBlock, selected);
+                    ReloadPersonalTransactions();
                 }
             }
         }
@@ -494,6 +528,7 @@ namespace Qado
                 SpendPublicKeyTextBox.Text = publicKey;
 
                 BalanceHelper.UpdateBalanceUI(BalanceTextBlock, privateKey);
+                ReloadPersonalTransactions();
             }
             catch
             {
@@ -525,6 +560,7 @@ namespace Qado
             GeneratePrivateKeyButton.Opacity = 0.5;
 
             BalanceHelper.UpdateBalanceUI(BalanceTextBlock, newPrivateKey);
+            ReloadPersonalTransactions();
             Info("Key", "New private key generated.");
         }
 
@@ -696,6 +732,434 @@ namespace Qado
             Logs.Clear();
         }
 
+        private void AddressBookAddButton_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                string normalized = NormalizeHex64(AddressBookInputTextBox?.Text);
+                if (string.IsNullOrWhiteSpace(normalized) || IsZeroHex64(normalized))
+                {
+                    if (AddressBookStatusText != null)
+                        AddressBookStatusText.Text = "Invalid pubkey: must be 64-char hex (32 bytes).";
+                    Warn("AddressBook", "Rejected invalid pubkey (expected 64-char hex32).");
+                    return;
+                }
+
+                if (!TryAddAddressBookEntry(normalized, out var message))
+                {
+                    if (AddressBookStatusText != null)
+                        AddressBookStatusText.Text = message;
+                    return;
+                }
+
+                if (AddressBookInputTextBox != null)
+                    AddressBookInputTextBox.Text = "";
+                if (AddressBookStatusText != null)
+                    AddressBookStatusText.Text = message;
+            }
+            catch (Exception ex)
+            {
+                if (AddressBookStatusText != null)
+                    AddressBookStatusText.Text = $"Add failed: {ex.Message}";
+                Warn("AddressBook", $"Add failed: {ex.Message}");
+            }
+        }
+
+        private void AddressBookDeleteButton_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                string normalized = "";
+                if (sender is FrameworkElement fe)
+                {
+                    if (fe.Tag is string tag)
+                        normalized = NormalizeHex64(tag);
+
+                    if (normalized.Length == 0 && fe.DataContext is AddressBookRow row)
+                        normalized = NormalizeHex64(row.PublicKey);
+                }
+
+                if (normalized.Length != 64)
+                {
+                    if (AddressBookStatusText != null)
+                        AddressBookStatusText.Text = "Delete failed: invalid row key.";
+                    return;
+                }
+
+                if (!TryRemoveAddressBookEntry(normalized, out var message))
+                {
+                    if (AddressBookStatusText != null)
+                        AddressBookStatusText.Text = message;
+                    return;
+                }
+
+                if (AddressBookStatusText != null)
+                    AddressBookStatusText.Text = message;
+            }
+            catch (Exception ex)
+            {
+                if (AddressBookStatusText != null)
+                    AddressBookStatusText.Text = $"Delete failed: {ex.Message}";
+                Warn("AddressBook", $"Delete failed: {ex.Message}");
+            }
+        }
+
+        private void LoadAddressBook()
+        {
+            _addressBookRows.Clear();
+            var entries = ReadAddressBookEntries();
+            for (int i = 0; i < entries.Count; i++)
+                _addressBookRows.Add(new AddressBookRow { PublicKey = entries[i] });
+
+            AddressBookStatusText.Text = _addressBookRows.Count == 0
+                ? "No addresses yet."
+                : $"{_addressBookRows.Count} address(es).";
+        }
+
+        private bool TryAddAddressBookEntry(string pubKeyHex, out string message)
+        {
+            for (int i = 0; i < _addressBookRows.Count; i++)
+            {
+                if (string.Equals(_addressBookRows[i].PublicKey, pubKeyHex, StringComparison.Ordinal))
+                {
+                    message = "Address already exists.";
+                    return false;
+                }
+            }
+
+            int insertAt = 0;
+            while (insertAt < _addressBookRows.Count &&
+                   string.CompareOrdinal(_addressBookRows[insertAt].PublicKey, pubKeyHex) < 0)
+            {
+                insertAt++;
+            }
+
+            _addressBookRows.Insert(insertAt, new AddressBookRow { PublicKey = pubKeyHex });
+            SaveAddressBook_NoThrow();
+            message = $"Address added ({_addressBookRows.Count} total).";
+            Info("AddressBook", $"Address added: {pubKeyHex}");
+            return true;
+        }
+
+        private bool TryRemoveAddressBookEntry(string pubKeyHex, out string message)
+        {
+            int index = -1;
+            for (int i = 0; i < _addressBookRows.Count; i++)
+            {
+                if (string.Equals(_addressBookRows[i].PublicKey, pubKeyHex, StringComparison.Ordinal))
+                {
+                    index = i;
+                    break;
+                }
+            }
+
+            if (index < 0)
+            {
+                message = "Address not found.";
+                return false;
+            }
+
+            _addressBookRows.RemoveAt(index);
+            SaveAddressBook_NoThrow();
+
+            message = _addressBookRows.Count == 0
+                ? "No addresses yet."
+                : $"Address removed ({_addressBookRows.Count} total).";
+            Info("AddressBook", $"Address removed: {pubKeyHex}");
+            return true;
+        }
+
+        private static List<string> ReadAddressBookEntries()
+        {
+            var rows = new List<string>(128);
+
+            try
+            {
+                lock (_addressBookFileSync)
+                {
+                    if (!File.Exists(_addressBookPath))
+                        return rows;
+
+                    var seen = new HashSet<string>(StringComparer.Ordinal);
+                    var lines = File.ReadAllLines(_addressBookPath);
+                    for (int i = 0; i < lines.Length; i++)
+                    {
+                        string normalized = NormalizeHex64(lines[i]);
+                        if (normalized.Length != 64 || IsZeroHex64(normalized))
+                            continue;
+
+                        if (seen.Add(normalized))
+                            rows.Add(normalized);
+                    }
+                }
+
+                rows.Sort(StringComparer.Ordinal);
+            }
+            catch
+            {
+            }
+
+            return rows;
+        }
+
+        private void SaveAddressBook_NoThrow()
+        {
+            try
+            {
+                string? dir = Path.GetDirectoryName(_addressBookPath);
+                if (!string.IsNullOrWhiteSpace(dir))
+                    Directory.CreateDirectory(dir);
+
+                var lines = new string[_addressBookRows.Count];
+                for (int i = 0; i < _addressBookRows.Count; i++)
+                    lines[i] = _addressBookRows[i].PublicKey;
+
+                lock (_addressBookFileSync)
+                    File.WriteAllLines(_addressBookPath, lines);
+            }
+            catch (Exception ex)
+            {
+                Warn("AddressBook", $"Save failed: {ex.Message}");
+            }
+        }
+
+        private void InitializeCopySupport()
+        {
+            AttachListViewCopySupport(BlocksListView);
+            AttachListViewCopySupport(MempoolListView);
+            AttachListViewCopySupport(PeersListView);
+            AttachListViewCopySupport(StateListView);
+            AttachListViewCopySupport(TxListView);
+            AttachListViewCopySupport(PersonalTxListView);
+            AttachListViewCopySupport(AddressBookListView);
+            AttachListViewCopySupport(LogListView);
+
+            AttachTextBlockCopySupport(TipHeightText);
+            AttachTextBlockCopySupport(TipHashText);
+            AttachTextBlockCopySupport(BalanceTextBlock);
+            AttachTextBlockCopySupport(MempoolCountText);
+            AttachTextBlockCopySupport(PeerCountText);
+            AttachTextBlockCopySupport(BlockUptimeText);
+            AttachTextBlockCopySupport(CurrentHashrateText);
+            AttachTextBlockCopySupport(NonceText);
+            AttachTextBlockCopySupport(SendStatusText);
+            AttachTextBlockCopySupport(TxHeaderText);
+            AttachTextBlockCopySupport(PersonalTxHeaderText);
+            AttachTextBlockCopySupport(AddressBookStatusText);
+        }
+
+        private void AttachListViewCopySupport(ListView listView)
+        {
+            if (listView == null)
+                return;
+
+            listView.PreviewMouseRightButtonDown -= ListView_PreviewMouseRightButtonDown;
+            listView.PreviewMouseRightButtonDown += ListView_PreviewMouseRightButtonDown;
+
+            var menu = new ContextMenu();
+            var copyCellItem = new MenuItem { Header = "Copy cell" };
+            copyCellItem.Click += (_, __) => CopySingleCellFromListView(listView);
+            menu.Items.Add(copyCellItem);
+            menu.Opened += (_, __) => copyCellItem.IsEnabled = HasCopyableCellContext(listView);
+            listView.ContextMenu = menu;
+        }
+
+        private void ListView_PreviewMouseRightButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            if (sender is not ListView listView)
+                return;
+
+            DependencyObject? current = e.OriginalSource as DependencyObject;
+            var item = FindAncestor<ListViewItem>(current);
+            if (item is null)
+            {
+                _lastRightClickCell = null;
+                return;
+            }
+
+            object? rowItem = listView.ItemContainerGenerator.ItemFromContainer(item);
+            if (ReferenceEquals(rowItem, DependencyProperty.UnsetValue) || rowItem is null)
+                rowItem = item.DataContext;
+            if (rowItem is null)
+            {
+                _lastRightClickCell = null;
+                return;
+            }
+
+            int columnIndex = ResolveClickedGridColumnIndex(listView, item, e);
+            _lastRightClickCell = new RightClickCellContext(listView, rowItem, columnIndex);
+
+            if (item.IsSelected)
+                return;
+
+            if ((Keyboard.Modifiers & ModifierKeys.Control) == 0)
+                listView.SelectedItems.Clear();
+
+            item.IsSelected = true;
+        }
+
+        private bool HasCopyableCellContext(ListView listView)
+        {
+            if (_lastRightClickCell is null)
+                return false;
+            if (!ReferenceEquals(_lastRightClickCell.ListView, listView))
+                return false;
+            if (_lastRightClickCell.Item is null)
+                return false;
+
+            if (_lastRightClickCell.ColumnIndex < 0)
+                return true;
+
+            return listView.View is GridView gv &&
+                   _lastRightClickCell.ColumnIndex < gv.Columns.Count;
+        }
+
+        private void CopySingleCellFromListView(ListView listView)
+        {
+            if (listView == null || _lastRightClickCell is null)
+                return;
+
+            if (!ReferenceEquals(_lastRightClickCell.ListView, listView))
+                return;
+
+            string text;
+            if (listView.View is GridView gv &&
+                gv.Columns.Count > 0 &&
+                _lastRightClickCell.ColumnIndex >= 0 &&
+                _lastRightClickCell.ColumnIndex < gv.Columns.Count)
+            {
+                text = GetGridCellText(_lastRightClickCell.Item, gv.Columns[_lastRightClickCell.ColumnIndex]);
+            }
+            else
+            {
+                text = SanitizeClipboardCell(_lastRightClickCell.Item?.ToString() ?? "");
+            }
+
+            try
+            {
+                Clipboard.SetText(text);
+            }
+            catch (Exception ex)
+            {
+                Warn("UI", $"Copy failed: {ex.Message}");
+            }
+        }
+
+        private static int ResolveClickedGridColumnIndex(ListView listView, ListViewItem item, MouseButtonEventArgs e)
+        {
+            if (listView.View is not GridView gv || gv.Columns.Count == 0)
+                return -1;
+
+            var src = e.OriginalSource as DependencyObject;
+            var presenter = FindAncestor<GridViewRowPresenter>(src) ?? FindDescendant<GridViewRowPresenter>(item);
+            if (presenter is null)
+                return -1;
+
+            double x = e.GetPosition(presenter).X;
+            if (x < 0)
+                return -1;
+
+            double cursor = 0;
+            for (int i = 0; i < gv.Columns.Count; i++)
+            {
+                var col = gv.Columns[i];
+                double width = col.ActualWidth;
+                if (width <= 0 || double.IsNaN(width))
+                {
+                    width = col.Width;
+                    if (width <= 0 || double.IsNaN(width))
+                        width = 0;
+                }
+
+                if (x >= cursor && x < cursor + width)
+                    return i;
+
+                cursor += width;
+            }
+
+            if (gv.Columns.Count > 0 && x >= cursor - 1)
+                return gv.Columns.Count - 1;
+
+            return -1;
+        }
+
+        private static T? FindAncestor<T>(DependencyObject? start) where T : DependencyObject
+        {
+            var current = start;
+            while (current != null)
+            {
+                if (current is T matched)
+                    return matched;
+                current = VisualTreeHelper.GetParent(current);
+            }
+
+            return null;
+        }
+
+        private void AttachTextBlockCopySupport(TextBlock textBlock)
+        {
+            if (textBlock == null)
+                return;
+
+            var menu = new ContextMenu();
+            var copyItem = new MenuItem { Header = "Copy text" };
+            copyItem.Click += (_, __) =>
+            {
+                var text = textBlock.Text ?? "";
+                if (string.IsNullOrWhiteSpace(text))
+                    return;
+
+                try
+                {
+                    Clipboard.SetText(text);
+                }
+                catch (Exception ex)
+                {
+                    Warn("UI", $"Copy failed: {ex.Message}");
+                }
+            };
+
+            menu.Items.Add(copyItem);
+            textBlock.ContextMenu = menu;
+        }
+
+        private static string GetGridCellText(object? item, GridViewColumn column)
+        {
+            if (item == null)
+                return "";
+
+            if (column.DisplayMemberBinding is Binding binding)
+            {
+                string path = binding.Path?.Path ?? "";
+                if (!string.IsNullOrWhiteSpace(path))
+                    return SanitizeClipboardCell(ReadPropertyPath(item, path));
+            }
+
+            return SanitizeClipboardCell(item.ToString() ?? "");
+        }
+
+        private static string ReadPropertyPath(object root, string path)
+        {
+            object? current = root;
+            var segments = path.Split('.', StringSplitOptions.RemoveEmptyEntries);
+            for (int i = 0; i < segments.Length; i++)
+            {
+                if (current == null)
+                    return "";
+
+                var prop = current.GetType().GetProperty(segments[i]);
+                if (prop == null)
+                    return "";
+
+                current = prop.GetValue(current);
+            }
+
+            return current?.ToString() ?? "";
+        }
+
+        private static string SanitizeClipboardCell(string value)
+            => (value ?? "").Replace('\t', ' ').Replace('\r', ' ').Replace('\n', ' ');
+
         private void ReloadPeers()
         {
             if (_isClosing) return;
@@ -757,13 +1221,17 @@ namespace Qado
                 {
                     using var cmd = Db.Connection.CreateCommand();
                     cmd.CommandText = @"
-SELECT p.ip, p.port, p.last_seen, IFNULL(a.announced_at, 0)
+SELECT p.ip,
+       p.port,
+       MAX(p.last_seen) AS last_seen,
+       MAX(IFNULL(a.announced_at, 0)) AS announced_at
 FROM peers p
 LEFT JOIN peer_announced a ON a.id = p.id
+GROUP BY p.ip, p.port
 ORDER BY
   CASE
-    WHEN p.last_seen > 0 THEN p.last_seen
-    ELSE IFNULL(a.announced_at, 0)
+    WHEN MAX(p.last_seen) > 0 THEN MAX(p.last_seen)
+    ELSE MAX(IFNULL(a.announced_at, 0))
   END DESC,
   p.ip ASC,
   p.port ASC
@@ -797,13 +1265,15 @@ LIMIT 200;";
                             lastSeenText = $"{seenAt.UtcDateTime:yyyy-MM-dd HH:mm:ss} UTC (announced)";
                         }
 
+                        bool connected = _p2pNode?.IsPeerConnected(ip, port) == true;
                         rows.Add(new PeerRow
                         {
                             Endpoint = $"{ip}:{port}",
                             LastSeenUtc = lastSeenText,
+                            LatencyMs = GetPeerLatencyText(ip, port, connected),
                             Status = hasSeen
-                                ? GetPeerStatus(ip, port, seenAt)
-                                : GetAnnouncedPeerStatus(ip, port, seenAt, hasAnyTimestamp)
+                                ? GetPeerStatus(ip, port, seenAt, connected)
+                                : GetAnnouncedPeerStatus(ip, port, seenAt, hasAnyTimestamp, connected)
                         });
                     }
                 }
@@ -825,9 +1295,9 @@ LIMIT 200;";
             return rows;
         }
 
-        private string GetPeerStatus(string ip, int port, DateTimeOffset seenAt)
+        private string GetPeerStatus(string ip, int port, DateTimeOffset seenAt, bool connected)
         {
-            if (_p2pNode?.IsPeerConnected(ip, port) == true)
+            if (connected)
                 return GetConnectedPeerStatus(ip, port);
 
             bool coolingDown = PeerFailTracker.ShouldBan(ip);
@@ -847,9 +1317,9 @@ LIMIT 200;";
             return "Stale";
         }
 
-        private string GetAnnouncedPeerStatus(string ip, int port, DateTimeOffset announcedAt, bool hasTimestamp)
+        private string GetAnnouncedPeerStatus(string ip, int port, DateTimeOffset announcedAt, bool hasTimestamp, bool connected)
         {
-            if (_p2pNode?.IsPeerConnected(ip, port) == true)
+            if (connected)
                 return GetConnectedPeerStatus(ip, port);
 
             bool coolingDown = PeerFailTracker.ShouldBan(ip);
@@ -865,6 +1335,18 @@ LIMIT 200;";
                 return "Announced (cooling down)";
 
             return stale ? "Unverified" : "Announced";
+        }
+
+        private string GetPeerLatencyText(string ip, int port, bool connected)
+        {
+            if (!connected)
+                return "-";
+
+            int? latencyMs = _p2pNode?.GetPeerLatencyMs(ip, port);
+            if (latencyMs is int ms && ms >= 0)
+                return ms.ToString();
+
+            return "...";
         }
 
         private string GetConnectedPeerStatus(string ip, int port)
@@ -1021,6 +1503,208 @@ LIMIT 200;";
             });
         }
 
+        private void ReloadPersonalTransactions()
+        {
+            if (_isClosing) return;
+
+            _personalTxTargetPubKey = NormalizeHex64(SpendPublicKeyTextBox?.Text);
+            Interlocked.Exchange(ref _personalTxReloadRequested, 1);
+            if (Interlocked.CompareExchange(ref _personalTxReloadWorkerRunning, 1, 0) != 0)
+                return;
+
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    while (!_isClosing)
+                    {
+                        if (Interlocked.Exchange(ref _personalTxReloadRequested, 0) == 0)
+                            break;
+
+                        string selectedPubKey = _personalTxTargetPubKey;
+                        var rows = BuildPersonalTxRowsSnapshot(selectedPubKey, out var headerText, out var errorMessage);
+                        if (_isClosing) break;
+
+                        try
+                        {
+                            Dispatcher.BeginInvoke(new Action(() =>
+                            {
+                                if (_isClosing) return;
+
+                                PersonalTxHeaderText.Text = headerText;
+                                _personalTxRows.Clear();
+                                for (int i = 0; i < rows.Count; i++)
+                                    _personalTxRows.Add(rows[i]);
+
+                                if (!string.IsNullOrWhiteSpace(errorMessage))
+                                    Warn("State", errorMessage);
+                            }));
+                        }
+                        catch
+                        {
+                        }
+                    }
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _personalTxReloadWorkerRunning, 0);
+                    if (!_isClosing && Volatile.Read(ref _personalTxReloadRequested) != 0)
+                        ReloadPersonalTransactions();
+                }
+            });
+        }
+
+        private List<PersonalTxRow> BuildPersonalTxRowsSnapshot(string selectedPubKey, out string headerText, out string? errorMessage)
+        {
+            errorMessage = null;
+            var rows = new List<PersonalTxRow>(256);
+
+            if (string.IsNullOrWhiteSpace(selectedPubKey))
+            {
+                headerText = "Select a key to view personal transactions.";
+                return rows;
+            }
+
+            if (Db.Connection == null)
+            {
+                headerText = $"Selected account: {selectedPubKey} (database not initialized yet).";
+                return rows;
+            }
+
+            ulong runningBalance = 0UL;
+
+            try
+            {
+                lock (Db.Sync)
+                {
+                    ulong tipHeight = BlockStore.GetLatestHeight();
+
+                    for (ulong h = 0; ; h++)
+                    {
+                        var hash = BlockStore.GetCanonicalHashAtHeight(h);
+                        if (hash is { Length: 32 })
+                        {
+                            var block = BlockStore.GetBlockByHash(hash);
+                            if (block?.Transactions is { Count: > 0 })
+                            {
+                                ulong blockTs = block.Header?.Timestamp ?? 0UL;
+                                for (int i = 0; i < block.Transactions.Count; i++)
+                                {
+                                    var tx = block.Transactions[i];
+                                    if (tx == null) continue;
+
+                                    string from = ToHex(tx.Sender);
+                                    string to = ToHex(tx.Recipient);
+                                    bool senderMatch = string.Equals(from, selectedPubKey, StringComparison.Ordinal);
+                                    bool recipientMatch = string.Equals(to, selectedPubKey, StringComparison.Ordinal);
+
+                                    if (!senderMatch && !recipientMatch)
+                                        continue;
+
+                                    if (TransactionValidator.IsCoinbase(tx))
+                                    {
+                                        if (recipientMatch)
+                                            runningBalance = AddU64Saturating(runningBalance, tx.Amount);
+                                    }
+                                    else
+                                    {
+                                        if (senderMatch)
+                                        {
+                                            if (TryAddU64(tx.Amount, tx.Fee, out var totalCost))
+                                            {
+                                                runningBalance = runningBalance >= totalCost
+                                                    ? runningBalance - totalCost
+                                                    : 0UL;
+                                            }
+                                            else
+                                            {
+                                                runningBalance = 0UL;
+                                            }
+                                        }
+
+                                        if (recipientMatch)
+                                            runningBalance = AddU64Saturating(runningBalance, tx.Amount);
+                                    }
+
+                                    rows.Add(new PersonalTxRow
+                                    {
+                                        TimestampUtc = SafeUnixToUtc(blockTs),
+                                        Type = senderMatch ? "sent" : "received",
+                                        From = from,
+                                        To = to,
+                                        AmountQado = QadoAmountParser.FormatNanoToQado(tx.Amount),
+                                        AmountForeground = senderMatch ? Brushes.Red : Brushes.Green,
+                                        FeeQado = QadoAmountParser.FormatNanoToQado(tx.Fee),
+                                        NewBalanceQado = QadoAmountParser.FormatNanoToQado(runningBalance),
+                                        Nonce = tx.TxNonce <= long.MaxValue ? (long)tx.TxNonce : long.MaxValue,
+                                        BlockTimestampUnix = blockTs,
+                                        BlockHeight = h,
+                                        TxIndex = i
+                                    });
+                                }
+                            }
+                        }
+
+                        if (h == tipHeight)
+                            break;
+                    }
+                }
+
+                rows.Sort(static (a, b) =>
+                {
+                    int c = b.BlockTimestampUnix.CompareTo(a.BlockTimestampUnix);
+                    if (c != 0) return c;
+
+                    c = b.Nonce.CompareTo(a.Nonce);
+                    if (c != 0) return c;
+
+                    c = b.BlockHeight.CompareTo(a.BlockHeight);
+                    if (c != 0) return c;
+
+                    return b.TxIndex.CompareTo(a.TxIndex);
+                });
+
+                headerText = $"Selected account: {selectedPubKey} ({rows.Count} confirmed tx).";
+            }
+            catch (Exception ex)
+            {
+                rows.Clear();
+                headerText = $"Selected account: {selectedPubKey}";
+                errorMessage = $"Load personal transactions failed: {ex.Message}";
+            }
+
+            return rows;
+        }
+
+        private static string NormalizeHex64(string? value)
+        {
+            var hex = (value ?? "").Trim().ToLowerInvariant();
+            if (hex.Length != 64) return "";
+
+            for (int i = 0; i < hex.Length; i++)
+            {
+                char c = hex[i];
+                bool isHex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+                if (!isHex) return "";
+            }
+
+            return hex;
+        }
+
+        private static bool IsZeroHex64(string hex)
+        {
+            if (hex is null || hex.Length != 64)
+                return false;
+
+            for (int i = 0; i < hex.Length; i++)
+            {
+                if (hex[i] != '0')
+                    return false;
+            }
+
+            return true;
+        }
+
         private List<AccountStateViewModel> BuildAccountRowsSnapshot(out string? errorMessage)
         {
             errorMessage = null;
@@ -1107,6 +1791,7 @@ LIMIT 200;";
         {
             public string Endpoint { get; set; } = "";
             public string LastSeenUtc { get; set; } = "";
+            public string LatencyMs { get; set; } = "-";
             public string Status { get; set; } = "";
         }
 
@@ -1145,6 +1830,28 @@ LIMIT 200;";
             public long Nonce { get; set; }
         }
 
+        public sealed class PersonalTxRow
+        {
+            public string TimestampUtc { get; set; } = "";
+            public string Type { get; set; } = "";
+            public string From { get; set; } = "";
+            public string To { get; set; } = "";
+            public string AmountQado { get; set; } = "";
+            public Brush AmountForeground { get; set; } = Brushes.Black;
+            public string FeeQado { get; set; } = "";
+            public string NewBalanceQado { get; set; } = "";
+            public long Nonce { get; set; }
+
+            public ulong BlockTimestampUnix { get; set; }
+            public ulong BlockHeight { get; set; }
+            public int TxIndex { get; set; }
+        }
+
+        public sealed class AddressBookRow
+        {
+            public string PublicKey { get; set; } = "";
+        }
+
         public void ShowBlockTransactions(Block block)
         {
             if (block == null) return;
@@ -1167,8 +1874,8 @@ LIMIT 200;";
                             Index = i,
                             From = Convert.ToHexString(tx.Sender).ToLowerInvariant(),
                             To = Convert.ToHexString(tx.Recipient).ToLowerInvariant(),
-                            AmountQado = QadoAmountParser.FormatNanoToQado(tx.Amount) + " QADO",
-                            FeeQado = QadoAmountParser.FormatNanoToQado(tx.Fee) + " QADO",
+                            AmountQado = QadoAmountParser.FormatNanoToQado(tx.Amount),
+                            FeeQado = QadoAmountParser.FormatNanoToQado(tx.Fee),
                             Nonce = tx.TxNonce <= long.MaxValue ? (long)tx.TxNonce : long.MaxValue
                         });
                     }
@@ -1377,8 +2084,8 @@ LIMIT 200;";
             {
                 From = ToHex(tx.Sender),
                 To = ToHex(tx.Recipient),
-                AmountQado = QadoAmountParser.FormatNanoToQado(tx.Amount) + " QADO",
-                FeeQado = QadoAmountParser.FormatNanoToQado(tx.Fee) + " QADO",
+                AmountQado = QadoAmountParser.FormatNanoToQado(tx.Amount),
+                FeeQado = QadoAmountParser.FormatNanoToQado(tx.Fee),
                 Nonce = tx.TxNonce
             };
         }
@@ -1485,6 +2192,37 @@ LIMIT 200;";
             {
                 return unixSeconds.ToString();
             }
+        }
+
+        private static string SafeUnixToUtc(ulong unixSeconds)
+        {
+            try
+            {
+                return DateTimeOffset.FromUnixTimeSeconds((long)unixSeconds)
+                    .UtcDateTime
+                    .ToString("yyyy-MM-dd HH:mm:ss 'UTC'");
+            }
+            catch
+            {
+                return unixSeconds.ToString();
+            }
+        }
+
+        private static bool TryAddU64(ulong a, ulong b, out ulong sum)
+        {
+            if (ulong.MaxValue - a < b)
+            {
+                sum = 0UL;
+                return false;
+            }
+
+            sum = a + b;
+            return true;
+        }
+
+        private static ulong AddU64Saturating(ulong a, ulong b)
+        {
+            return ulong.MaxValue - a < b ? ulong.MaxValue : a + b;
         }
 
         public void RefreshTip() => PrependNewBlocksOrReloadIfReorg();

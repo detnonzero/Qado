@@ -32,12 +32,8 @@ namespace Qado.Storage
                     if (hash is not { Length: 32 })
                         throw new InvalidOperationException($"canon missing at height {h}.");
 
-                    if (!TryGetLocationFromBlockIndex(hash, tx, out long off, out _))
-                        throw new InvalidOperationException($"block_index missing location for canon hash at height {h}.");
-
-                    var payload = BlockLog.ReadPayload(off, out var headerHash);
-                    if (headerHash is not { Length: 32 } || !BytesEqual(headerHash, hash))
-                        throw new InvalidOperationException($"BlockLog header hash mismatch at height {h}.");
+                    if (!TryGetPayload(hash, tx, out var payload))
+                        throw new InvalidOperationException($"block payload missing for canon hash at height {h}.");
 
                     var blk = BlockBinarySerializer.Read(payload);
                     blk.BlockHeight = h;
@@ -80,21 +76,20 @@ namespace Qado.Storage
             return true;
         }
 
-        private static bool TryGetLocationFromBlockIndex(byte[] hash, SqliteTransaction tx, out long recordOffset, out int recordSize)
+        private static bool TryGetPayload(byte[] hash, SqliteTransaction tx, out byte[] payload)
         {
-            recordOffset = 0;
-            recordSize = 0;
+            payload = Array.Empty<byte>();
 
             using var cmd = tx.Connection!.CreateCommand();
             cmd.Transaction = tx;
-            cmd.CommandText = "SELECT file_offset, file_size FROM block_index WHERE hash=$h LIMIT 1;";
+            cmd.CommandText = "SELECT payload FROM block_payloads WHERE hash=$h LIMIT 1;";
             cmd.Parameters.AddWithValue("$h", hash);
 
-            using var r = cmd.ExecuteReader();
-            if (!r.Read()) return false;
+            var v = cmd.ExecuteScalar() as byte[];
+            if (v is not { Length: > 0 })
+                return false;
 
-            recordOffset = r.GetInt64(0);
-            recordSize = r.GetInt32(1);
+            payload = (byte[])v.Clone();
             return true;
         }
 
@@ -113,6 +108,7 @@ namespace Qado.Storage
                 if (a[i] != b[i]) return false;
             return true;
         }
+
     }
 }
 

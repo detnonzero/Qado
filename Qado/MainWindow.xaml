@@ -3,7 +3,6 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Qado" Height="720" Width="1100"
         WindowStartupLocation="CenterScreen">
-
     <Grid Margin="12">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
@@ -152,6 +151,7 @@
 
                         <ListView x:Name="BlocksListView"
                                   Grid.Row="1"
+                                  SelectionMode="Extended"
                                   MouseDoubleClick="BlocksListView_MouseDoubleClick"
                                   ScrollViewer.VerticalScrollBarVisibility="Auto"
                                   ScrollViewer.HorizontalScrollBarVisibility="Auto">
@@ -176,14 +176,15 @@
                 <TabItem Header="Mempool">
                     <Grid Margin="10">
                         <ListView x:Name="MempoolListView"
+                                  SelectionMode="Extended"
                                   ScrollViewer.VerticalScrollBarVisibility="Auto"
                                   ScrollViewer.HorizontalScrollBarVisibility="Auto">
                             <ListView.View>
                                 <GridView>
                                     <GridViewColumn Header="From" DisplayMemberBinding="{Binding From}" Width="360"/>
                                     <GridViewColumn Header="To" DisplayMemberBinding="{Binding To}" Width="360"/>
-                                    <GridViewColumn Header="Amount" DisplayMemberBinding="{Binding AmountQado}" Width="140"/>
-                                    <GridViewColumn Header="Fee" DisplayMemberBinding="{Binding FeeQado}" Width="140"/>
+                                    <GridViewColumn Header="Amount (QADO)" DisplayMemberBinding="{Binding AmountQado}" Width="140"/>
+                                    <GridViewColumn Header="Fee (QADO)" DisplayMemberBinding="{Binding FeeQado}" Width="140"/>
                                     <GridViewColumn Header="Nonce" DisplayMemberBinding="{Binding Nonce}" Width="120"/>
                                 </GridView>
                             </ListView.View>
@@ -194,13 +195,15 @@
                 <TabItem Header="Peers">
                     <Grid Margin="10">
                         <ListView x:Name="PeersListView"
+                                  SelectionMode="Extended"
                                   ScrollViewer.VerticalScrollBarVisibility="Auto"
                                   ScrollViewer.HorizontalScrollBarVisibility="Auto">
                             <ListView.View>
                                 <GridView>
                                     <GridViewColumn Header="Endpoint" DisplayMemberBinding="{Binding Endpoint}" Width="300"/>
                                     <GridViewColumn Header="Last Seen (UTC)" DisplayMemberBinding="{Binding LastSeenUtc}" Width="200"/>
-                                    <GridViewColumn Header="Status" DisplayMemberBinding="{Binding Status}" Width="420"/>
+                                    <GridViewColumn Header="Latency (ms)" DisplayMemberBinding="{Binding LatencyMs}" Width="110"/>
+                                    <GridViewColumn Header="Status" DisplayMemberBinding="{Binding Status}" Width="320"/>
                                 </GridView>
                             </ListView.View>
                         </ListView>
@@ -210,12 +213,13 @@
                 <TabItem Header="State">
                     <Grid Margin="10">
                         <ListView x:Name="StateListView"
+                                  SelectionMode="Extended"
                                   ScrollViewer.VerticalScrollBarVisibility="Auto"
                                   ScrollViewer.HorizontalScrollBarVisibility="Auto">
                             <ListView.View>
                                 <GridView>
                                     <GridViewColumn Header="Public Key" DisplayMemberBinding="{Binding PublicKey}" Width="420"/>
-                                    <GridViewColumn Header="Balance" DisplayMemberBinding="{Binding BalanceFormatted}" Width="160"/>
+                                    <GridViewColumn Header="Balance (QADO)" DisplayMemberBinding="{Binding BalanceFormatted}" Width="160"/>
                                     <GridViewColumn Header="Nonce" DisplayMemberBinding="{Binding Nonce}" Width="120"/>
                                 </GridView>
                             </ListView.View>
@@ -238,6 +242,7 @@
 
                         <ListView x:Name="TxListView"
                                   Grid.Row="1"
+                                  SelectionMode="Extended"
                                   ScrollViewer.VerticalScrollBarVisibility="Auto"
                                   ScrollViewer.HorizontalScrollBarVisibility="Auto">
                             <ListView.View>
@@ -245,9 +250,100 @@
                                     <GridViewColumn Header="#" DisplayMemberBinding="{Binding Index}" Width="50"/>
                                     <GridViewColumn Header="From" DisplayMemberBinding="{Binding From}" Width="420"/>
                                     <GridViewColumn Header="To" DisplayMemberBinding="{Binding To}" Width="420"/>
-                                    <GridViewColumn Header="Amount" DisplayMemberBinding="{Binding AmountQado}" Width="140"/>
-                                    <GridViewColumn Header="Fee" DisplayMemberBinding="{Binding FeeQado}" Width="140"/>
+                                    <GridViewColumn Header="Amount (QADO)" DisplayMemberBinding="{Binding AmountQado}" Width="140"/>
+                                    <GridViewColumn Header="Fee (QADO)" DisplayMemberBinding="{Binding FeeQado}" Width="140"/>
                                     <GridViewColumn Header="Nonce" DisplayMemberBinding="{Binding Nonce}" Width="100"/>
+                                </GridView>
+                            </ListView.View>
+                        </ListView>
+                    </Grid>
+                </TabItem>
+
+                <TabItem Header="My Transactions">
+                    <Grid Margin="10">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                        </Grid.RowDefinitions>
+
+                        <TextBlock x:Name="PersonalTxHeaderText"
+                                   FontSize="16"
+                                   FontWeight="Bold"
+                                   Margin="0,0,0,8"
+                                   Text="Select a key to view personal transactions." />
+
+                        <ListView x:Name="PersonalTxListView"
+                                  Grid.Row="1"
+                                  SelectionMode="Extended"
+                                  ScrollViewer.VerticalScrollBarVisibility="Auto"
+                                  ScrollViewer.HorizontalScrollBarVisibility="Auto">
+                            <ListView.View>
+                                <GridView>
+                                    <GridViewColumn Header="Time" DisplayMemberBinding="{Binding TimestampUtc}" Width="170"/>
+                                    <GridViewColumn Header="Type" DisplayMemberBinding="{Binding Type}" Width="90"/>
+                                    <GridViewColumn Header="From" DisplayMemberBinding="{Binding From}" Width="320"/>
+                                    <GridViewColumn Header="To" DisplayMemberBinding="{Binding To}" Width="320"/>
+                                    <GridViewColumn Header="Amount (QADO)" Width="140">
+                                        <GridViewColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBlock Text="{Binding AmountQado}"
+                                                           Foreground="{Binding AmountForeground}"/>
+                                            </DataTemplate>
+                                        </GridViewColumn.CellTemplate>
+                                    </GridViewColumn>
+                                    <GridViewColumn Header="Fee (QADO)" DisplayMemberBinding="{Binding FeeQado}" Width="140"/>
+                                    <GridViewColumn Header="New Balance (QADO)" DisplayMemberBinding="{Binding NewBalanceQado}" Width="170"/>
+                                    <GridViewColumn Header="Nonce" DisplayMemberBinding="{Binding Nonce}" Width="100"/>
+                                </GridView>
+                            </ListView.View>
+                        </ListView>
+                    </Grid>
+                </TabItem>
+
+                <TabItem Header="Address Book">
+                    <Grid Margin="10">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                        </Grid.RowDefinitions>
+
+                        <StackPanel Orientation="Horizontal" Grid.Row="0" Margin="0,0,0,8">
+                            <TextBox x:Name="AddressBookInputTextBox"
+                                     Width="560"
+                                     VerticalAlignment="Center"/>
+                            <Button x:Name="AddressBookAddButton"
+                                    Content="Add Address"
+                                    Width="120"
+                                    Margin="8,0,0,0"/>
+                        </StackPanel>
+
+                        <TextBlock x:Name="AddressBookStatusText"
+                                   Grid.Row="1"
+                                   Margin="0,0,0,8"
+                                   Text="No addresses yet." />
+
+                        <ListView x:Name="AddressBookListView"
+                                  Grid.Row="2"
+                                  SelectionMode="Extended"
+                                  ScrollViewer.VerticalScrollBarVisibility="Auto"
+                                  ScrollViewer.HorizontalScrollBarVisibility="Auto">
+                            <ListView.View>
+                                <GridView>
+                                    <GridViewColumn Header="Public Key (hex32)" DisplayMemberBinding="{Binding PublicKey}" Width="640"/>
+                                    <GridViewColumn Header="" Width="70">
+                                        <GridViewColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <Button Content="Delete"
+                                                        Width="56"
+                                                        Height="22"
+                                                        Padding="4,0"
+                                                        FontSize="11"
+                                                        Tag="{Binding PublicKey}"
+                                                        Click="AddressBookDeleteButton_Click"/>
+                                            </DataTemplate>
+                                        </GridViewColumn.CellTemplate>
+                                    </GridViewColumn>
                                 </GridView>
                             </ListView.View>
                         </ListView>
@@ -265,6 +361,7 @@
 
                 <ListView x:Name="LogListView"
                           Grid.Row="0"
+                          SelectionMode="Extended"
                           ScrollViewer.VerticalScrollBarVisibility="Auto"
                           ScrollViewer.HorizontalScrollBarVisibility="Auto">
                     <ListView.View>

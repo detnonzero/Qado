@@ -1,5 +1,6 @@
 using System;
 using System.Net.Sockets;
+using System.Threading;
 
 namespace Qado.Networking
 {
@@ -17,6 +18,11 @@ namespace Qado.Networking
         public bool RemoteIsPublic { get; set; }
         public DateTime ConnectedUtc { get; } = DateTime.UtcNow;
         public DateTime LastMessageUtc { get; set; } = DateTime.UtcNow;
+        public long LastPingSentUnixMs { get; set; }
+        public int LastLatencyMs { get; set; } = -1;
+        public DateTime LastLatencyUpdatedUtc { get; set; } = DateTime.MinValue;
+        public int PingTimeoutStreak { get; set; }
+        public SemaphoreSlim SendLock { get; } = new(1, 1);
 
         public string SessionKey => RemoteEndpoint;
     }

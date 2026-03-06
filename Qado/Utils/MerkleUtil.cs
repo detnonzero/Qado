@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Security.Cryptography;
 using Qado.Blockchain;
 
 namespace Qado.Utils
@@ -68,7 +67,7 @@ namespace Qado.Utils
             Span<byte> input = stackalloc byte[1 + HashSize];
             input[0] = ConsensusRules.MerkleLeafDomainTag;
             leafHash.AsSpan(0, HashSize).CopyTo(input.Slice(1, HashSize));
-            return SHA256.HashData(input);
+            return Blake3Util.Hash(input);
         }
 
         private static byte[] HashNode(byte[] left, byte[] right)
@@ -80,7 +79,7 @@ namespace Qado.Utils
             input[0] = ConsensusRules.MerkleNodeDomainTag;
             left.AsSpan(0, HashSize).CopyTo(input.Slice(1, HashSize));
             right.AsSpan(0, HashSize).CopyTo(input.Slice(1 + HashSize, HashSize));
-            return SHA256.HashData(input);
+            return Blake3Util.Hash(input);
         }
 
         private static byte[] EnsureHash32(byte[]? value, string name)

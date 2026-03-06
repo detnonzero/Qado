@@ -20,16 +20,18 @@ namespace Qado.Networking
 
     public sealed class HeaderSyncManager : IDisposable
     {
-        public const int MaxHeaderSyncPeers = 2;
-        public const int MaxHeadersPerMessage = 144000;
+        public const int MaxHeaderSyncPeers = 1;
+        public const int MaxHeadersPerMessage = 10000;
         public const int MaxLocatorHashes = 64;
-        public static readonly TimeSpan HeaderResponseTimeout = TimeSpan.FromSeconds(60);
+        public static readonly TimeSpan HeaderResponseTimeout = TimeSpan.FromSeconds(12);
         public static readonly int MaxHeadersPayloadBytes = 4 + (MaxHeadersPerMessage * BlockHeader.PowHeaderSize);
 
         private const int MedianTimePastWindow = 11;
         private const int MaxFutureTimeDriftSeconds = 2 * 60 * 60;
         private const int RetargetWindowSolveTimes = 60;
         private const int RetargetMaxAdjustFactor = 2;
+        private static readonly TimeSpan HeaderLatencyFreshWindow = TimeSpan.FromMinutes(2);
+        private static readonly TimeSpan HeaderPeerQualityRetention = TimeSpan.FromHours(6);
 
         private readonly object _gate = new();
         private readonly Func<IReadOnlyCollection<PeerSession>> _sessionSnapshot;
@@ -46,8 +48,17 @@ namespace Qado.Networking
         private readonly Dictionary<string, DateTime> _awaitingByPeerKey = new(StringComparer.Ordinal);
         private bool _completed;
         private readonly HashSet<string> _noProgressPeerKeys = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, HeaderPeerQuality> _peerQualityByKey = new(StringComparer.Ordinal);
+        private string? _lastHeadersChunkPeerKey;
 
         private readonly record struct InboundHeadersFrame(string PeerKey, byte[] Payload);
+
+        private sealed class HeaderPeerQuality
+        {
+            public int SuccessCount;
+            public int FailureCount;
+            public DateTime LastUpdatedUtc = DateTime.UtcNow;
+        }
 
         private readonly record struct HeaderContext(
             byte[] Hash,
@@ -106,7 +117,7 @@ namespace Qado.Networking
 
         public void OnPeerReady(PeerSession peer)
         {
-            if (peer == null || !peer.RemoteIsPublic)
+            if (peer == null)
                 return;
 
             lock (_gate)
@@ -137,6 +148,7 @@ namespace Qado.Networking
                 _completed = false;
                 _awaitingByPeerKey.Clear();
                 _noProgressPeerKeys.Clear();
+                _lastHeadersChunkPeerKey = null;
             }
 
             if (changed)
@@ -156,8 +168,13 @@ namespace Qado.Networking
             lock (_gate)
             {
                 changed = _awaitingByPeerKey.Remove(key);
+                if (string.Equals(_lastHeadersChunkPeerKey, key, StringComparison.Ordinal))
+                    _lastHeadersChunkPeerKey = null;
                 if (changed)
+                {
                     _noProgressPeerKeys.Add(key);
+                    ReportHeaderPeerFailure_NoLock(key, DateTime.UtcNow);
+                }
             }
 
             if (changed)
@@ -167,9 +184,6 @@ namespace Qado.Networking
         public void OnHeaders(PeerSession peer, byte[] payload)
         {
             if (peer == null || payload == null || payload.Length == 0)
-                return;
-
-            if (!peer.RemoteIsPublic)
                 return;
 
             string key = NormalizePeerKey(peer.SessionKey);
@@ -346,8 +360,7 @@ namespace Qado.Networking
                     var current = FindPeerByKey(peers, kv.Key);
                     if (current == null ||
                         !current.HandshakeOk ||
-                        !current.Client.Connected ||
-                        !current.RemoteIsPublic)
+                        !current.Client.Connected)
                     {
                         staleKeys.Add(kv.Key);
                     }
@@ -373,20 +386,27 @@ namespace Qado.Networking
                     string key = timedOutKeys[i];
                     _awaitingByPeerKey.Remove(key);
                     _noProgressPeerKeys.Add(key);
+                    ReportHeaderPeerFailure_NoLock(key, now);
                     _log?.Warn("HeaderSync", $"headers timeout; rotating peer {key}.");
                 }
 
                 int slots = MaxHeaderSyncPeers - _awaitingByPeerKey.Count;
                 if (slots > 0)
                 {
-                    var selected = SelectPublicPeers(peers, slots, _noProgressPeerKeys, _awaitingByPeerKey.Keys);
+                    var selected = SelectPublicPeers(
+                        peers,
+                        slots,
+                        now,
+                        _noProgressPeerKeys,
+                        _awaitingByPeerKey.Keys,
+                        _lastHeadersChunkPeerKey);
                     for (int i = 0; i < selected.Count; i++)
                     {
                         var peer = selected[i];
                         string key = NormalizePeerKey(peer.SessionKey);
                         _awaitingByPeerKey[key] = now;
                         peersToQuery.Add((peer, key));
-                        _log?.Info("HeaderSync", $"selected public peer {peer.RemoteEndpoint}");
+                        _log?.Info("HeaderSync", $"selected sync peer {peer.RemoteEndpoint}");
                     }
                 }
 
@@ -478,6 +498,7 @@ namespace Qado.Networking
                             lock (_gate)
                             {
                                 _noProgressPeerKeys.Add(frame.PeerKey);
+                                ReportHeaderPeerFailure_NoLock(frame.PeerKey, DateTime.UtcNow);
                             }
                             _log?.Info("HeaderSync", $"no new headers from peer {frame.PeerKey}; rotating.");
                             RequestTick();
@@ -487,6 +508,8 @@ namespace Qado.Networking
                         lock (_gate)
                         {
                             _noProgressPeerKeys.Remove(frame.PeerKey);
+                            ReportHeaderPeerSuccess_NoLock(frame.PeerKey, DateTime.UtcNow);
+                            _lastHeadersChunkPeerKey = frame.PeerKey;
                         }
 
                         RequestTick();
@@ -512,6 +535,7 @@ namespace Qado.Networking
             {
                 _awaitingByPeerKey.Remove(peerKey);
                 _noProgressPeerKeys.Add(peerKey);
+                ReportHeaderPeerFailure_NoLock(peerKey, DateTime.UtcNow);
             }
 
             RequestTick();
@@ -702,11 +726,7 @@ namespace Qado.Networking
                 byte[] hash;
                 try
                 {
-                    hash = Argon2Util.ComputeHash(
-                        headerPow,
-                        memoryKb: ConsensusRules.PowMemoryKb,
-                        iterations: ConsensusRules.PowIterations,
-                        parallelism: ConsensusRules.PowParallelism);
+                    hash = Blake3Util.Hash(headerPow);
                 }
                 catch
                 {
@@ -809,7 +829,7 @@ namespace Qado.Networking
                     return false;
                 }
 
-                UInt128 chainwork = parent.Chainwork + ChainworkUtil.IncrementFromTarget(haveTarget);
+                UInt128 chainwork = ChainworkUtil.Add(parent.Chainwork, ChainworkUtil.IncrementFromTarget(haveTarget));
 
                 var ctx = new HeaderContext(
                     Hash: (byte[])hash.Clone(),
@@ -876,7 +896,7 @@ namespace Qado.Networking
             var merkle = bytes.Slice(o, 32).ToArray(); o += 32;
             ulong ts = BinaryPrimitives.ReadUInt64BigEndian(bytes.Slice(o, 8)); o += 8;
             var target = bytes.Slice(o, 32).ToArray(); o += 32;
-            uint nonce = BinaryPrimitives.ReadUInt32BigEndian(bytes.Slice(o, 4)); o += 4;
+            ulong nonce = BinaryPrimitives.ReadUInt64BigEndian(bytes.Slice(o, 8)); o += 8;
             var miner = bytes.Slice(o, 32).ToArray(); o += 32;
 
             if (o != BlockHeader.PowHeaderSize)
@@ -1088,11 +1108,13 @@ namespace Qado.Networking
             return true;
         }
 
-        private static List<PeerSession> SelectPublicPeers(
+        private List<PeerSession> SelectPublicPeers(
             IReadOnlyCollection<PeerSession> peers,
             int maxCount,
+            DateTime now,
             ISet<string>? excludedPeerKeys = null,
-            IEnumerable<string>? alreadySelectedPeerKeys = null)
+            IEnumerable<string>? alreadySelectedPeerKeys = null,
+            string? preferDifferentThanPeerKey = null)
         {
             var selected = new List<PeerSession>(Math.Max(0, maxCount));
             if (maxCount <= 0)
@@ -1102,9 +1124,10 @@ namespace Qado.Networking
             if (alreadySelectedPeerKeys != null)
                 skip = new HashSet<string>(alreadySelectedPeerKeys, StringComparer.Ordinal);
 
+            var candidates = new List<PeerSession>(peers.Count);
             foreach (var peer in peers)
             {
-                if (peer == null || !peer.HandshakeOk || !peer.Client.Connected || !peer.RemoteIsPublic)
+                if (peer == null || !peer.HandshakeOk || !peer.Client.Connected)
                     continue;
 
                 string key = NormalizePeerKey(peer.SessionKey);
@@ -1113,12 +1136,148 @@ namespace Qado.Networking
                 if (skip != null && skip.Contains(key))
                     continue;
 
-                selected.Add(peer);
-                if (selected.Count >= maxCount)
-                    break;
+                candidates.Add(peer);
             }
 
+            PrunePeerQuality_NoLock(now);
+
+            candidates.Sort((a, b) =>
+            {
+                string ak = NormalizePeerKey(a.SessionKey);
+                string bk = NormalizePeerKey(b.SessionKey);
+
+                int qa = GetPeerQualitySortKey_NoLock(ak);
+                int qb = GetPeerQualitySortKey_NoLock(bk);
+                int cmp = qb.CompareTo(qa); // higher quality first
+                if (cmp != 0)
+                    return cmp;
+
+                int la = GetPeerLatencySortKey(a, now);
+                int lb = GetPeerLatencySortKey(b, now);
+                cmp = la.CompareTo(lb); // lower latency first
+                if (cmp != 0)
+                    return cmp;
+
+                cmp = a.ConnectedUtc.CompareTo(b.ConnectedUtc); // older session first
+                if (cmp != 0)
+                    return cmp;
+
+                return string.CompareOrdinal(ak, bk);
+            });
+
+            string avoidKey = string.IsNullOrWhiteSpace(preferDifferentThanPeerKey)
+                ? string.Empty
+                : NormalizePeerKey(preferDifferentThanPeerKey);
+
+            if (!string.IsNullOrEmpty(avoidKey) && candidates.Count > 1)
+            {
+                int preferredIdx = -1;
+                for (int i = 0; i < candidates.Count; i++)
+                {
+                    if (!string.Equals(NormalizePeerKey(candidates[i].SessionKey), avoidKey, StringComparison.Ordinal))
+                    {
+                        preferredIdx = i;
+                        break;
+                    }
+                }
+
+                if (preferredIdx > 0)
+                {
+                    var preferred = candidates[preferredIdx];
+                    candidates.RemoveAt(preferredIdx);
+                    candidates.Insert(0, preferred);
+                }
+            }
+
+            for (int i = 0; i < candidates.Count && selected.Count < maxCount; i++)
+                selected.Add(candidates[i]);
+
             return selected;
+        }
+
+        private static int GetPeerLatencySortKey(PeerSession peer, DateTime now)
+        {
+            if (peer == null)
+                return int.MaxValue;
+
+            if (peer.LastLatencyMs < 0 || peer.LastLatencyUpdatedUtc == DateTime.MinValue)
+                return int.MaxValue;
+
+            if ((now - peer.LastLatencyUpdatedUtc) > HeaderLatencyFreshWindow)
+                return int.MaxValue;
+
+            return peer.LastLatencyMs;
+        }
+
+        private int GetPeerQualitySortKey_NoLock(string peerKey)
+        {
+            if (string.IsNullOrWhiteSpace(peerKey))
+                return 5000; // unknown peers are neutral
+
+            if (!_peerQualityByKey.TryGetValue(peerKey, out var q))
+                return 5000;
+
+            int s = Math.Max(0, q.SuccessCount);
+            int f = Math.Max(0, q.FailureCount);
+            int num = s + 1;
+            int den = s + f + 2;
+            if (den <= 0)
+                return 5000;
+
+            return (int)((10_000L * num) / den);
+        }
+
+        private void ReportHeaderPeerSuccess_NoLock(string peerKey, DateTime now)
+        {
+            if (string.IsNullOrWhiteSpace(peerKey))
+                return;
+
+            if (!_peerQualityByKey.TryGetValue(peerKey, out var q))
+            {
+                q = new HeaderPeerQuality();
+                _peerQualityByKey[peerKey] = q;
+            }
+
+            q.SuccessCount = Math.Min(q.SuccessCount + 1, 10_000);
+            if (q.FailureCount > 0)
+                q.FailureCount--;
+            q.LastUpdatedUtc = now;
+
+            PrunePeerQuality_NoLock(now);
+        }
+
+        private void ReportHeaderPeerFailure_NoLock(string peerKey, DateTime now)
+        {
+            if (string.IsNullOrWhiteSpace(peerKey))
+                return;
+
+            if (!_peerQualityByKey.TryGetValue(peerKey, out var q))
+            {
+                q = new HeaderPeerQuality();
+                _peerQualityByKey[peerKey] = q;
+            }
+
+            q.FailureCount = Math.Min(q.FailureCount + 1, 10_000);
+            q.LastUpdatedUtc = now;
+
+            PrunePeerQuality_NoLock(now);
+        }
+
+        private void PrunePeerQuality_NoLock(DateTime now)
+        {
+            if (_peerQualityByKey.Count == 0)
+                return;
+
+            var cutoff = now - HeaderPeerQualityRetention;
+            var remove = new List<string>();
+            foreach (var kv in _peerQualityByKey)
+            {
+                if (kv.Value.LastUpdatedUtc < cutoff)
+                    remove.Add(kv.Key);
+            }
+
+            for (int i = 0; i < remove.Count; i++)
+                _peerQualityByKey.Remove(remove[i]);
         }
 
         private static PeerSession? FindPeerByKey(IReadOnlyCollection<PeerSession> peers, string peerKey)
@@ -1139,11 +1298,30 @@ namespace Qado.Networking
         {
             chain = new List<BlockIndexStore.HeaderRecord>();
 
-            if (!BlockIndexStore.TryGetBestHeaderTip(out var tip, out _, out _))
+            if (BlockIndexStore.TryGetBestHeaderTip(out var bestHeaderTip, out _, out _) &&
+                TryBuildChainFromTip(bestHeaderTip, out chain))
+            {
+                return true;
+            }
+
+            // Recovery fallback: keep sync alive even when the global "best header" pointer is temporarily inconsistent.
+            if (BlockIndexStore.TryGetBestValidatedTip(out var bestValidatedTip, out _, out _) &&
+                TryBuildChainFromTip(bestValidatedTip, out chain))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryBuildChainFromTip(byte[] tipHash, out List<BlockIndexStore.HeaderRecord> chain)
+        {
+            chain = new List<BlockIndexStore.HeaderRecord>();
+            if (tipHash is not { Length: 32 })
                 return false;
 
             var reverse = new List<BlockIndexStore.HeaderRecord>();
-            var cur = tip;
+            var cur = tipHash;
             int guard = 0;
 
             while (cur is { Length: 32 })
@@ -1165,8 +1343,11 @@ namespace Qado.Networking
             }
 
             reverse.Reverse();
+            if (reverse.Count == 0)
+                return false;
+
             chain = reverse;
-            return chain.Count > 0;
+            return true;
         }
 
         private static bool TryLoadHeaderPowBytes(byte[] hash, out byte[] headerPowBytes)

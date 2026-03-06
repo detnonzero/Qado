@@ -15,7 +15,7 @@ namespace Qado.Blockchain
 
         private static readonly byte[] GENESIS_TARGET = Convert.FromHexString(NetworkParams.GenesisTargetHex);
 
-        private const uint GENESIS_NONCE = NetworkParams.GenesisNonce;
+        private const ulong GENESIS_NONCE = NetworkParams.GenesisNonce;
         private const uint GENESIS_CHAIN_ID = NetworkParams.ChainId;
 
         private static readonly ulong GENESIS_COINBASE_AMOUNT = RewardCalculator.GetBlockSubsidy(0);
@@ -159,7 +159,7 @@ namespace Qado.Blockchain
                         throw new InvalidOperationException("Canonical genesis hash mismatch (rechecked in tx).");
                     }
 
-                    var stored = BlockStore.GetBlockByHash(canon0Again);
+                    var stored = BlockStore.GetBlockByHash(canon0Again, tx);
                     if (stored == null)
                     {
                         tx.Rollback();

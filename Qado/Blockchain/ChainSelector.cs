@@ -24,6 +24,22 @@ namespace Qado.Blockchain
         private static readonly object PrefetchFailureGate = new();
         private static DateTime _prefetchFailureCooldownUntilUtc = DateTime.MinValue;
         private static readonly TimeSpan PrefetchFailureCooldown = TimeSpan.FromSeconds(3);
+        private static readonly object MissingCandidateGate = new();
+        private static readonly Dictionary<string, MissingCandidateState> MissingCandidateByHash = new(StringComparer.Ordinal);
+        private static readonly TimeSpan MissingCandidateBackoffBase = TimeSpan.FromSeconds(5);
+        private static readonly TimeSpan MissingCandidateBackoffCap = TimeSpan.FromMinutes(2);
+        private static readonly TimeSpan MissingCandidateStateRetention = TimeSpan.FromMinutes(15);
+        private const int MaxMissingCandidateEntries = 65_536;
+        private static readonly object MissingPayloadRecoveryGate = new();
+        private static DateTime _nextMissingPayloadRecoveryAllowedUtc = DateTime.MinValue;
+        private static readonly TimeSpan MissingPayloadRecoveryCooldown = TimeSpan.FromSeconds(15);
+
+        private sealed class MissingCandidateState
+        {
+            public int MissStreak;
+            public DateTime NextRetryUtc = DateTime.MinValue;
+            public DateTime LastSeenUtc = DateTime.MinValue;
+        }
 
         public static void MaybeAdoptNewTip(byte[] candidateTipHash, ILogSink? log = null, MempoolManager? mempool = null)
         {
@@ -62,8 +78,6 @@ namespace Qado.Blockchain
             if (currentWork != 0 && candidateWork <= currentWork)
                 return;
 
-            log?.Warn("ChainSel", $"Adopting stronger chain (oldTip={ToHex(canonTipHash, 16)} -> newTip={ToHex(candidateTipHash, 16)}).");
-
             if (!TryBuildCandidateHeightMap(candidateTipHash, out var candTipHeight, out var candByHeight, log))
             {
                 log?.Warn("ChainSel", "Failed to build candidate chain map; skipping adoption.");
@@ -84,6 +98,14 @@ namespace Qado.Blockchain
                 }
                 newCanonAsc.Add((h, hashAtH));
             }
+
+            if (IsMissingCandidateBlocked_NoThrow(newCanonAsc, out _, out _, out _))
+            {
+                RememberAdoptionCooldown_NoThrow(candidateTipHash);
+                return;
+            }
+
+            log?.Warn("ChainSel", $"Adopting stronger chain (oldTip={ToHex(canonTipHash, 16)} -> newTip={ToHex(candidateTipHash, 16)}).");
 
             ulong rollbackTop = canonTipHeight;
 
@@ -114,7 +136,7 @@ namespace Qado.Blockchain
                     return;
                 }
 
-                    _ = TryPrefetchBlocksDescending(oldCanonDesc, out oldBlocksDesc, log);
+                    _ = TryPrefetchBlocksDescending(oldCanonDesc, tx, out oldBlocksDesc, log);
 
                     for (int i = 0; i < oldCanonDesc.Count; i++)
                         StateUndoStore.RollbackBlock(oldCanonDesc[i], tx);
@@ -223,6 +245,7 @@ namespace Qado.Blockchain
 
         private static bool TryPrefetchBlocksDescending(
             List<byte[]> hashesDesc,
+            SqliteTransaction tx,
             out List<Block> blocksDesc,
             ILogSink? log)
         {
@@ -233,7 +256,7 @@ namespace Qado.Blockchain
                 var h = hashesDesc[i];
                 if (h is not { Length: 32 }) continue;
 
-                var b = BlockStore.GetBlockByHash(h);
+                var b = BlockStore.GetBlockByHash(h, tx);
                 if (b == null)
                 {
                     log?.Warn("ChainSel", $"Missing old canonical block payload ({ToHex(h, 16)}).");
@@ -262,9 +285,13 @@ namespace Qado.Blockchain
                 var b = BlockStore.GetBlockByHash(hash);
                 if (b == null)
                 {
+                    NoteMissingCandidate_NoThrow(hash);
                     log?.Warn("ChainSel", $"Missing candidate block payload for height {h} ({ToHex(hash, 16)}).");
+                    TriggerMissingPayloadRecovery_NoThrow(log, hash);
                     return false;
                 }
+
+                ClearMissingCandidate_NoThrow(hash);
 
                 b.BlockHeight = h;
                 b.BlockHash = (byte[])hash.Clone();
@@ -609,13 +636,182 @@ namespace Qado.Blockchain
 
             try
             {
-                _ = BlockIndexStore.MarkBadAndDescendants(blockHash, (int)BadChainReason.BlockStateInvalid);
-                log?.Warn("ChainSel", $"Marked block as state-invalid: {ToHex(blockHash, 16)}");
+                // In early-stage networks, transient/incomplete data is common.
+                // Keep invalidation local to the single block to avoid branch-wide poisoning.
+                _ = BlockIndexStore.MarkBadSelf(blockHash, (int)BadChainReason.BlockStateInvalid);
+                log?.Warn("ChainSel", $"Marked block as state-invalid (self-only): {ToHex(blockHash, 16)}");
             }
             catch (Exception ex)
             {
                 log?.Warn("ChainSel", $"Failed to mark state-invalid block: {ex.Message}");
             }
+        }
+
+        private static bool IsMissingCandidateBlocked_NoThrow(
+            List<(ulong Height, byte[] Hash)> mappingAsc,
+            out ulong blockedHeight,
+            out byte[]? blockedHash,
+            out TimeSpan remaining)
+        {
+            blockedHeight = 0;
+            blockedHash = null;
+            remaining = TimeSpan.Zero;
+
+            if (mappingAsc == null || mappingAsc.Count == 0)
+                return false;
+
+            try
+            {
+                lock (MissingCandidateGate)
+                {
+                    var now = DateTime.UtcNow;
+                    PruneMissingCandidate_NoThrow(now);
+
+                    for (int i = 0; i < mappingAsc.Count; i++)
+                    {
+                        var (h, hash) = mappingAsc[i];
+                        if (hash is not { Length: 32 })
+                            continue;
+
+                        string key = Hex(hash);
+                        if (!MissingCandidateByHash.TryGetValue(key, out var state))
+                            continue;
+
+                        if (state.NextRetryUtc <= now)
+                            continue;
+
+                        blockedHeight = h;
+                        blockedHash = (byte[])hash.Clone();
+                        remaining = state.NextRetryUtc - now;
+                        return true;
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            return false;
+        }
+
+        private static void NoteMissingCandidate_NoThrow(byte[] hash)
+        {
+            if (hash is not { Length: 32 })
+                return;
+
+            try
+            {
+                lock (MissingCandidateGate)
+                {
+                    var now = DateTime.UtcNow;
+                    string key = Hex(hash);
+
+                    if (!MissingCandidateByHash.TryGetValue(key, out var state))
+                    {
+                        state = new MissingCandidateState();
+                        MissingCandidateByHash[key] = state;
+                    }
+
+                    if (state.LastSeenUtc != DateTime.MinValue &&
+                        (now - state.LastSeenUtc) > TimeSpan.FromMinutes(2))
+                    {
+                        state.MissStreak = 0;
+                    }
+
+                    state.MissStreak = Math.Min(state.MissStreak + 1, 16);
+                    state.LastSeenUtc = now;
+                    state.NextRetryUtc = now + ComputeMissingCandidateBackoff(state.MissStreak);
+
+                    PruneMissingCandidate_NoThrow(now);
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private static void ClearMissingCandidate_NoThrow(byte[] hash)
+        {
+            if (hash is not { Length: 32 })
+                return;
+
+            try
+            {
+                lock (MissingCandidateGate)
+                {
+                    MissingCandidateByHash.Remove(Hex(hash));
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private static void TriggerMissingPayloadRecovery_NoThrow(ILogSink? log, byte[] hash)
+        {
+            try
+            {
+                bool shouldTrigger = false;
+                lock (MissingPayloadRecoveryGate)
+                {
+                    var now = DateTime.UtcNow;
+                    if (now >= _nextMissingPayloadRecoveryAllowedUtc)
+                    {
+                        _nextMissingPayloadRecoveryAllowedUtc = now + MissingPayloadRecoveryCooldown;
+                        shouldTrigger = true;
+                    }
+                }
+
+                if (!shouldTrigger)
+                    return;
+
+                _ = Task.Run(() =>
+                {
+                    try { P2PNode.Instance?.RequestSyncNow("chainsel-missing-candidate-payload"); } catch { }
+                });
+
+                log?.Warn("Sync", $"Recovery sync requested for missing candidate payload {ToHex(hash, 16)}.");
+            }
+            catch
+            {
+            }
+        }
+
+        private static TimeSpan ComputeMissingCandidateBackoff(int missStreak)
+        {
+            int exp = Math.Clamp(missStreak - 1, 0, 6);
+            long factor = 1L << exp;
+            long ticks = MissingCandidateBackoffBase.Ticks * factor;
+            if (ticks <= 0 || ticks > MissingCandidateBackoffCap.Ticks)
+                ticks = MissingCandidateBackoffCap.Ticks;
+            return new TimeSpan(ticks);
+        }
+
+        private static void PruneMissingCandidate_NoThrow(DateTime now)
+        {
+            if (MissingCandidateByHash.Count == 0)
+                return;
+
+            var cutoff = now - MissingCandidateStateRetention;
+            var stale = new List<string>();
+            foreach (var kv in MissingCandidateByHash)
+            {
+                var s = kv.Value;
+                if (s.LastSeenUtc < cutoff && s.NextRetryUtc <= now)
+                    stale.Add(kv.Key);
+            }
+
+            for (int i = 0; i < stale.Count; i++)
+                MissingCandidateByHash.Remove(stale[i]);
+
+            if (MissingCandidateByHash.Count <= MaxMissingCandidateEntries)
+                return;
+
+            var ordered = new List<KeyValuePair<string, MissingCandidateState>>(MissingCandidateByHash);
+            ordered.Sort((a, b) => a.Value.LastSeenUtc.CompareTo(b.Value.LastSeenUtc));
+            int overflow = MissingCandidateByHash.Count - MaxMissingCandidateEntries;
+            for (int i = 0; i < overflow && i < ordered.Count; i++)
+                MissingCandidateByHash.Remove(ordered[i].Key);
         }
 
         private static bool IsInPrefetchFailureCooldown(out TimeSpan remaining)

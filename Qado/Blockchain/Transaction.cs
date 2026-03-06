@@ -1,8 +1,8 @@
 using System;
 using System.Buffers.Binary;
-using System.Security.Cryptography;
 using Qado.Networking;
 using Qado.Serialization;
+using Qado.Utils;
 
 namespace Qado.Blockchain
 {
@@ -48,7 +48,7 @@ namespace Qado.Blockchain
         }
 
         public byte[] ComputeTransactionHash()
-            => SHA256.HashData(ToBytes());
+            => Blake3Util.Hash(ToBytes());
 
         public void ValidateBasicOrThrow()
         {

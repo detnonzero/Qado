@@ -96,13 +96,14 @@ ON CONFLICT(hash) DO UPDATE SET
             }
         }
 
-        public static (int fileId, long recordOffset, int recordSize)? GetLocation(byte[] hash)
+        public static (int fileId, long recordOffset, int recordSize)? GetLocation(byte[] hash, SqliteTransaction? tx = null)
         {
             if (hash is not { Length: 32 }) return null;
 
             lock (Db.Sync)
             {
-                using var cmd = Conn.CreateCommand();
+                using var cmd = (tx?.Connection ?? Conn).CreateCommand();
+                cmd.Transaction = tx;
                 cmd.CommandText = "SELECT file_id, file_offset, file_size FROM block_index WHERE hash=$h LIMIT 1;";
                 cmd.Parameters.AddWithValue("$h", hash);
                 using var r = cmd.ExecuteReader();
@@ -161,7 +162,7 @@ ON CONFLICT(hash) DO UPDATE SET
             }
         }
 
-        public static bool TryGetMeta(byte[] hash, out ulong height, out byte[] prevHash, out UInt128 chainwork)
+        public static bool TryGetMeta(byte[] hash, out ulong height, out byte[] prevHash, out UInt128 chainwork, SqliteTransaction? tx = null)
         {
             height = 0;
             prevHash = new byte[32];
@@ -171,7 +172,8 @@ ON CONFLICT(hash) DO UPDATE SET
 
             lock (Db.Sync)
             {
-                using var cmd = Conn.CreateCommand();
+                using var cmd = (tx?.Connection ?? Conn).CreateCommand();
+                cmd.Transaction = tx;
                 cmd.CommandText = "SELECT height, prev_hash, chainwork FROM block_index WHERE hash=$h LIMIT 1;";
                 cmd.Parameters.AddWithValue("$h", hash);
 
@@ -290,7 +292,7 @@ SELECT hash, height, chainwork
 FROM block_index
 WHERE is_bad = 0
   AND bad_ancestor = 0
-ORDER BY chainwork DESC, hash ASC
+ORDER BY chainwork DESC, height DESC, ts DESC, hash ASC
 LIMIT 1;";
                 using var r = cmd.ExecuteReader();
                 if (!r.Read())
@@ -573,6 +575,30 @@ WHERE (is_bad <> 0 OR bad_ancestor <> 0)
                 cmd.Transaction = tx;
                 cmd.CommandText = "UPDATE block_index SET status=$st WHERE hash=$h;";
                 cmd.Parameters.AddWithValue("$st", statusFlags);
+                cmd.Parameters.AddWithValue("$h", hash);
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        public static void MarkPayloadMissing(byte[] hash, SqliteTransaction? tx = null)
+        {
+            if (hash is not { Length: 32 }) throw new ArgumentException("hash must be 32 bytes", nameof(hash));
+
+            lock (Db.Sync)
+            {
+                using var cmd = (tx?.Connection ?? Conn).CreateCommand();
+                cmd.Transaction = tx;
+                cmd.CommandText = @"
+UPDATE block_index
+SET file_id = -1,
+    file_offset = -1,
+    file_size = 0,
+    status = CASE
+        WHEN is_bad <> 0 OR bad_ancestor <> 0 THEN status
+        ELSE $headerOnly
+    END
+WHERE hash = $h;";
+                cmd.Parameters.AddWithValue("$headerOnly", StatusHeaderOnly);
                 cmd.Parameters.AddWithValue("$h", hash);
                 cmd.ExecuteNonQuery();
             }

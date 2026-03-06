@@ -17,7 +17,7 @@ namespace Qado.Blockchain
 
         public const int TxLengthPrefixBytes = 4;
 
-        public const int TargetMaxBlockSizeBytes = 18045;
+        public const int TargetMaxBlockSizeBytes = 18049;
 
         public const int MaxTransactionSizeBytes =
             (TargetMaxBlockSizeBytes - BlockHeaderSizeBytes - (MaxTransactionsPerBlock * TxLengthPrefixBytes))
