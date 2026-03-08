@@ -63,8 +63,6 @@ namespace Qado.Storage
 
                 BlockStore.SetCanonicalHashAtHeight(newHeight, block.BlockHash!, tx);
                 BlockIndexStore.SetStatus(block.BlockHash!, BlockIndexStore.StatusCanonicalStateValidated, tx);
-                MetaStore.Set("LatestBlockHash", Convert.ToHexString(block.BlockHash!).ToLowerInvariant(), tx);
-                MetaStore.Set("LatestHeight", newHeight.ToString(), tx);
 
             return true;
         }

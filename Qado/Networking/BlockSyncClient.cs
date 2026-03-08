@@ -15,7 +15,7 @@ namespace Qado.Networking
 
     public readonly record struct BlockSyncPrepareResult(bool Success, string Error);
 
-    public readonly record struct BlockSyncCommitResult(bool Success, byte[] BlockHash, string Error);
+    public readonly record struct BlockSyncChunkCommitResult(bool Success, byte[] LastBlockHash, string Error);
 
     public sealed class BlockSyncClient : IDisposable
     {
@@ -28,7 +28,7 @@ namespace Qado.Networking
         private readonly Func<UInt128> _getLocalTipChainwork;
         private readonly Func<byte[]> _getLocalTipHash;
         private readonly Func<byte[], ulong, UInt128, PeerSession, CancellationToken, Task<BlockSyncPrepareResult>> _prepareBatchAsync;
-        private readonly Func<byte[], ulong, byte[], PeerSession, CancellationToken, Task<BlockSyncCommitResult>> _commitBlockAsync;
+        private readonly Func<IReadOnlyList<byte[]>, ulong, byte[], PeerSession, CancellationToken, Task<BlockSyncChunkCommitResult>> _commitChunkAsync;
         private readonly Func<PeerSession, BlocksEndStatus, CancellationToken, Task> _completeBatchAsync;
         private readonly Func<PeerSession?, string, CancellationToken, Task> _abortBatchAsync;
         private readonly Action<PeerSession, string>? _penalizePeer;
@@ -56,7 +56,7 @@ namespace Qado.Networking
             Func<UInt128> getLocalTipChainwork,
             Func<byte[]> getLocalTipHash,
             Func<byte[], ulong, UInt128, PeerSession, CancellationToken, Task<BlockSyncPrepareResult>> prepareBatchAsync,
-            Func<byte[], ulong, byte[], PeerSession, CancellationToken, Task<BlockSyncCommitResult>> commitBlockAsync,
+            Func<IReadOnlyList<byte[]>, ulong, byte[], PeerSession, CancellationToken, Task<BlockSyncChunkCommitResult>> commitChunkAsync,
             Func<PeerSession, BlocksEndStatus, CancellationToken, Task> completeBatchAsync,
             Func<PeerSession?, string, CancellationToken, Task> abortBatchAsync,
             Action<PeerSession, string>? penalizePeer = null,
@@ -67,7 +67,7 @@ namespace Qado.Networking
             _getLocalTipChainwork = getLocalTipChainwork ?? throw new ArgumentNullException(nameof(getLocalTipChainwork));
             _getLocalTipHash = getLocalTipHash ?? throw new ArgumentNullException(nameof(getLocalTipHash));
             _prepareBatchAsync = prepareBatchAsync ?? throw new ArgumentNullException(nameof(prepareBatchAsync));
-            _commitBlockAsync = commitBlockAsync ?? throw new ArgumentNullException(nameof(commitBlockAsync));
+            _commitChunkAsync = commitChunkAsync ?? throw new ArgumentNullException(nameof(commitChunkAsync));
             _completeBatchAsync = completeBatchAsync ?? throw new ArgumentNullException(nameof(completeBatchAsync));
             _abortBatchAsync = abortBatchAsync ?? throw new ArgumentNullException(nameof(abortBatchAsync));
             _penalizePeer = penalizePeer;
@@ -245,24 +245,21 @@ namespace Qado.Networking
                 }
             }
 
-            for (int i = 0; i < frame.Blocks.Count; i++)
+            var commit = await _commitChunkAsync(
+                frame.Blocks,
+                expectedHeight,
+                expectedPrevHash,
+                peer,
+                ct).ConfigureAwait(false);
+
+            if (!commit.Success || commit.LastBlockHash is not { Length: 32 })
             {
-                var commit = await _commitBlockAsync(
-                    frame.Blocks[i],
-                    expectedHeight,
-                    expectedPrevHash,
-                    peer,
-                    ct).ConfigureAwait(false);
-
-                if (!commit.Success || commit.BlockHash is not { Length: 32 })
-                {
-                    await HandleBatchFailureAsync(peer, $"commit failed: {commit.Error}", forceLocator: true, ct).ConfigureAwait(false);
-                    return;
-                }
-
-                expectedPrevHash = SafeCloneHash(commit.BlockHash);
-                expectedHeight++;
+                await HandleBatchFailureAsync(peer, $"commit failed: {commit.Error}", forceLocator: true, ct).ConfigureAwait(false);
+                return;
             }
+
+            expectedPrevHash = SafeCloneHash(commit.LastBlockHash);
+            expectedHeight += (ulong)frame.Blocks.Count;
 
             lock (_gate)
             {

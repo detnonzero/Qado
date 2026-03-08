@@ -42,9 +42,6 @@ namespace Qado.Storage
                     StateApplier.ApplyBlock(blk, tx);
                 }
 
-                MetaStore.Set("LatestBlockHash", Convert.ToHexString(tipHash).ToLowerInvariant(), tx);
-                MetaStore.Set("LatestHeight", tipHeight.ToString(), tx);
-
                 tx.Commit();
             }
 

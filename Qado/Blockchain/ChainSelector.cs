@@ -164,9 +164,6 @@ namespace Qado.Blockchain
                         }
                     }
 
-                    MetaStore.Set("LatestBlockHash", Hex(candidateTipHash), tx);
-                    MetaStore.Set("LatestHeight", candTipHeight.ToString(), tx);
-
                     tx.Commit();
                     ClearAdoptionCooldown_NoThrow(candidateTipHash);
                     log?.Info("ChainSel", $"Adopted tip {ToHex(candidateTipHash, 16)} @ height {candTipHeight} (fromHeight={fromHeight}).");

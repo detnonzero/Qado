@@ -33,8 +33,7 @@ CREATE TABLE IF NOT EXISTS peers(
   id        BLOB(32) PRIMARY KEY,
   ip        TEXT NOT NULL,
   port      INTEGER NOT NULL,
-  last_seen INTEGER NOT NULL,
-  pubkey    BLOB(32)
+  last_seen INTEGER NOT NULL
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_peers_last_seen    ON peers(last_seen DESC);
 CREATE INDEX IF NOT EXISTS idx_peers_ip_last_seen ON peers(ip, last_seen DESC);
@@ -80,18 +79,10 @@ CREATE TABLE IF NOT EXISTS block_index(
   target      BLOB(32) NOT NULL,
   miner       BLOB(32) NOT NULL,
   chainwork   BLOB(16) NOT NULL,
-  file_id     INTEGER NOT NULL,
-  file_offset INTEGER NOT NULL,
-  file_size   INTEGER NOT NULL,
   status      INTEGER NOT NULL,
   is_bad      INTEGER NOT NULL DEFAULT 0,
   bad_reason  INTEGER NOT NULL DEFAULT 0,
   bad_ancestor INTEGER NOT NULL DEFAULT 0
-) WITHOUT ROWID;
-
-CREATE TABLE IF NOT EXISTS header_store(
-  hash   BLOB(32) PRIMARY KEY,
-  header BLOB NOT NULL
 ) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS block_payloads(
@@ -132,9 +123,8 @@ CREATE INDEX IF NOT EXISTS idx_tx_txid   ON tx_index(txid);
 
             RequireColumns(tx, "block_index", new[]
             {
-                "hash","prev_hash","height","ts","target","miner","chainwork","file_id","file_offset","file_size","status","is_bad","bad_reason","bad_ancestor"
+                "hash","prev_hash","height","ts","target","miner","chainwork","status","is_bad","bad_reason","bad_ancestor"
             });
-            RequireColumns(tx, "header_store", new[] { "hash", "header" });
             RequireColumns(tx, "block_payloads", new[] { "hash", "payload" });
 
             RequireColumns(tx, "canon", new[] { "height", "hash" });

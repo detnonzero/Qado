@@ -55,6 +55,23 @@ namespace Qado.Blockchain
                 tx: tx,
                 out reason);
 
+        public static bool ValidateNetworkTipBlock(
+            Block block,
+            Block canonicalTip,
+            Func<ulong, Block?> getCanonicalBlockByHeight,
+            out string reason,
+            SqliteTransaction? tx = null)
+            => ValidateCommon(
+                block,
+                strictTxChecks: true,
+                requirePrevKnown: true,
+                enforceTipExtending: true,
+                validateStateAgainstCanonical: true,
+                tx: tx,
+                out reason,
+                canonicalTipOverride: canonicalTip,
+                getCanonicalBlockByHeightOverride: getCanonicalBlockByHeight);
+
         public static bool ValidateNetworkSideBlockStateless(Block block, out string reason, SqliteTransaction? tx = null)
             => ValidateCommon(
                 block,
@@ -73,7 +90,9 @@ namespace Qado.Blockchain
             bool enforceTipExtending,
             bool validateStateAgainstCanonical,
             SqliteTransaction? tx,
-            out string reason)
+            out string reason,
+            Block? canonicalTipOverride = null,
+            Func<ulong, Block?>? getCanonicalBlockByHeightOverride = null)
         {
             reason = "OK";
 
@@ -134,7 +153,9 @@ namespace Qado.Blockchain
 
                 if (enforceTipExtending)
                 {
-                    var tip = BlockStore.GetLatestBlock(tx);
+                    var tip = canonicalTipOverride;
+                    if (tip?.BlockHash is not { Length: 32 })
+                        tip = BlockStore.GetLatestBlock(tx);
                     if (tip?.BlockHash is not { Length: 32 })
                     {
                         reason = "Local tip unknown";
@@ -150,7 +171,21 @@ namespace Qado.Blockchain
 
                 if (requirePrevKnown)
                 {
-                    prevBlock = BlockStore.GetBlockByHash(header.PreviousBlockHash, tx);
+                    if (enforceTipExtending &&
+                        canonicalTipOverride?.BlockHash is { Length: 32 } &&
+                        canonicalTipOverride.BlockHeight + 1UL == block.BlockHeight)
+                    {
+                        prevBlock = canonicalTipOverride;
+                    }
+                    else if (getCanonicalBlockByHeightOverride != null && block.BlockHeight > 0)
+                    {
+                        prevBlock = getCanonicalBlockByHeightOverride(block.BlockHeight - 1UL);
+                    }
+                    else
+                    {
+                        prevBlock = BlockStore.GetBlockByHash(header.PreviousBlockHash, tx);
+                    }
+
                     if (prevBlock == null)
                     {
                         reason = "Previous block missing";
@@ -163,7 +198,7 @@ namespace Qado.Blockchain
                         return false;
                     }
 
-                    ulong mtp = ComputeMedianTimePast(prevBlock, MedianTimePastWindow, tx);
+                    ulong mtp = ComputeMedianTimePast(prevBlock, MedianTimePastWindow, tx, getCanonicalBlockByHeightOverride);
                     if (header.Timestamp <= mtp)
                     {
                         reason = "Timestamp must be greater than median time past";
@@ -190,7 +225,7 @@ namespace Qado.Blockchain
 
             if (block.BlockHeight > 0 && prevBlock != null)
             {
-                var expectedTarget = ComputeExpectedTargetForThisBlock(block, prevBlock, tx);
+                var expectedTarget = ComputeExpectedTargetForThisBlock(block, prevBlock, tx, getCanonicalBlockByHeightOverride);
                 if (expectedTarget is null || expectedTarget.Length != 32) { reason = "Expected target computation failed"; return false; }
                 if (!BytesEqual32(haveTarget, expectedTarget))
                 {
@@ -381,9 +416,25 @@ namespace Qado.Blockchain
             return true;
         }
 
-        private static byte[] ComputeExpectedTargetForThisBlock(Block block, Block prevBlock, SqliteTransaction? tx)
+        private static byte[] ComputeExpectedTargetForThisBlock(
+            Block block,
+            Block prevBlock,
+            SqliteTransaction? tx,
+            Func<ulong, Block?>? getCanonicalBlockByHeightOverride = null)
         {
             ulong nextHeight = block.BlockHeight;
+
+            if (getCanonicalBlockByHeightOverride != null)
+            {
+                Block? CachedGetter(ulong h)
+                {
+                    if (h == prevBlock.BlockHeight)
+                        return prevBlock;
+                    return getCanonicalBlockByHeightOverride(h);
+                }
+
+                return DifficultyCalculator.GetNextTarget(nextHeight, CachedGetter);
+            }
 
             var map = BuildAncestorMap(prevBlock, maxBlocks: 256, tx);
             Block? Getter(ulong h) => map.TryGetValue(h, out var b) ? b : null;
@@ -432,23 +483,48 @@ namespace Qado.Blockchain
         private static string Hex32Lower(byte[] b32)
             => Convert.ToHexString(b32).ToLowerInvariant();
 
-        private static ulong ComputeMedianTimePast(Block prevBlock, int window, SqliteTransaction? tx)
+        private static ulong ComputeMedianTimePast(
+            Block prevBlock,
+            int window,
+            SqliteTransaction? tx,
+            Func<ulong, Block?>? getCanonicalBlockByHeightOverride = null)
         {
             var values = new List<ulong>(Math.Max(1, window));
-            Block? cur = prevBlock;
 
-            for (int i = 0; i < window && cur?.Header is not null; i++)
+            if (getCanonicalBlockByHeightOverride != null)
             {
-                values.Add(cur.Header.Timestamp);
+                ulong h = prevBlock.BlockHeight;
+                for (int i = 0; i < window; i++)
+                {
+                    Block? cur = h == prevBlock.BlockHeight
+                        ? prevBlock
+                        : getCanonicalBlockByHeightOverride(h);
+                    if (cur?.Header is null)
+                        break;
 
-                if (cur.BlockHeight == 0)
-                    break;
+                    values.Add(cur.Header.Timestamp);
+                    if (h == 0)
+                        break;
 
-                var ph = cur.Header.PreviousBlockHash;
-                if (ph is not { Length: 32 })
-                    break;
+                    h--;
+                }
+            }
+            else
+            {
+                Block? cur = prevBlock;
+                for (int i = 0; i < window && cur?.Header is not null; i++)
+                {
+                    values.Add(cur.Header.Timestamp);
 
-                cur = BlockStore.GetBlockByHash(ph, tx);
+                    if (cur.BlockHeight == 0)
+                        break;
+
+                    var ph = cur.Header.PreviousBlockHash;
+                    if (ph is not { Length: 32 })
+                        break;
+
+                    cur = BlockStore.GetBlockByHash(ph, tx);
+                }
             }
 
             if (values.Count == 0)

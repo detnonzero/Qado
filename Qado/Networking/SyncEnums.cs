@@ -1,13 +1,5 @@
 namespace Qado.Networking
 {
-    public enum HeaderSyncState
-    {
-        Idle = 0,
-        SelectingPeer = 1,
-        WaitingHeaders = 2,
-        Completed = 3
-    }
-
     public enum BadChainReason
     {
         None = 0,

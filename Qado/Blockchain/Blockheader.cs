@@ -8,7 +8,7 @@ namespace Qado.Blockchain
     {
         public const int HashSize = 32;
 
-        public const int PowHeaderSize = 1 + 32 + 32 + 8 + 32 + 8 + 32;
+        public const int HashInputSizeBytes = 1 + 32 + 32 + 8 + 32 + 8 + 32;
 
         public byte Version { get; set; } = 1;
 
@@ -75,7 +75,7 @@ namespace Qado.Blockchain
             if (!global::Qado.Blockchain.Difficulty.IsValidTarget(_target))
                 throw new InvalidOperationException("Target out of consensus range.");
 
-            var buf = new byte[PowHeaderSize];
+            var buf = new byte[HashInputSizeBytes];
             int o = 0;
 
             buf[o++] = Version;

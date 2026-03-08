@@ -51,9 +51,6 @@ namespace Qado.Storage
             UInt128 delta = BigToUInt128Sat(diff);
             UInt128 cw = ChainworkUtil.Add(parentWork, delta);
 
-            const int fileId = 0;
-            const long recordOffset = 0;
-            int recordSize = payload.Length;
             if (statusFlags <= 0)
                 statusFlags = BlockIndexStore.StatusCanonicalStateValidated;
 
@@ -65,9 +62,6 @@ namespace Qado.Storage
                 target32: target,
                 miner32: block.Header.Miner,
                 chainwork: cw,
-                fileId: fileId,
-                recordOffset: recordOffset,
-                recordSize: recordSize,
                 statusFlags: statusFlags,
                 tx: tx);
         }
@@ -76,8 +70,8 @@ namespace Qado.Storage
         {
             if (hash is not { Length: 32 }) throw new ArgumentException("hash must be 32 bytes", nameof(hash));
 
-            var loc = BlockIndexStore.GetLocation(hash, tx);
-            if (loc == null) return null;
+            if (!BlockIndexStore.ContainsHash(hash, tx))
+                return null;
 
             if (!BlockPayloadStore.TryGet(hash, out var payload, tx))
             {
@@ -109,8 +103,7 @@ namespace Qado.Storage
             if (hash is not { Length: 32 })
                 return false;
 
-            var loc = BlockIndexStore.GetLocation(hash, tx);
-            if (loc == null)
+            if (!BlockIndexStore.ContainsHash(hash, tx))
                 return false;
 
             if (!BlockPayloadStore.TryGet(hash, out payload, tx))
@@ -221,29 +214,6 @@ ON CONFLICT(height) DO UPDATE SET hash = excluded.hash;";
                 }
                 catch
                 {
-                    // In transactional callers we must not guess heights from metadata.
-                    if (tx != null)
-                    {
-                        height = 0;
-                        return false;
-                    }
-
-                    try
-                    {
-                        using var fallback = Conn.CreateCommand();
-                        fallback.CommandText = "SELECT value FROM meta WHERE key='LatestHeight' LIMIT 1;";
-                        var raw = fallback.ExecuteScalar();
-                        if (raw != null && raw is not DBNull &&
-                            ulong.TryParse(Convert.ToString(raw), out var parsed))
-                        {
-                            height = parsed;
-                            return true;
-                        }
-                    }
-                    catch
-                    {
-                    }
-
                     height = 0;
                     return false;
                 }
@@ -340,21 +310,6 @@ WHERE block_hash IN (SELECT hash FROM block_index WHERE height >= $h);";
                 delIdx.ExecuteNonQuery();
             }
 
-            if (fromHeight == 0)
-            {
-                MetaStore.Set("LatestHeight", "0", tx);
-                MetaStore.Set("LatestBlockHash", "", tx);
-            }
-            else
-            {
-                ulong newTipH = fromHeight - 1;
-                var newTipHash = GetCanonicalHashAtHeight(newTipH, tx);
-
-                MetaStore.Set("LatestHeight", newTipH.ToString(), tx);
-                MetaStore.Set("LatestBlockHash",
-                    newTipHash is { Length: 32 } ? Convert.ToHexString(newTipHash).ToLowerInvariant() : "",
-                    tx);
-            }
         }
 
         public static void AdoptCanonicalRange(ulong fromHeight, List<(ulong Height, byte[] Hash)> mapping)
@@ -416,8 +371,6 @@ ON CONFLICT(height) DO UPDATE SET hash = excluded.hash;";
             block.BlockHeight = newHeight;
 
             SetCanonicalHashAtHeight(newHeight, block.BlockHash!, tx);
-            MetaStore.Set("LatestBlockHash", Convert.ToHexString(block.BlockHash!).ToLowerInvariant(), tx);
-            MetaStore.Set("LatestHeight", newHeight.ToString(), tx);
 
             return true;
         }

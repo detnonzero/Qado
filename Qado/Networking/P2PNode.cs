@@ -25,9 +25,7 @@ namespace Qado.Networking
         private static readonly int MaxFramePayloadBytes =
             Math.Max(
                 Math.Max(ConsensusRules.MaxBlockSizeBytes, BlockSyncProtocol.MaxFramePayloadBytes),
-                Math.Max(
-                    BlockDownloadManager.MaxHashListPayloadBytes,
-                    HeaderSyncManager.MaxHeadersPayloadBytes));
+                BlockDownloadManager.MaxHashListPayloadBytes);
         private const int MaxSessions = 128;
         private const int OutboundTargetConnections = 10; // bounded by [8..12]
         private const int OutboundMinConnections = 8;
@@ -55,8 +53,8 @@ namespace Qado.Networking
         private static readonly TimeSpan MissingHeaderResyncCooldown = TimeSpan.FromSeconds(12);
         private static readonly TimeSpan InvRelayCooldown = TimeSpan.FromMinutes(2);
         private const int MaxInvRelayEntries = 8192;
-        private static readonly TimeSpan LatencyProbeInterval = TimeSpan.FromSeconds(15);
-        private static readonly TimeSpan LatencyProbeTimeout = TimeSpan.FromSeconds(5);
+        private static readonly TimeSpan LatencyProbeInterval = TimeSpan.FromSeconds(60);
+        private static readonly TimeSpan LatencyProbeTimeout = TimeSpan.FromSeconds(10);
 
         public static P2PNode? Instance { get; private set; }
         public bool IsPubliclyReachable => _reachability.IsPublic;
@@ -92,7 +90,6 @@ namespace Qado.Networking
         private readonly Dictionary<string, DateTime> _invRelayByHash = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<string, byte> _dialInFlight = new(StringComparer.Ordinal);
         private readonly SemaphoreSlim _validationSerializeGate = new(1, 1);
-        private readonly HeaderSyncManager _headerSyncManager;
         private readonly BlockDownloadManager _blockDownloadManager;
         private readonly ValidationWorker _validationWorker;
         private readonly BlockSyncClient _blockSyncClient;
@@ -122,6 +119,139 @@ namespace Qado.Networking
             public bool DidRollback { get; set; }
             public List<Block> RolledBackCanonicalBlocksDesc { get; } = new();
             public List<Block> AppliedBlocksAsc { get; } = new();
+            public BlockSyncHistoryCache History { get; } = new();
+        }
+
+        private sealed class BlockSyncHistoryCache
+        {
+            private const ulong MaxDepth = 384;
+            private readonly SortedDictionary<ulong, Block> _byHeight = new();
+
+            public ulong TipHeight { get; private set; }
+            public byte[] TipHash { get; private set; } = Array.Empty<byte>();
+
+            public void Seed(Block tipBlock)
+            {
+                if (tipBlock == null)
+                    throw new ArgumentNullException(nameof(tipBlock));
+                if (tipBlock.BlockHash is not { Length: 32 })
+                    throw new ArgumentException("tipBlock.BlockHash missing", nameof(tipBlock));
+
+                _byHeight.Clear();
+                TipHeight = tipBlock.BlockHeight;
+                TipHash = (byte[])tipBlock.BlockHash.Clone();
+                Remember(tipBlock);
+                Prune();
+            }
+
+            public BlockSyncHistoryCache CreateWorkingCopy()
+            {
+                var copy = new BlockSyncHistoryCache
+                {
+                    TipHeight = TipHeight,
+                    TipHash = TipHash is { Length: 32 } ? (byte[])TipHash.Clone() : Array.Empty<byte>()
+                };
+
+                foreach (var kv in _byHeight)
+                    copy._byHeight[kv.Key] = kv.Value;
+
+                return copy;
+            }
+
+            public void ReplaceWith(BlockSyncHistoryCache source)
+            {
+                if (source == null)
+                    throw new ArgumentNullException(nameof(source));
+
+                _byHeight.Clear();
+                foreach (var kv in source._byHeight)
+                    _byHeight[kv.Key] = kv.Value;
+
+                TipHeight = source.TipHeight;
+                TipHash = source.TipHash is { Length: 32 } ? (byte[])source.TipHash.Clone() : Array.Empty<byte>();
+            }
+
+            public Block? EnsureTip(ulong tipHeight, SqliteTransaction tx)
+            {
+                RemoveAbove(tipHeight);
+                TipHeight = tipHeight;
+
+                var tipBlock = GetBlockAtHeight(tipHeight, tx);
+                if (tipBlock?.BlockHash is { Length: 32 })
+                    TipHash = (byte[])tipBlock.BlockHash.Clone();
+                else
+                    TipHash = Array.Empty<byte>();
+
+                Prune();
+                return tipBlock;
+            }
+
+            public Block? GetBlockAtHeight(ulong height, SqliteTransaction tx)
+            {
+                if (_byHeight.TryGetValue(height, out var cached))
+                    return cached;
+
+                var block = BlockStore.GetBlockByHeight(height, tx);
+                if (block?.BlockHash is not { Length: 32 })
+                    return null;
+
+                Remember(block);
+                Prune();
+                return block;
+            }
+
+            public void NoteCommitted(Block block)
+            {
+                if (block == null)
+                    throw new ArgumentNullException(nameof(block));
+                if (block.BlockHash is not { Length: 32 })
+                    throw new ArgumentException("block.BlockHash missing", nameof(block));
+
+                TipHeight = block.BlockHeight;
+                TipHash = (byte[])block.BlockHash.Clone();
+                Remember(block);
+                Prune();
+            }
+
+            private void Remember(Block block)
+            {
+                _byHeight[block.BlockHeight] = block;
+            }
+
+            private void RemoveAbove(ulong height)
+            {
+                if (_byHeight.Count == 0)
+                    return;
+
+                var remove = new List<ulong>();
+                foreach (var kv in _byHeight)
+                {
+                    if (kv.Key > height)
+                        remove.Add(kv.Key);
+                }
+
+                for (int i = 0; i < remove.Count; i++)
+                    _byHeight.Remove(remove[i]);
+            }
+
+            private void Prune()
+            {
+                RemoveAbove(TipHeight);
+
+                ulong keepFrom = TipHeight > MaxDepth ? TipHeight - MaxDepth : 0;
+                if (_byHeight.Count == 0)
+                    return;
+
+                var remove = new List<ulong>();
+                foreach (var kv in _byHeight)
+                {
+                    if (kv.Key < keepFrom)
+                        remove.Add(kv.Key);
+                }
+
+                for (int i = 0; i < remove.Count; i++)
+                    _byHeight.Remove(remove[i]);
+            }
         }
 
         private enum ConnectOutcome
@@ -137,11 +267,6 @@ namespace Qado.Networking
             _log = log;
             _nodeId = GetOrCreateNodeId();
             _validationWorker = new ValidationWorker(ProcessValidationWorkItemAsync, _log);
-            _headerSyncManager = new HeaderSyncManager(
-                sessionSnapshot: GetSessionSnapshot,
-                sendFrameAsync: SendFrameViaSessionAsync,
-                onSyncCompleted: OnHeaderSyncCompleted,
-                log: _log);
             _blockSyncClient = new BlockSyncClient(
                 sessionSnapshot: GetSessionSnapshot,
                 sendFrameAsync: SendFrameViaSessionAsync,
@@ -168,7 +293,7 @@ namespace Qado.Networking
                     }
                 },
                 prepareBatchAsync: PrepareBlockSyncBatchAsync,
-                commitBlockAsync: CommitBlockSyncBlockAsync,
+                commitChunkAsync: CommitBlockSyncChunkAsync,
                 completeBatchAsync: CompleteBlockSyncBatchAsync,
                 abortBatchAsync: AbortBlockSyncBatchAsync,
                 penalizePeer: (peer, reason) =>
@@ -181,8 +306,6 @@ namespace Qado.Networking
                 sessionSnapshot: GetSessionSnapshot,
                 sendFrameAsync: SendFrameViaSessionAsync,
                 haveBlock: HaveBlockLocally,
-                isDownloadCandidate: IsHeaderCandidateDownloadable,
-                requestResync: RequestSyncNow,
                 enqueueValidator: item => _validationWorker.Enqueue(item),
                 revalidateStoredBlock: RevalidateStoredBlock,
                 log: _log);
@@ -226,7 +349,6 @@ namespace Qado.Networking
                 _sessions.TryRemove(kv.Key, out _);
             }
 
-            try { _headerSyncManager.Dispose(); } catch { }
             try { _blockDownloadManager.Dispose(); } catch { }
             try { _validationWorker.Dispose(); } catch { }
             try { _blockSyncClient.Dispose(); } catch { }
@@ -528,11 +650,6 @@ namespace Qado.Networking
                 s.LastPingSentUnixMs = 0;
                 s.LastLatencyMs = -1;
                 s.PingTimeoutStreak++;
-                if (s.PingTimeoutStreak >= 2)
-                {
-                    DropSessionNoThrow(s, $"latency probe timeout ({s.PingTimeoutStreak}x)");
-                    return;
-                }
             }
 
             var payload = new byte[8];
@@ -556,7 +673,6 @@ namespace Qado.Networking
 
             try { s.Client.Close(); } catch { }
             _sessions.TryRemove(s.RemoteEndpoint, out _);
-            try { _headerSyncManager.OnPeerDisconnected(s); } catch { }
             try { _blockDownloadManager.OnPeerDisconnected(s); } catch { }
             _ = _blockSyncClient.OnPeerDisconnectedAsync(s, CancellationToken.None);
             _log?.Warn("P2P", $"dropping session {EndpointLogFormatter.FormatEndpoint(s.RemoteEndpoint)}: {reason}");
@@ -763,7 +879,6 @@ namespace Qado.Networking
             }
             finally
             {
-                _headerSyncManager.OnPeerDisconnected(s);
                 _blockDownloadManager.OnPeerDisconnected(s);
                 _sessions.TryRemove(s.RemoteEndpoint, out _);
                 _ = _blockSyncClient.OnPeerDisconnectedAsync(s, CancellationToken.None);
@@ -809,12 +924,6 @@ namespace Qado.Networking
 
                 case MsgType.GetData:
                     await HandleGetData(payload, s, ct).ConfigureAwait(false);
-                    return;
-
-                case MsgType.Headers:
-                    return;
-
-                case MsgType.GetHeaders:
                     return;
 
                 case MsgType.GetBlock:
@@ -1050,16 +1159,6 @@ namespace Qado.Networking
             _log?.Info("P2P", $"TX accepted (nonce={txMsg.TxNonce}) gossiped");
         }
 
-        private async Task HandleBlock(byte[] payload, PeerSession s, CancellationToken ct)
-        {
-            if (!_blockDownloadManager.IsDownloadStarted)
-                return;
-
-            if (!_blockDownloadManager.EnqueueBlockPayload(s, payload))
-                _log?.Warn("Sync", "Validation queue full. Dropping inbound block payload.");
-            await Task.CompletedTask;
-        }
-
         private async Task HandleBlockInternal(byte[] payload, PeerSession s, CancellationToken ct, bool? enforceRateLimitOverride)
         {
             string peerKey = GetBanKey(s);
@@ -1152,12 +1251,12 @@ namespace Qado.Networking
             if (BlockIndexStore.IsBadOrHasBadAncestor(prevHash))
             {
                 _log?.Warn("P2P", $"Dropping block with bad parent: {Hex16(blk.BlockHash!)}");
-                TryReplanFromBestHeader("parent-bad");
+                _blockSyncClient.RequestResync("parent-bad");
                 _blockDownloadManager.MarkBlockValidated(blk.BlockHash!, valid: false);
                 return;
             }
 
-            bool alreadyHavePayload = BlockIndexStore.GetLocation(blk.BlockHash!) != null;
+            bool alreadyHavePayload = BlockIndexStore.HasPayload(blk.BlockHash!);
             if (alreadyHavePayload &&
                 BlockIndexStore.TryGetBadFlags(blk.BlockHash!, out bool isBad, out bool badAncestor, out _, null) &&
                 (isBad || badAncestor))
@@ -1177,7 +1276,7 @@ namespace Qado.Networking
 
                 if (existingStatus == BlockIndexStore.StatusSideStateInvalid)
                 {
-                    TryReplanFromBestHeader("known-invalid");
+                    _blockSyncClient.RequestResync("known-invalid");
                     _blockDownloadManager.MarkBlockValidated(blk.BlockHash!, valid: false);
                     return;
                 }
@@ -1362,7 +1461,7 @@ namespace Qado.Networking
                         shouldAttemptAdopt = (canonTipNow - blk.BlockHeight) <= 4UL;
                     }
 
-                    bool parentPayloadAvailable = BlockIndexStore.GetLocation(prevHash) != null;
+                    bool parentPayloadAvailable = BlockIndexStore.HasPayload(prevHash);
                     if (shouldAttemptAdopt && isInActivePlan && parentPayloadAvailable)
                     {
                         ChainSelector.MaybeAdoptNewTip(blk.BlockHash!, _log, _mempool);
@@ -1387,7 +1486,7 @@ namespace Qado.Networking
                 (isBadNow || badAncestorNow))
             {
                 _blockDownloadManager.MarkBlockValidated(blk.BlockHash!, valid: false);
-                TryReplanFromBestHeader("post-validation-bad");
+                _blockSyncClient.RequestResync("post-validation-bad");
                 return;
             }
 
@@ -1453,12 +1552,6 @@ namespace Qado.Networking
             }
         }
 
-        private async Task HandleGetHeaders(byte[] payload, PeerSession s, CancellationToken ct)
-        {
-            var headersPayload = _headerSyncManager.BuildHeadersResponseForLocator(payload);
-            await SendFrameAsync(s, MsgType.Headers, headersPayload, ct).ConfigureAwait(false);
-        }
-
         private async Task HandleGetTip(PeerSession s, CancellationToken ct)
         {
             ulong latest;
@@ -1514,6 +1607,7 @@ namespace Qado.Networking
 
                 ulong forkHeight = startHeight - 1UL;
                 byte[]? localForkHash;
+                Block? forkBlock;
                 lock (Db.Sync)
                 {
                     var currentTipHash = BlockStore.GetCanonicalHashAtHeight(BlockStore.GetLatestHeight()) ?? Array.Empty<byte>();
@@ -1524,21 +1618,26 @@ namespace Qado.Networking
                         return new BlockSyncPrepareResult(false, $"peer tip chainwork not better than local chain (peer={advertisedTipChainwork}, local={currentTipWork})");
 
                     localForkHash = BlockStore.GetCanonicalHashAtHeight(forkHeight);
+                    forkBlock = BlockStore.GetBlockByHeight(forkHeight);
                 }
 
                 if (localForkHash is not { Length: 32 })
                     return new BlockSyncPrepareResult(false, $"missing local forkpoint at height {forkHeight}");
+                if (forkBlock?.BlockHash is not { Length: 32 })
+                    return new BlockSyncPrepareResult(false, $"missing local forkpoint payload at height {forkHeight}");
 
                 if (!BytesEqual32(localForkHash, startHash))
                     return new BlockSyncPrepareResult(false, "forkpoint no longer matches local canonical chain");
 
-                _activeBlockSyncBatch = new BlockSyncBatchContext
+                var batch = new BlockSyncBatchContext
                 {
                     PeerKey = peer.SessionKey,
                     ForkHash = (byte[])startHash.Clone(),
                     ForkHeight = forkHeight,
                     AdvertisedTipChainwork = advertisedTipChainwork
                 };
+                batch.History.Seed(forkBlock);
+                _activeBlockSyncBatch = batch;
 
                 releaseGate = false;
                 return new BlockSyncPrepareResult(true, string.Empty);
@@ -1554,83 +1653,143 @@ namespace Qado.Networking
             }
         }
 
-        private Task<BlockSyncCommitResult> CommitBlockSyncBlockAsync(
-            byte[] payload,
+        private Task<BlockSyncChunkCommitResult> CommitBlockSyncChunkAsync(
+            IReadOnlyList<byte[]> payloads,
             ulong expectedHeight,
             byte[] expectedPrevHash,
             PeerSession peer,
             CancellationToken ct)
         {
             if (peer == null)
-                return Task.FromResult(new BlockSyncCommitResult(false, Array.Empty<byte>(), "peer missing"));
-            if (payload == null || payload.Length == 0 || payload.Length > BlockSyncProtocol.MaxSerializedBlockBytes)
-                return Task.FromResult(new BlockSyncCommitResult(false, Array.Empty<byte>(), "invalid block payload size"));
+                return Task.FromResult(new BlockSyncChunkCommitResult(false, Array.Empty<byte>(), "peer missing"));
+            if (payloads == null || payloads.Count == 0 || payloads.Count > BlockSyncProtocol.ChunkBlocks)
+                return Task.FromResult(new BlockSyncChunkCommitResult(false, Array.Empty<byte>(), "invalid chunk payload count"));
             if (expectedPrevHash is not { Length: 32 })
-                return Task.FromResult(new BlockSyncCommitResult(false, Array.Empty<byte>(), "invalid expected prev hash"));
+                return Task.FromResult(new BlockSyncChunkCommitResult(false, Array.Empty<byte>(), "invalid expected prev hash"));
 
             var batch = _activeBlockSyncBatch;
             if (batch == null)
-                return Task.FromResult(new BlockSyncCommitResult(false, Array.Empty<byte>(), "no active batch"));
+                return Task.FromResult(new BlockSyncChunkCommitResult(false, Array.Empty<byte>(), "no active batch"));
             if (!string.Equals(batch.PeerKey, peer.SessionKey, StringComparison.Ordinal))
-                return Task.FromResult(new BlockSyncCommitResult(false, Array.Empty<byte>(), "batch peer mismatch"));
+                return Task.FromResult(new BlockSyncChunkCommitResult(false, Array.Empty<byte>(), "batch peer mismatch"));
 
-            Block block;
+            var blocks = new List<Block>(payloads.Count);
+            ulong nextHeight = expectedHeight;
+            byte[] nextPrevHash = (byte[])expectedPrevHash.Clone();
+
+            for (int i = 0; i < payloads.Count; i++)
+            {
+                if (ct.IsCancellationRequested)
+                    return Task.FromResult(new BlockSyncChunkCommitResult(false, Array.Empty<byte>(), "operation cancelled"));
+
+                var payload = payloads[i];
+                if (payload == null || payload.Length == 0 || payload.Length > BlockSyncProtocol.MaxSerializedBlockBytes)
+                    return Task.FromResult(new BlockSyncChunkCommitResult(false, Array.Empty<byte>(), "invalid block payload size"));
+
+                Block block;
+                try
+                {
+                    block = BlockBinarySerializer.Read(payload);
+                }
+                catch (Exception ex)
+                {
+                    return Task.FromResult(new BlockSyncChunkCommitResult(false, Array.Empty<byte>(), $"block decode failed: {ex.Message}"));
+                }
+
+                if (block.Header?.PreviousBlockHash is not { Length: 32 })
+                    return Task.FromResult(new BlockSyncChunkCommitResult(false, Array.Empty<byte>(), "block missing prev hash"));
+
+                block.BlockHeight = nextHeight;
+                if (block.BlockHash is not { Length: 32 } || IsZero32(block.BlockHash))
+                    block.BlockHash = block.ComputeBlockHash();
+
+                if (!BytesEqual32(block.Header.PreviousBlockHash, nextPrevHash))
+                    return Task.FromResult(new BlockSyncChunkCommitResult(false, Array.Empty<byte>(), "prev hash mismatch"));
+
+                if (BlockIndexStore.IsBadOrHasBadAncestor(block.BlockHash!))
+                    return Task.FromResult(new BlockSyncChunkCommitResult(false, Array.Empty<byte>(), "block is marked bad"));
+
+                blocks.Add(block);
+                nextPrevHash = (byte[])block.BlockHash!.Clone();
+                nextHeight++;
+            }
+
             try
             {
-                block = BlockBinarySerializer.Read(payload);
-            }
-            catch (Exception ex)
-            {
-                return Task.FromResult(new BlockSyncCommitResult(false, Array.Empty<byte>(), $"block decode failed: {ex.Message}"));
-            }
+                var workingBatch = new BlockSyncBatchContext
+                {
+                    PeerKey = batch.PeerKey,
+                    ForkHash = (byte[])batch.ForkHash.Clone(),
+                    ForkHeight = batch.ForkHeight,
+                    AdvertisedTipChainwork = batch.AdvertisedTipChainwork,
+                    DidRollback = batch.DidRollback
+                };
+                if (batch.RolledBackCanonicalBlocksDesc.Count > 0)
+                    workingBatch.RolledBackCanonicalBlocksDesc.AddRange(batch.RolledBackCanonicalBlocksDesc);
 
-            if (block.Header?.PreviousBlockHash is not { Length: 32 })
-                return Task.FromResult(new BlockSyncCommitResult(false, Array.Empty<byte>(), "block missing prev hash"));
+                var workingHistory = batch.History.CreateWorkingCopy();
 
-            block.BlockHeight = expectedHeight;
-            if (block.BlockHash is not { Length: 32 } || IsZero32(block.BlockHash))
-                block.BlockHash = block.ComputeBlockHash();
-
-            if (!BytesEqual32(block.Header.PreviousBlockHash, expectedPrevHash))
-                return Task.FromResult(new BlockSyncCommitResult(false, Array.Empty<byte>(), "prev hash mismatch"));
-
-            if (BlockIndexStore.IsBadOrHasBadAncestor(block.BlockHash!))
-                return Task.FromResult(new BlockSyncCommitResult(false, Array.Empty<byte>(), "block is marked bad"));
-
-            try
-            {
                 lock (Db.Sync)
                 {
                     using var tx = Db.Connection!.BeginTransaction();
 
-                    if (!EnsureBlockSyncTipReady(batch, expectedHeight, expectedPrevHash, tx, out var prepReason))
+                    if (!EnsureBlockSyncTipReady(workingBatch, expectedHeight, expectedPrevHash, tx, out var prepReason))
                     {
                         tx.Rollback();
-                        return Task.FromResult(new BlockSyncCommitResult(false, Array.Empty<byte>(), prepReason));
+                        return Task.FromResult(new BlockSyncChunkCommitResult(false, Array.Empty<byte>(), prepReason));
                     }
 
-                    if (!BlockValidator.ValidateNetworkTipBlock(block, out var reason, tx))
+                    var tipBlock = workingHistory.EnsureTip(expectedHeight - 1UL, tx);
+                    if (tipBlock?.BlockHash is not { Length: 32 } || !BytesEqual32(tipBlock.BlockHash, expectedPrevHash))
                     {
                         tx.Rollback();
-                        return Task.FromResult(new BlockSyncCommitResult(false, Array.Empty<byte>(), reason));
+                        return Task.FromResult(new BlockSyncChunkCommitResult(false, Array.Empty<byte>(), "failed to align validation tip"));
                     }
 
-                    BlockStore.SaveBlock(block, tx, BlockIndexStore.StatusCanonicalStateValidated);
-                    StateApplier.ApplyBlockWithUndo(block, tx);
-                    BlockStore.SetCanonicalHashAtHeight(expectedHeight, block.BlockHash!, tx);
-                    BlockIndexStore.SetStatus(block.BlockHash!, BlockIndexStore.StatusCanonicalStateValidated, tx);
-                    MetaStore.Set("LatestBlockHash", Convert.ToHexString(block.BlockHash!).ToLowerInvariant(), tx);
-                    MetaStore.Set("LatestHeight", expectedHeight.ToString(), tx);
+                    for (int i = 0; i < blocks.Count; i++)
+                    {
+                        if (ct.IsCancellationRequested)
+                        {
+                            tx.Rollback();
+                            return Task.FromResult(new BlockSyncChunkCommitResult(false, Array.Empty<byte>(), "operation cancelled"));
+                        }
+
+                        var block = blocks[i];
+                        if (!BlockValidator.ValidateNetworkTipBlock(
+                                block,
+                                tipBlock,
+                                h => workingHistory.GetBlockAtHeight(h, tx),
+                                out var reason,
+                                tx))
+                        {
+                            tx.Rollback();
+                            return Task.FromResult(new BlockSyncChunkCommitResult(false, Array.Empty<byte>(), reason));
+                        }
+
+                        BlockStore.SaveBlock(block, tx, BlockIndexStore.StatusCanonicalStateValidated);
+                        StateApplier.ApplyBlockWithUndo(block, tx);
+                        BlockStore.SetCanonicalHashAtHeight(block.BlockHeight, block.BlockHash!, tx);
+                        BlockIndexStore.SetStatus(block.BlockHash!, BlockIndexStore.StatusCanonicalStateValidated, tx);
+
+                        workingHistory.NoteCommitted(block);
+                        tipBlock = block;
+                    }
 
                     tx.Commit();
                 }
 
-                batch.AppliedBlocksAsc.Add(block);
-                return Task.FromResult(new BlockSyncCommitResult(true, (byte[])block.BlockHash!.Clone(), string.Empty));
+                batch.DidRollback = workingBatch.DidRollback;
+                batch.RolledBackCanonicalBlocksDesc.Clear();
+                if (workingBatch.RolledBackCanonicalBlocksDesc.Count > 0)
+                    batch.RolledBackCanonicalBlocksDesc.AddRange(workingBatch.RolledBackCanonicalBlocksDesc);
+                batch.History.ReplaceWith(workingHistory);
+                batch.AppliedBlocksAsc.AddRange(blocks);
+
+                return Task.FromResult(new BlockSyncChunkCommitResult(true, (byte[])blocks[^1].BlockHash!.Clone(), string.Empty));
             }
             catch (Exception ex)
             {
-                return Task.FromResult(new BlockSyncCommitResult(false, Array.Empty<byte>(), ex.Message));
+                return Task.FromResult(new BlockSyncChunkCommitResult(false, Array.Empty<byte>(), ex.Message));
             }
         }
 
@@ -1753,8 +1912,6 @@ namespace Qado.Networking
             }
 
             BlockStore.DeleteCanonicalFromHeight(expectedHeight, tx);
-            MetaStore.Set("LatestBlockHash", Convert.ToHexString(expectedPrevHash).ToLowerInvariant(), tx);
-            MetaStore.Set("LatestHeight", forkHeight.ToString(), tx);
             batch.DidRollback = true;
 
             var alignedTipHash = BlockStore.GetCanonicalHashAtHeight(forkHeight, tx);
@@ -1865,9 +2022,6 @@ namespace Qado.Networking
 
             BlockStore.SetCanonicalHashAtHeight(newHeight, blk.BlockHash!, tx);
 
-            MetaStore.Set("LatestBlockHash", Convert.ToHexString(blk.BlockHash!).ToLowerInvariant(), tx);
-            MetaStore.Set("LatestHeight", newHeight.ToString(), tx);
-
             return true;
         }
 
@@ -1893,7 +2047,7 @@ namespace Qado.Networking
                 if (affected > 0)
                     _log?.Warn("Sync", $"Marked bad block (self-only): root={Hex16(blockHash)} reason={(int)reason} ({context})");
 
-                TryReplanFromBestHeader(context);
+                _blockSyncClient.RequestResync(context);
             }
             catch
             {
@@ -1922,7 +2076,6 @@ namespace Qado.Networking
                 catch (Exception ex)
                 {
                     try { sess.Client.Close(); } catch { }
-                    try { _headerSyncManager.OnPeerDisconnected(sess); } catch { }
                     try { _blockDownloadManager.OnPeerDisconnected(sess); } catch { }
                     _sessions.TryRemove(kv.Key, out _);
                     _ = _blockSyncClient.OnPeerDisconnectedAsync(sess, CancellationToken.None);
@@ -2086,10 +2239,7 @@ namespace Qado.Networking
         }
 
         private static bool HaveBlockLocally(byte[] hash)
-            => hash is { Length: 32 } && BlockIndexStore.GetLocation(hash) != null;
-
-        private static bool IsHeaderCandidateDownloadable(byte[] hash)
-            => hash is { Length: 32 } && !BlockIndexStore.IsBadOrHasBadAncestor(hash);
+            => hash is { Length: 32 } && BlockIndexStore.HasPayload(hash);
 
         public void RequestSyncNow(string reason = "manual")
         {
@@ -2110,24 +2260,6 @@ namespace Qado.Networking
                     _log?.Warn("Sync", $"Try Sync redial failed ({reason}): {ex.Message}");
                 }
             }, CancellationToken.None);
-        }
-
-        private void OnHeaderSyncCompleted(HeaderSyncPlan plan)
-        {
-            if (_blockDownloadManager.IsDownloadStarted)
-            {
-                _blockDownloadManager.ReplanDownload(plan.MissingBlockHashes, plan.RevalidateBlockHashes);
-            }
-            else
-            {
-                _blockDownloadManager.BeginDownload(plan.MissingBlockHashes, plan.RevalidateBlockHashes);
-            }
-        }
-
-        private bool TryReplanFromBestHeader(string context)
-        {
-            _blockSyncClient.RequestResync(context);
-            return false;
         }
 
         private void RevalidateStoredBlock(byte[] hash)
@@ -2157,7 +2289,7 @@ namespace Qado.Networking
                 }
 
                 _log?.Warn("Sync", $"Stored payload missing/corrupt for {Hex16(hash)}; scheduling re-download.");
-                TryReplanFromBestHeader("revalidate-missing-payload");
+                _blockSyncClient.RequestResync("revalidate-missing-payload");
             }
             catch
             {

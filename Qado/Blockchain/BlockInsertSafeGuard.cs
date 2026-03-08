@@ -32,7 +32,7 @@ namespace Qado.Blockchain
             if (block.BlockHash is not { Length: 32 } || IsZero32(block.BlockHash))
                 block.BlockHash = block.ComputeBlockHash();
 
-            if (BlockIndexStore.GetLocation(block.BlockHash) != null)
+            if (BlockIndexStore.HasPayload(block.BlockHash))
             {
                 error = "Block already known";
                 log?.Warn("Insert", error);

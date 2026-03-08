@@ -28,14 +28,11 @@ namespace Qado.Blockchain
         public Miner(
             string privateKeyHex,
             Func<List<Transaction>> getReadyTransactions,
-            Func<byte>? getDifficulty, // compatibility callback, currently unused
             Func<Block, Task> onBlockMinedAsync,
             Action<Block> onBlockAccepted,
             Action? onHashIteration = null,
             ILogSink? log = null)
         {
-            _ = getDifficulty; // keep compatibility parameter without warnings
-
             if (string.IsNullOrWhiteSpace(privateKeyHex))
                 throw new ArgumentException("privateKeyHex required", nameof(privateKeyHex));
 

@@ -2,6 +2,47 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.3.1] - 2026-03-08
+
+### Changed
+- Catch-up block sync was substantially accelerated:
+  - streamed `BlockChunk`s are now committed atomically per chunk instead of one SQL transaction per block
+  - linear sync validation now reuses an in-memory ancestor/history cache for MTP + difficulty checks
+  - this greatly reduces repeated SQLite reads and per-block commit overhead on long small-block syncs
+- The legacy header-first sync path was removed:
+  - `HeaderSyncManager` and the old `SyncManager` were deleted
+  - outbound/inbound `GetHeaders` handling is no longer part of the active sync flow
+  - direct locator-based block sync is now the only active catch-up path
+- Legacy resync churn was cleaned up from the old download pipeline:
+  - `inv-before-download` / `inv-out-of-plan` style resync triggers were removed
+  - the remaining `BlockDownloadManager` path is now focused on inventory/payload handling instead of mixed legacy planning
+- Peer liveness probing was relaxed:
+  - latency probe interval increased from `15s` to `60s`
+  - probe timeout set to `10s`
+  - probe timeout no longer disconnects peers
+- Node status in the GUI was simplified:
+  - `Synced/Tip Height x/y` was removed
+  - the status header now shows only the canonical `Height`
+- Storage/schema cleanup for the direct-block era:
+  - `header_store` was removed
+  - unused `peers.pubkey` was removed
+  - obsolete `block_index.file_id/file_offset/file_size` metadata was removed
+  - canonical tip mirroring via `meta.LatestBlockHash` / `meta.LatestHeight` was removed
+- Old PoW-era leftovers were cleaned up:
+  - the unused Argon2 utility and package reference were removed
+  - dead PoW tuning constants were removed
+  - `BlockHeader.PowHeaderSize` was renamed to `HashInputSizeBytes`
+
+### Fixed
+- Fixed sync slowdowns caused by repeated ancestor/difficulty backwalks through SQLite during linear catch-up.
+- Fixed block-presence checks to use actual payload availability in `block_payloads` instead of stale file-location metadata.
+- Fixed unnecessary sync disruption from aggressive ping timeout disconnects during long chunk validation/commit phases.
+- Fixed mixed legacy sync behavior where old download/resync hooks could interfere with the active direct block-sync pipeline.
+
+### Notes
+- `0.3.1` expects a fresh database after the schema cleanup. No SQLite migrations are provided for these removals; delete `data/` and resync.
+- Release artifacts continue to be produced via `release.ps1` (`win-x64` + `SHA256SUMS.txt`).
+
 ## [0.3.0] - 2026-03-05
 
 ### Changed

@@ -4,16 +4,12 @@ namespace Qado.Blockchain
 {
     internal static class ConsensusRules
     {
-        public const int PowMemoryKb = 4; // 4 KiB
-        public const int PowIterations = 1;
-        public const int PowParallelism = 1;
-
         public const int MaxTransactionsPerBlock = 100;
 
         public const byte MerkleLeafDomainTag = 0x00;
         public const byte MerkleNodeDomainTag = 0x01;
 
-        public const int BlockHeaderSizeBytes = BlockHeader.PowHeaderSize + 4;
+        public const int BlockHeaderSizeBytes = BlockHeader.HashInputSizeBytes + 4;
 
         public const int TxLengthPrefixBytes = 4;
 

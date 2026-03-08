@@ -636,8 +636,11 @@ internal static class Program
             getLocalTipHash: () => (byte[])localTip.Clone(),
             prepareBatchAsync: (startHash, startHeight, advertisedTipChainwork, peer, ct) =>
                 Task.FromResult(new BlockSyncPrepareResult(true, string.Empty)),
-            commitBlockAsync: (payload, height, prevHash, peer, ct) =>
-                Task.FromResult(new BlockSyncCommitResult(true, HashFromU64(height), string.Empty)),
+            commitChunkAsync: (payloads, height, prevHash, peer, ct) =>
+            {
+                ulong lastHeight = height + (ulong)payloads.Count - 1UL;
+                return Task.FromResult(new BlockSyncChunkCommitResult(true, HashFromU64(lastHeight), string.Empty));
+            },
             completeBatchAsync: (peer, status, ct) => Task.CompletedTask,
             abortBatchAsync: (peer, reason, ct) => Task.CompletedTask,
             log: null);
@@ -679,12 +682,13 @@ internal static class Program
             getLocalTipHash: () => (byte[])localTip.Clone(),
             prepareBatchAsync: (startHash, startHeight, advertisedTipChainwork, peer, ct) =>
                 Task.FromResult(new BlockSyncPrepareResult(true, string.Empty)),
-            commitBlockAsync: (payload, height, prevHash, peer, ct) =>
+            commitChunkAsync: (payloads, height, prevHash, peer, ct) =>
             {
-                localHeight = height;
-                localChainwork = (UInt128)height;
-                localTip = HashFromU64(height + 10_000UL);
-                return Task.FromResult(new BlockSyncCommitResult(true, (byte[])localTip.Clone(), string.Empty));
+                ulong lastHeight = height + (ulong)payloads.Count - 1UL;
+                localHeight = lastHeight;
+                localChainwork = (UInt128)lastHeight;
+                localTip = HashFromU64(lastHeight + 10_000UL);
+                return Task.FromResult(new BlockSyncChunkCommitResult(true, (byte[])localTip.Clone(), string.Empty));
             },
             completeBatchAsync: (peer, status, ct) => Task.CompletedTask,
             abortBatchAsync: (peer, reason, ct) => Task.CompletedTask,
@@ -747,8 +751,8 @@ internal static class Program
             getLocalTipHash: () => (byte[])localTip.Clone(),
             prepareBatchAsync: (startHash, startHeight, advertisedTipChainwork, peer, ct) =>
                 Task.FromResult(new BlockSyncPrepareResult(true, string.Empty)),
-            commitBlockAsync: (payload, height, prevHash, peer, ct) =>
-                Task.FromResult(new BlockSyncCommitResult(false, Array.Empty<byte>(), "invalid block")),
+            commitChunkAsync: (payloads, height, prevHash, peer, ct) =>
+                Task.FromResult(new BlockSyncChunkCommitResult(false, Array.Empty<byte>(), "invalid block")),
             completeBatchAsync: (peer, status, ct) => Task.CompletedTask,
             abortBatchAsync: (peer, reason, ct) => Task.CompletedTask,
             penalizePeer: (peer, reason) => penalized.Add(peer.SessionKey),

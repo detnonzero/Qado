@@ -1397,17 +1397,16 @@ LIMIT 200;";
             });
         }
 
-        private (ulong tipHeight, ulong targetTipHeight, string tipHashText, int mempoolCount) ReadNodeStatusSnapshot()
+        private (ulong height, string tipHashText, int mempoolCount) ReadNodeStatusSnapshot()
         {
-            ulong tipHeight = 0;
-            ulong targetTipHeight = 0;
+            ulong height = 0;
             string tipHashText = "-";
             int mempoolCount = 0;
 
             try
             {
-                tipHeight = BlockStore.GetLatestHeight();
-                var tipHash = BlockStore.GetCanonicalHashAtHeight(tipHeight);
+                height = BlockStore.GetLatestHeight();
+                var tipHash = BlockStore.GetCanonicalHashAtHeight(height);
                 if (tipHash is { Length: 32 })
                     tipHashText = Convert.ToHexString(tipHash).ToLowerInvariant();
             }
@@ -1415,24 +1414,12 @@ LIMIT 200;";
             {
             }
 
-            try
-            {
-                if (BlockIndexStore.TryGetBestHeaderTip(out _, out var bestHeaderHeight, out _))
-                    targetTipHeight = bestHeaderHeight;
-            }
-            catch
-            {
-            }
-
-            if (targetTipHeight < tipHeight)
-                targetTipHeight = tipHeight;
-
             try { mempoolCount = _mempool?.Count ?? 0; } catch { }
 
-            return (tipHeight, targetTipHeight, tipHashText, mempoolCount);
+            return (height, tipHashText, mempoolCount);
         }
 
-        private void ApplyNodeStatusSnapshot((ulong tipHeight, ulong targetTipHeight, string tipHashText, int mempoolCount) snap)
+        private void ApplyNodeStatusSnapshot((ulong height, string tipHashText, int mempoolCount) snap)
         {
             if (_isClosing) return;
 
@@ -1449,7 +1436,7 @@ LIMIT 200;";
             {
             }
 
-            TipHeightText.Text = $"{snap.tipHeight}/{snap.targetTipHeight}";
+            TipHeightText.Text = snap.height.ToString();
             TipHashText.Text = snap.tipHashText;
             MempoolCountText.Text = snap.mempoolCount.ToString();
             PeerCountText.Text = peerCount.ToString();

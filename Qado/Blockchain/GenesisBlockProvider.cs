@@ -75,7 +75,7 @@ namespace Qado.Blockchain
             if (!BytesEqual32(expectedRoot, header.MerkleRoot)) { reason = "merkle mismatch"; return false; }
 
             var expectedHash = block.ComputeBlockHash();
-            if (expectedHash is not { Length: 32 }) { reason = "pow hash invalid"; return false; }
+            if (expectedHash is not { Length: 32 }) { reason = "block hash invalid"; return false; }
             if (block.BlockHash is not { Length: 32 }) { reason = "blockHash malformed"; return false; }
             if (!BytesEqual32(expectedHash, block.BlockHash)) { reason = "blockHash mismatch"; return false; }
 
@@ -180,9 +180,6 @@ namespace Qado.Blockchain
                 BlockStore.SaveBlock(genesis, tx);
 
                 BlockStore.SetCanonicalHashAtHeight(0, genesis.BlockHash!, tx);
-
-                MetaStore.Set("LatestBlockHash", Hex(genesis.BlockHash!), tx);
-                MetaStore.Set("LatestHeight", "0", tx);
 
                 tx.Commit();
             }

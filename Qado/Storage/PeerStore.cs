@@ -20,7 +20,7 @@ namespace Qado.Storage
             (ulong)ReadIntEnv("QADO_PEERS_TTL_DAYS", fallback: 1, min: 1, max: 365) * 24UL * 60UL * 60UL;
         private const string QuarantineReasonTtlExpired = "ttl-expired";
 
-        public static void Upsert(byte[] id, string ip, int port, ulong lastSeen, byte[]? pubkey, SqliteTransaction? tx = null)
+        public static void Upsert(byte[] id, string ip, int port, ulong lastSeen, SqliteTransaction? tx = null)
         {
             if (id is not { Length: 32 }) throw new ArgumentException("id must be 32 bytes", nameof(id));
             if (string.IsNullOrWhiteSpace(ip)) throw new ArgumentNullException(nameof(ip));
@@ -28,13 +28,13 @@ namespace Qado.Storage
 
             if (tx != null)
             {
-                UpsertCore(tx.Connection!, tx, id, ip, port, lastSeen, pubkey);
+                UpsertCore(tx.Connection!, tx, id, ip, port, lastSeen);
                 return;
             }
 
             lock (Db.Sync)
             {
-                UpsertCore(Db.Connection, null, id, ip, port, lastSeen, pubkey);
+                UpsertCore(Db.Connection, null, id, ip, port, lastSeen);
             }
 
             RaisePeerListChanged();
@@ -72,7 +72,7 @@ namespace Qado.Storage
                 if (bypassQuarantine)
                     ClearEndpointQuarantineCore(conn, tx, ipNorm, port);
 
-                UpsertCore(conn, tx, id, ipNorm, port, lastSeen, pubkey: null);
+                UpsertCore(conn, tx, id, ipNorm, port, lastSeen);
                 if (lastSeen > 0)
                     DeleteAnnouncedAtCore(conn, tx, id);
 
@@ -88,7 +88,7 @@ namespace Qado.Storage
                 if (bypassQuarantine)
                     ClearEndpointQuarantineCore(Db.Connection, null, ipNorm, port);
 
-                UpsertCore(Db.Connection, null, id, ipNorm, port, lastSeen, pubkey: null);
+                UpsertCore(Db.Connection, null, id, ipNorm, port, lastSeen);
                 if (lastSeen > 0)
                     DeleteAnnouncedAtCore(Db.Connection, null, id);
 
@@ -203,17 +203,15 @@ namespace Qado.Storage
             byte[] id,
             string ip,
             int port,
-            ulong lastSeen,
-            byte[]? pubkey)
+            ulong lastSeen)
         {
             const string sql = @"
-INSERT INTO peers(id,ip,port,last_seen,pubkey)
-VALUES($i,$ip,$p,$t,$k)
+INSERT INTO peers(id,ip,port,last_seen)
+VALUES($i,$ip,$p,$t)
 ON CONFLICT(id) DO UPDATE SET
   ip=excluded.ip,
   port=excluded.port,
-  last_seen=excluded.last_seen,
-  pubkey=excluded.pubkey;";
+  last_seen=excluded.last_seen;";
 
             long ts = lastSeen <= long.MaxValue ? (long)lastSeen : long.MaxValue;
 
@@ -224,7 +222,6 @@ ON CONFLICT(id) DO UPDATE SET
             cmd.Parameters.AddWithValue("$ip", ip);
             cmd.Parameters.AddWithValue("$p", port);
             cmd.Parameters.AddWithValue("$t", ts);
-            cmd.Parameters.AddWithValue("$k", (object?)pubkey ?? DBNull.Value);
             cmd.ExecuteNonQuery();
         }
 
@@ -236,8 +233,8 @@ ON CONFLICT(id) DO UPDATE SET
             int port)
         {
             const string sql = @"
-INSERT INTO peers(id,ip,port,last_seen,pubkey)
-VALUES($i,$ip,$p,0,NULL)
+INSERT INTO peers(id,ip,port,last_seen)
+VALUES($i,$ip,$p,0)
 ON CONFLICT(id) DO NOTHING;";
 
             using var cmd = conn.CreateCommand();

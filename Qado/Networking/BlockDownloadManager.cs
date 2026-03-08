@@ -25,7 +25,6 @@ namespace Qado.Networking
         private static readonly TimeSpan PeerFailureCooldownBase = TimeSpan.FromSeconds(25);
         private static readonly TimeSpan PeerFailureCooldownCap = TimeSpan.FromMinutes(10);
         private static readonly TimeSpan PeerFailureStreakResetAfter = TimeSpan.FromMinutes(15);
-        private static readonly TimeSpan OutOfPlanResyncCooldown = TimeSpan.FromSeconds(12);
         private static readonly TimeSpan OutOfPlanFallbackTtl = TimeSpan.FromMinutes(2);
         private static readonly TimeSpan LatencyFreshWindow = TimeSpan.FromMinutes(2);
         private const int MaxOutOfPlanFallbackHashes = 1024;
@@ -47,8 +46,6 @@ namespace Qado.Networking
         private readonly Func<IReadOnlyCollection<PeerSession>> _sessionSnapshot;
         private readonly Func<PeerSession, MsgType, byte[], CancellationToken, Task> _sendFrameAsync;
         private readonly Func<byte[], bool> _haveBlock;
-        private readonly Func<byte[], bool>? _isDownloadCandidate;
-        private readonly Action<string>? _requestResync;
         private readonly Func<ValidationWorkItem, bool> _enqueueValidator;
         private readonly Action<byte[]> _revalidateStoredBlock;
         private readonly ILogSink? _log;
@@ -58,11 +55,9 @@ namespace Qado.Networking
         private int _haveBlockCheckErrorLogged;
         private int _candidateCheckErrorLogged;
         private int _started;
-        private bool _downloadStarted;
         private string? _activeChunkPeerKey;
         private string? _lastChunkPeerKey;
         private int _activeChunkRequested;
-        private DateTime _nextOutOfPlanResyncAllowedUtc = DateTime.MinValue;
 
         private sealed class InflightRequest
         {
@@ -81,8 +76,6 @@ namespace Qado.Networking
             Func<IReadOnlyCollection<PeerSession>> sessionSnapshot,
             Func<PeerSession, MsgType, byte[], CancellationToken, Task> sendFrameAsync,
             Func<byte[], bool> haveBlock,
-            Func<byte[], bool>? isDownloadCandidate,
-            Action<string>? requestResync,
             Func<ValidationWorkItem, bool> enqueueValidator,
             Action<byte[]> revalidateStoredBlock,
             ILogSink? log = null)
@@ -90,20 +83,9 @@ namespace Qado.Networking
             _sessionSnapshot = sessionSnapshot ?? throw new ArgumentNullException(nameof(sessionSnapshot));
             _sendFrameAsync = sendFrameAsync ?? throw new ArgumentNullException(nameof(sendFrameAsync));
             _haveBlock = haveBlock ?? throw new ArgumentNullException(nameof(haveBlock));
-            _isDownloadCandidate = isDownloadCandidate;
-            _requestResync = requestResync;
             _enqueueValidator = enqueueValidator ?? throw new ArgumentNullException(nameof(enqueueValidator));
             _revalidateStoredBlock = revalidateStoredBlock ?? throw new ArgumentNullException(nameof(revalidateStoredBlock));
             _log = log;
-        }
-
-        public bool IsDownloadStarted
-        {
-            get
-            {
-                lock (_gate)
-                    return _downloadStarted;
-            }
         }
 
         public void ResetTransientSyncState(string reason = "manual")
@@ -135,7 +117,6 @@ namespace Qado.Networking
                 _peerCooldownUntilUtc.Clear();
                 _peerFailureStateByKey.Clear();
                 _outOfPlanFallbackUntilUtc.Clear();
-                _nextOutOfPlanResyncAllowedUtc = DateTime.MinValue;
                 _activeChunkPeerKey = null;
                 _lastChunkPeerKey = null;
                 _activeChunkRequested = 0;
@@ -155,68 +136,6 @@ namespace Qado.Networking
             _ = Task.Run(() => RecoverUnvalidatedBlocksAsync(ct), CancellationToken.None);
         }
 
-        public void BeginDownload(IReadOnlyList<byte[]> hashesToDownload, IReadOnlyList<byte[]> hashesToRevalidate)
-        {
-            int added;
-
-            lock (_gate)
-            {
-                _downloadStarted = true;
-                _activeChunkPeerKey = null;
-                _activeChunkRequested = 0;
-                _outOfPlanFallbackUntilUtc.Clear();
-                ReplaceActivePlan_NoLock(hashesToDownload, hashesToRevalidate);
-                added = EnqueueMissingHashes_NoLock(hashesToDownload, source: "plan");
-            }
-
-            if (hashesToRevalidate != null)
-            {
-                for (int i = 0; i < hashesToRevalidate.Count; i++)
-                {
-                    var hash = hashesToRevalidate[i];
-                    if (hash is not { Length: 32 })
-                        continue;
-
-                    try { _revalidateStoredBlock(hash); } catch { }
-                }
-            }
-
-            if (added > 0 || (hashesToRevalidate?.Count ?? 0) > 0)
-                RequestPump();
-        }
-
-        public void ReplanDownload(IReadOnlyList<byte[]> hashesToDownload, IReadOnlyList<byte[]> hashesToRevalidate)
-        {
-            int added;
-            lock (_gate)
-            {
-                _downloadStarted = true;
-                _activeChunkPeerKey = null;
-                _activeChunkRequested = 0;
-                _outOfPlanFallbackUntilUtc.Clear();
-                ReplaceActivePlan_NoLock(hashesToDownload, hashesToRevalidate);
-                TrimQueuedToActivePlan_NoLock();
-                TrimInflightToActivePlan_NoLock();
-                TrimStateToActivePlan_NoLock();
-                added = EnqueueMissingHashes_NoLock(hashesToDownload, source: "replan");
-            }
-
-            if (hashesToRevalidate != null)
-            {
-                for (int i = 0; i < hashesToRevalidate.Count; i++)
-                {
-                    var hash = hashesToRevalidate[i];
-                    if (hash is not { Length: 32 })
-                        continue;
-
-                    try { _revalidateStoredBlock(hash); } catch { }
-                }
-            }
-
-            if (added > 0 || (hashesToRevalidate?.Count ?? 0) > 0)
-                RequestPump();
-        }
-
         public bool EnqueueBlockPayload(PeerSession peer, byte[] payload, bool? enforceRateLimitOverride = null)
         {
             if (peer == null || payload == null || payload.Length == 0)
@@ -230,12 +149,7 @@ namespace Qado.Networking
             if (peer == null)
                 return;
 
-            bool shouldPump;
-            lock (_gate)
-                shouldPump = _downloadStarted;
-
-            if (shouldPump)
-                RequestPump();
+            RequestPump();
         }
 
         public void OnPeerDisconnected(PeerSession peer)
@@ -298,11 +212,6 @@ namespace Qado.Networking
                 return;
             }
 
-            bool downloadStarted;
-            lock (_gate)
-                downloadStarted = _downloadStarted;
-
-            bool shouldResync = false;
             var inPlan = new List<byte[]>(hashes.Count);
             var outOfPlanUnknown = new List<byte[]>(hashes.Count);
             var outOfPlanFetchable = new List<byte[]>(Math.Min(hashes.Count, MaxOutOfPlanFallbackPerInv));
@@ -336,37 +245,13 @@ namespace Qado.Networking
                 if (BlockIndexStore.IsBadOrHasBadAncestor(hash))
                     continue;
 
-                shouldResync = true;
                 if (outOfPlanFetchable.Count < MaxOutOfPlanFallbackPerInv)
                     outOfPlanFetchable.Add(hash);
             }
 
-            if (shouldResync)
-            {
-                bool allowResync = true;
-                if (downloadStarted)
-                {
-                    lock (_gate)
-                    {
-                        DateTime now = DateTime.UtcNow;
-                        if (now < _nextOutOfPlanResyncAllowedUtc)
-                        {
-                            allowResync = false;
-                        }
-                        else
-                        {
-                            _nextOutOfPlanResyncAllowedUtc = now + OutOfPlanResyncCooldown;
-                        }
-                    }
-                }
-
-                if (allowResync)
-                    _requestResync?.Invoke(downloadStarted ? "inv-out-of-plan" : "inv-before-download");
-            }
-
             int fallbackArmed = 0;
             int fallbackQueued = 0;
-            if (downloadStarted && outOfPlanFetchable.Count > 0)
+            if (outOfPlanFetchable.Count > 0)
             {
                 lock (_gate)
                 {
@@ -405,9 +290,6 @@ namespace Qado.Networking
 
             lock (_gate)
             {
-                if (!_downloadStarted)
-                    return 0;
-
                 DateTime now = DateTime.UtcNow;
                 PruneOutOfPlanFallback_NoLock(now);
                 armed = AddOutOfPlanFallback_NoLock(new[] { hash }, now);
@@ -489,11 +371,7 @@ namespace Qado.Networking
 
             string hex = ToHex(hash);
             lock (_gate)
-            {
-                if (!_downloadStarted)
-                    return false;
                 return _activePlanHashes.Contains(hex);
-            }
         }
 
         public bool IsOutOfPlanFallbackHash(byte[] hash)
@@ -555,13 +433,6 @@ namespace Qado.Networking
 
         private async Task PumpDownloadAsync(CancellationToken ct)
         {
-            bool downloadStarted;
-            lock (_gate)
-                downloadStarted = _downloadStarted;
-
-            if (!downloadStarted)
-                return;
-
             var peers = _sessionSnapshot();
             if (peers == null || peers.Count == 0)
                 return;
@@ -694,9 +565,6 @@ namespace Qado.Networking
 
             lock (_gate)
             {
-                if (!_downloadStarted)
-                    return;
-
                 added = EnqueueMissingHashes_NoLock(hashes, source, ref duplicates, now);
             }
 
@@ -1319,20 +1187,6 @@ LIMIT 50000;";
                     return false;
             }
 
-            if (_isDownloadCandidate != null)
-            {
-                try
-                {
-                    return _isDownloadCandidate(hash);
-                }
-                catch (Exception ex)
-                {
-                    if (Interlocked.CompareExchange(ref _candidateCheckErrorLogged, 1, 0) == 0)
-                        _log?.Warn("Sync", $"download-candidate check failed; suppressing repeats: {ex.Message}");
-                    return false;
-                }
-            }
-
             try
             {
                 return !BlockIndexStore.IsBadOrHasBadAncestor(hash);
@@ -1340,7 +1194,7 @@ LIMIT 50000;";
             catch (Exception ex)
             {
                 if (Interlocked.CompareExchange(ref _candidateCheckErrorLogged, 1, 0) == 0)
-                    _log?.Warn("Sync", $"download-candidate fallback check failed; suppressing repeats: {ex.Message}");
+                    _log?.Warn("Sync", $"download-candidate check failed; suppressing repeats: {ex.Message}");
                 return false;
             }
         }
@@ -1356,105 +1210,6 @@ LIMIT 50000;";
                 if (Interlocked.CompareExchange(ref _haveBlockCheckErrorLogged, 1, 0) == 0)
                     _log?.Warn("Sync", $"have-block check failed; suppressing repeats: {ex.Message}");
                 return false;
-            }
-        }
-
-        private void ReplaceActivePlan_NoLock(IReadOnlyList<byte[]>? hashesToDownload, IReadOnlyList<byte[]>? hashesToRevalidate)
-        {
-            _activePlanHashes.Clear();
-            AddPlanHashes_NoLock(hashesToDownload);
-            AddPlanHashes_NoLock(hashesToRevalidate);
-        }
-
-        private void TrimQueuedToActivePlan_NoLock()
-        {
-            if (_missingQueue.Count == 0)
-            {
-                _queuedSet.Clear();
-                return;
-            }
-
-            var keepQueue = new Queue<byte[]>(_missingQueue.Count);
-            var keepSet = new HashSet<string>(StringComparer.Ordinal);
-
-            while (_missingQueue.Count > 0)
-            {
-                var hash = _missingQueue.Dequeue();
-                if (hash is not { Length: 32 })
-                    continue;
-
-                string hex = ToHex(hash);
-                if (!_activePlanHashes.Contains(hex))
-                    continue;
-
-                if (!keepSet.Add(hex))
-                    continue;
-
-                keepQueue.Enqueue(hash);
-            }
-
-            _missingQueue.Clear();
-            while (keepQueue.Count > 0)
-                _missingQueue.Enqueue(keepQueue.Dequeue());
-
-            _queuedSet.Clear();
-            foreach (var hex in keepSet)
-                _queuedSet.Add(hex);
-        }
-
-        private void TrimInflightToActivePlan_NoLock()
-        {
-            if (_inflightByHash.Count == 0)
-                return;
-
-            var remove = new List<string>();
-            foreach (var kv in _inflightByHash)
-            {
-                if (!_activePlanHashes.Contains(kv.Key))
-                    remove.Add(kv.Key);
-            }
-
-            for (int i = 0; i < remove.Count; i++)
-            {
-                string hashHex = remove[i];
-                if (!_inflightByHash.TryGetValue(hashHex, out var req))
-                    continue;
-
-                _inflightByHash.Remove(hashHex);
-
-                if (_inflightByPeer.TryGetValue(req.PeerKey, out var set))
-                {
-                    set.Remove(hashHex);
-                    if (set.Count == 0)
-                        _inflightByPeer.Remove(req.PeerKey);
-                }
-            }
-        }
-
-        private void TrimStateToActivePlan_NoLock()
-        {
-            if (_stateByHash.IsEmpty)
-                return;
-
-            foreach (var kv in _stateByHash)
-            {
-                if (_activePlanHashes.Contains(kv.Key))
-                    continue;
-
-                _stateByHash.TryRemove(kv.Key, out _);
-            }
-        }
-
-        private void AddPlanHashes_NoLock(IReadOnlyList<byte[]>? hashes)
-        {
-            if (hashes == null || hashes.Count == 0)
-                return;
-
-            for (int i = 0; i < hashes.Count; i++)
-            {
-                if (hashes[i] is not { Length: 32 } h)
-                    continue;
-                _activePlanHashes.Add(ToHex(h));
             }
         }
 

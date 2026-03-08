@@ -14,22 +14,6 @@ namespace Qado.Storage
         public const int StatusSideStatelessAccepted = 2;
         public const int StatusSideStateInvalid = 3;
 
-        public readonly record struct HeaderRecord(
-            byte[] Hash,
-            byte[] PrevHash,
-            ulong Height,
-            ulong Timestamp,
-            byte[] Target,
-            byte[] Miner,
-            UInt128 Chainwork,
-            int Status,
-            bool IsBad,
-            bool BadAncestor,
-            int BadReason,
-            int FileId,
-            long RecordOffset,
-            int RecordSize);
-
         private static SqliteConnection Conn =>
             Db.Connection ?? throw new InvalidOperationException("Db not initialized");
 
@@ -41,9 +25,6 @@ namespace Qado.Storage
             byte[] target32,
             byte[] miner32,
             UInt128 chainwork,
-            int fileId,
-            long recordOffset,
-            int recordSize,
             int statusFlags,
             SqliteTransaction? tx = null)
         {
@@ -58,11 +39,9 @@ namespace Qado.Storage
                 cmd.Transaction = tx;
                 cmd.CommandText = @"
 INSERT INTO block_index(
-  hash, prev_hash, height, ts, target, miner, chainwork,
-  file_id, file_offset, file_size, status
+  hash, prev_hash, height, ts, target, miner, chainwork, status
 ) VALUES(
-  $h, $p, $ht, $ts, $t, $m, $cw,
-  $fid, $off, $sz, $st
+  $h, $p, $ht, $ts, $t, $m, $cw, $st
 )
 ON CONFLICT(hash) DO UPDATE SET
   prev_hash   = excluded.prev_hash,
@@ -71,9 +50,6 @@ ON CONFLICT(hash) DO UPDATE SET
   target      = excluded.target,
   miner       = excluded.miner,
   chainwork   = excluded.chainwork,
-  file_id     = excluded.file_id,
-  file_offset = excluded.file_offset,
-  file_size   = excluded.file_size,
   status      = excluded.status;
 ";
                 cmd.Parameters.AddWithValue("$h", hash);
@@ -87,48 +63,24 @@ ON CONFLICT(hash) DO UPDATE SET
                 U128.WriteBE(cw, chainwork);
                 cmd.Parameters.AddWithValue("$cw", cw.ToArray());
 
-                cmd.Parameters.AddWithValue("$fid", fileId);
-                cmd.Parameters.AddWithValue("$off", recordOffset);
-                cmd.Parameters.AddWithValue("$sz", recordSize);
                 cmd.Parameters.AddWithValue("$st", statusFlags);
 
                 cmd.ExecuteNonQuery();
             }
         }
 
-        public static (int fileId, long recordOffset, int recordSize)? GetLocation(byte[] hash, SqliteTransaction? tx = null)
+        public static bool HasPayload(byte[] hash, SqliteTransaction? tx = null)
         {
-            if (hash is not { Length: 32 }) return null;
+            if (hash is not { Length: 32 }) return false;
 
             lock (Db.Sync)
             {
                 using var cmd = (tx?.Connection ?? Conn).CreateCommand();
                 cmd.Transaction = tx;
-                cmd.CommandText = "SELECT file_id, file_offset, file_size FROM block_index WHERE hash=$h LIMIT 1;";
+                cmd.CommandText = "SELECT 1 FROM block_payloads WHERE hash=$h LIMIT 1;";
                 cmd.Parameters.AddWithValue("$h", hash);
-                using var r = cmd.ExecuteReader();
-                if (!r.Read()) return null;
-                if (r.FieldCount < 3)
-                    return null;
-
-                int fileId;
-                long offset;
-                int size;
-                try
-                {
-                    fileId = r.GetInt32(0);
-                    offset = r.GetInt64(1);
-                    size = r.GetInt32(2);
-                }
-                catch
-                {
-                    return null;
-                }
-
-                if (fileId < 0 || offset < 0 || size <= 0)
-                    return null;
-
-                return (fileId, offset, size);
+                var v = cmd.ExecuteScalar();
+                return v != null && v is not DBNull;
             }
         }
 
@@ -209,75 +161,7 @@ ON CONFLICT(hash) DO UPDATE SET
             }
         }
 
-        public static bool TryGetHeaderRecord(byte[] hash, out HeaderRecord record, SqliteTransaction? tx = null)
-        {
-            record = default;
-            if (hash is not { Length: 32 }) return false;
-
-            lock (Db.Sync)
-            {
-                using var cmd = (tx?.Connection ?? Conn).CreateCommand();
-                cmd.Transaction = tx;
-                cmd.CommandText = @"
-SELECT prev_hash, height, ts, target, miner, chainwork, status, is_bad, bad_ancestor, bad_reason, file_id, file_offset, file_size
-FROM block_index
-WHERE hash=$h
-LIMIT 1;";
-                cmd.Parameters.AddWithValue("$h", hash);
-                using var r = cmd.ExecuteReader();
-                if (!r.Read()) return false;
-
-                var prev = r[0] as byte[];
-                long heightRaw = r.GetInt64(1);
-                long tsRaw = r.GetInt64(2);
-                var target = r[3] as byte[];
-                var miner = r[4] as byte[];
-                var cwBytes = r[5] as byte[];
-                long statusRaw = r.GetInt64(6);
-                long isBadRaw = r.GetInt64(7);
-                long badAncestorRaw = r.GetInt64(8);
-                long badReasonRaw = r.GetInt64(9);
-                int fileId = r.GetInt32(10);
-                long recordOffset = r.GetInt64(11);
-                int recordSize = r.GetInt32(12);
-
-                if (prev is not { Length: 32 } ||
-                    target is not { Length: 32 } ||
-                    miner is not { Length: 32 } ||
-                    cwBytes is not { Length: 16 } ||
-                    heightRaw < 0 ||
-                    tsRaw < 0)
-                {
-                    return false;
-                }
-
-                record = new HeaderRecord(
-                    Hash: (byte[])hash.Clone(),
-                    PrevHash: (byte[])prev.Clone(),
-                    Height: (ulong)heightRaw,
-                    Timestamp: (ulong)tsRaw,
-                    Target: (byte[])target.Clone(),
-                    Miner: (byte[])miner.Clone(),
-                    Chainwork: U128.ReadBE(cwBytes),
-                    Status: (int)statusRaw,
-                    IsBad: isBadRaw != 0,
-                    BadAncestor: badAncestorRaw != 0,
-                    BadReason: (int)badReasonRaw,
-                    FileId: fileId,
-                    RecordOffset: recordOffset,
-                    RecordSize: recordSize);
-
-                return true;
-            }
-        }
-
-        public static bool TryGetBestHeaderHash(out byte[] hash, SqliteTransaction? tx = null)
-        {
-            hash = Array.Empty<byte>();
-            return TryGetBestHeaderTip(out hash, out _, out _, tx);
-        }
-
-        public static bool TryGetBestHeaderTip(out byte[] hash, out ulong height, out UInt128 chainwork, SqliteTransaction? tx = null)
+        public static bool TryGetBestKnownTip(out byte[] hash, out ulong height, out UInt128 chainwork, SqliteTransaction? tx = null)
         {
             hash = Array.Empty<byte>();
             height = 0;
@@ -342,46 +226,6 @@ LIMIT 1;";
                 hash = (byte[])h.Clone();
                 height = (ulong)heightRaw;
                 chainwork = U128.ReadBE(cwBytes);
-                return true;
-            }
-        }
-
-        public static void UpsertHeaderBytes(byte[] hash, byte[] headerBytes, SqliteTransaction? tx = null)
-        {
-            if (hash is not { Length: 32 }) throw new ArgumentException("hash must be 32 bytes", nameof(hash));
-            if (headerBytes == null || headerBytes.Length == 0) throw new ArgumentException("headerBytes must not be empty", nameof(headerBytes));
-
-            lock (Db.Sync)
-            {
-                using var cmd = (tx?.Connection ?? Conn).CreateCommand();
-                cmd.Transaction = tx;
-                cmd.CommandText = @"
-INSERT INTO header_store(hash, header)
-VALUES($h, $hdr)
-ON CONFLICT(hash) DO UPDATE SET
-  header = excluded.header;";
-                cmd.Parameters.AddWithValue("$h", hash);
-                cmd.Parameters.AddWithValue("$hdr", headerBytes);
-                cmd.ExecuteNonQuery();
-            }
-        }
-
-        public static bool TryGetHeaderBytes(byte[] hash, out byte[] headerBytes, SqliteTransaction? tx = null)
-        {
-            headerBytes = Array.Empty<byte>();
-            if (hash is not { Length: 32 }) return false;
-
-            lock (Db.Sync)
-            {
-                using var cmd = (tx?.Connection ?? Conn).CreateCommand();
-                cmd.Transaction = tx;
-                cmd.CommandText = "SELECT header FROM header_store WHERE hash=$h LIMIT 1;";
-                cmd.Parameters.AddWithValue("$h", hash);
-                var v = cmd.ExecuteScalar() as byte[];
-                if (v is not { Length: > 0 })
-                    return false;
-
-                headerBytes = (byte[])v.Clone();
                 return true;
             }
         }
@@ -590,10 +434,7 @@ WHERE (is_bad <> 0 OR bad_ancestor <> 0)
                 cmd.Transaction = tx;
                 cmd.CommandText = @"
 UPDATE block_index
-SET file_id = -1,
-    file_offset = -1,
-    file_size = 0,
-    status = CASE
+SET status = CASE
         WHEN is_bad <> 0 OR bad_ancestor <> 0 THEN status
         ELSE $headerOnly
     END
@@ -626,9 +467,10 @@ WHERE hash = $h;";
                 using var cmd = (tx?.Connection ?? Conn).CreateCommand();
                 cmd.Transaction = tx;
                 cmd.CommandText = @"
-SELECT COUNT(1), IFNULL(SUM(file_size), 0)
-FROM block_index
-WHERE status = $st;";
+SELECT COUNT(1), IFNULL(SUM(LENGTH(bp.payload)), 0)
+FROM block_index bi
+LEFT JOIN block_payloads bp ON bp.hash = bi.hash
+WHERE bi.status = $st;";
                 cmd.Parameters.AddWithValue("$st", statusFlags);
 
                 using var r = cmd.ExecuteReader();
@@ -647,8 +489,9 @@ WHERE status = $st;";
                 using var cmd = (tx?.Connection ?? Conn).CreateCommand();
                 cmd.Transaction = tx;
                 cmd.CommandText = @"
-SELECT COUNT(1), IFNULL(SUM(bi.file_size), 0)
+SELECT COUNT(1), IFNULL(SUM(LENGTH(bp.payload)), 0)
 FROM block_index bi
+LEFT JOIN block_payloads bp ON bp.hash = bi.hash
 LEFT JOIN canon c ON c.hash = bi.hash
 WHERE c.hash IS NULL
   AND bi.status = $st

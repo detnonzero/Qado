@@ -191,7 +191,6 @@ namespace Qado.CodeBehindHelper
                     var miner = new Miner(
                         privateKeyHex,
                         () => buffer.GetAllReadyTransactionsSortedByFee(),
-                        null, // compatibility parameter, currently unused
                         async (block) => await OnBlockMinedAsync(block, privateKeyHex, mempool, logSink, balanceTextBlock).ConfigureAwait(false),
                         _ => { },
                         () => { Interlocked.Increment(ref _hashCount); }, // hash-rate callback
@@ -263,8 +262,6 @@ namespace Qado.CodeBehindHelper
                         StateApplier.ApplyBlockWithUndo(block, tx);
 
                         BlockStore.SetCanonicalHashAtHeight(newCanonHeight, block.BlockHash!, tx);
-                        MetaStore.Set("LatestBlockHash", Convert.ToHexString(block.BlockHash!).ToLowerInvariant(), tx);
-                        MetaStore.Set("LatestHeight", newCanonHeight.ToString(), tx);
 
                         extendedCanon = true;
                     }
