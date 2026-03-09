@@ -19,7 +19,7 @@ namespace Qado.Networking
 
     public static class BlockSyncProtocol
     {
-        public const int BatchMaxBlocks = 1440;
+        public const int BatchMaxBlocks = 4096;
         public const int ChunkBlocks = 64;
         public const int MaxLocatorHashes = 64;
         public const int MaxSerializedBlockBytes = 64 * 1024;

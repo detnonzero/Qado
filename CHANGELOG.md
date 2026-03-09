@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.3.2] - 2026-03-09
+
+### Changed
+- Direct block-sync batch size was increased from `1440` to `4096` blocks while keeping `64` blocks per chunk.
+
+### Notes
+- This keeps the chunk/frame format unchanged, so mixed-version peers remain compatible; older peers simply continue capping batches at `1440`.
+
 ## [0.3.1] - 2026-03-08
 
 ### Changed
@@ -42,6 +50,7 @@ All notable changes to this project are documented in this file.
 ### Notes
 - `0.3.1` expects a fresh database after the schema cleanup. No SQLite migrations are provided for these removals; delete `data/` and resync.
 - Release artifacts continue to be produced via `release.ps1` (`win-x64` + `SHA256SUMS.txt`).
+
 
 ## [0.3.0] - 2026-03-05
 

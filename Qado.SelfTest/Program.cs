@@ -43,7 +43,7 @@ internal static class Program
             Run("ChainSelector_Reorg_MempoolReconcile", TestChainSelectorReorgMempoolReconcile);
             Run("MempoolSelection_RespectsSenderNonceOrder", TestMempoolSelectionRespectsSenderNonceOrder);
             Run("BlockLocator_FindsForkpoint", TestBlockLocatorFindsForkpoint);
-            Run("BlockSyncProtocol_Chunks1440Blocks", TestBlockSyncProtocolChunks1440Blocks);
+            Run("BlockSyncProtocol_Chunks4096Blocks", TestBlockSyncProtocolChunks4096Blocks);
             Run("BlockSyncProtocol_TipPayload_RoundTripsChainwork", TestBlockSyncProtocolTipPayloadRoundTripsChainwork);
             Run("BlockSyncClient_PrefersHigherChainworkOverHeight", TestBlockSyncClientPrefersHigherChainworkOverHeight);
             Run("BlockSyncClient_Disconnect_ResumesFromLastCommitted", TestBlockSyncClientDisconnectResumesFromLastCommitted);
@@ -564,10 +564,10 @@ internal static class Program
         Assert(BytesEqual(foundHash, forkHash), "fork hash mismatch");
     }
 
-    private static void TestBlockSyncProtocolChunks1440Blocks()
+    private static void TestBlockSyncProtocolChunks4096Blocks()
     {
-        var blocks = new List<byte[]>(1440);
-        for (int i = 0; i < 1440; i++)
+        var blocks = new List<byte[]>(4096);
+        for (int i = 0; i < 4096; i++)
         {
             var blob = new byte[96];
             blob[0] = (byte)i;
@@ -576,7 +576,7 @@ internal static class Program
         }
 
         var payloads = BlockSyncProtocol.BuildChunkPayloads(blocks, startHeight: 777UL);
-        Assert(payloads.Count == 23, $"expected 23 chunk payloads, got {payloads.Count}");
+        Assert(payloads.Count == 64, $"expected 64 chunk payloads, got {payloads.Count}");
 
         ulong expectedHeight = 777UL;
         int totalBlocks = 0;
@@ -592,7 +592,7 @@ internal static class Program
             expectedHeight += (ulong)frame.Blocks.Count;
         }
 
-        Assert(totalBlocks == 1440, $"expected 1440 chunked blocks, got {totalBlocks}");
+        Assert(totalBlocks == 4096, $"expected 4096 chunked blocks, got {totalBlocks}");
     }
 
     private static void TestBlockSyncProtocolTipPayloadRoundTripsChainwork()
