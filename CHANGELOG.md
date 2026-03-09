@@ -2,6 +2,50 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.3.3] - 2026-03-09
+
+### Changed
+- The P2P/sync stack was redesigned for the small-network block-first model:
+  - live gossip now prefers direct full `Block` push
+  - peer coordination now uses `Hello` + `TipState`
+  - parent recovery now uses `GetAncestorPack`
+  - initial sync now runs only via `GetBlocksByLocator` / `GetBlocksFrom` plus `BlocksBatchStart` / `BlocksChunk` / `BlocksBatchEnd`
+- The runtime was split into clearer components:
+  - `SmallNetPeerFlow` for peer control-plane handling
+  - `BlockIngressFlow` for live/requested block intake
+  - `BulkSyncRuntime` for chunked initial-sync commit/finalize behavior
+- Live-gossip and bulk-sync behavior were decoupled:
+  - live blocks are prioritized in validation
+  - known side branches are retained instead of being dropped early
+  - missing parents are buffered as orphans and actively requested from the same peer
+- Initial sync remains chunked for performance:
+  - `64` blocks per chunk
+  - up to `4096` blocks per batch
+  - SQL commit remains chunkwise
+  - in-memory sync history/ancestor caching is used during validation
+- Legacy active runtime paths were removed from the wire flow:
+  - `InvBlock` / `GetData`
+  - `GetTip` / `Tip`
+  - old mixed legacy sync dispatch paths
+
+### Fixed
+- Fixed long-lived peer divergence where fresh competing tip/side blocks could be ignored or mishandled outside the old active-plan path.
+- Fixed orphan/parent handling so unknown-parent blocks are validated statelessly, buffered, and trigger immediate parent recovery instead of being silently lost.
+- Fixed mempool drift by only removing transactions after true canonical acceptance/adoption.
+- Fixed repeated initial-sync restart loops at the `4096` batch boundary:
+  - continuation now resumes from the current local canonical tip
+  - `more-available` continuation keeps the validation/sync gate across batch boundaries
+  - coordinator-driven parallel catch-up requests are suppressed while direct block sync is already active
+  - UI/local adoption and local mining no longer interfere with the active initial-sync continuation path
+- Fixed diagnostics around batch continuation failures by logging both local and expected forkpoints.
+
+### Notes
+- `0.3.3` is intentionally not P2P-wire-compatible with older binaries:
+  - handshake version is now `2`
+  - SmallNet protocol version is now `2`
+  - upgrade all peers together; mixed old/new nodes are not supported
+- SelfTest coverage was expanded for orphan promotion, bulk-sync continuation, disconnect resume, active-sync suppression of parallel catch-up requests, and the new block-first peer flow.
+
 ## [0.3.2] - 2026-03-09
 
 ### Changed

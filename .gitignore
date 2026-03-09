@@ -364,3 +364,8 @@ FodyWeavers.xsd
 
 # Local release scratch/output
 _tmp_build/
+.dotnet-home/
+.dotnet-cli/
+selftest*.log
+selftest*.out
+selftest*.err

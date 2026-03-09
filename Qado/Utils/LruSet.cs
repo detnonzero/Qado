@@ -52,6 +52,15 @@ namespace Qado.Utils
             return TryAdd(h);
         }
 
+        public void Clear()
+        {
+            while (_fifo.TryDequeue(out _))
+            {
+            }
+
+            _seen.Clear();
+        }
+
         private void PurgeExpired()
         {
             long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();

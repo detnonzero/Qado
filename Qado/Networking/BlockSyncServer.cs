@@ -93,10 +93,17 @@ namespace Qado.Networking
             }
 
             ulong startHeight = forkHeight + 1UL;
+            Guid batchId = Guid.NewGuid();
             await sendFrameAsync(
                 peer,
-                MsgType.BlocksBegin,
-                BlockSyncProtocol.BuildBlocksBegin(forkHash, startHeight, totalBlocks),
+                MsgType.BlocksBatchStart,
+                SmallNetSyncProtocol.BuildBlocksBatchStart(new SmallNetBlocksBatchStartFrame(
+                    batchId,
+                    forkHash,
+                    forkHeight,
+                    totalBlocks,
+                    BlockStore.GetCanonicalHashAtHeight(tipHeight) ?? new byte[32],
+                    TryGetTipChainwork(tipHeight))),
                 ct).ConfigureAwait(false);
 
             int sentBlocks = 0;
@@ -112,7 +119,15 @@ namespace Qado.Networking
                     if (!BlockStore.TryGetSerializedCanonicalBlockAtHeight(currentHeight, out var blockBlob))
                     {
                         log?.Warn("Sync", $"BlockSyncServer missing canonical payload at height {currentHeight}; terminating stream early.");
-                        await sendFrameAsync(peer, MsgType.BlocksEnd, BlockSyncProtocol.BuildBlocksEnd(BlocksEndStatus.MoreAvailable), ct)
+                        await sendFrameAsync(
+                                peer,
+                                MsgType.BlocksBatchEnd,
+                                SmallNetSyncProtocol.BuildBlocksBatchEnd(new SmallNetBlocksBatchEndFrame(
+                                    batchId,
+                                    forkHash,
+                                    forkHeight,
+                                    MoreAvailable: true)),
+                                ct)
                             .ConfigureAwait(false);
                         return;
                     }
@@ -123,8 +138,8 @@ namespace Qado.Networking
 
                 await sendFrameAsync(
                     peer,
-                    MsgType.BlockChunk,
-                    BlockSyncProtocol.BuildBlockChunk(firstHeight, chunk),
+                    MsgType.BlocksChunk,
+                    SmallNetSyncProtocol.BuildBlocksChunk(firstHeight, chunk),
                     ct).ConfigureAwait(false);
 
                 sentBlocks += chunk.Count;
@@ -134,7 +149,27 @@ namespace Qado.Networking
                 ? BlocksEndStatus.TipReached
                 : BlocksEndStatus.MoreAvailable;
 
-            await sendFrameAsync(peer, MsgType.BlocksEnd, BlockSyncProtocol.BuildBlocksEnd(status), ct).ConfigureAwait(false);
+            byte[] lastHash = totalBlocks > 0
+                ? BlockStore.GetCanonicalHashAtHeight(forkHeight + (ulong)totalBlocks) ?? forkHash
+                : forkHash;
+            await sendFrameAsync(
+                peer,
+                MsgType.BlocksBatchEnd,
+                SmallNetSyncProtocol.BuildBlocksBatchEnd(new SmallNetBlocksBatchEndFrame(
+                    batchId,
+                    lastHash,
+                    forkHeight + (ulong)totalBlocks,
+                    status == BlocksEndStatus.MoreAvailable)),
+                ct).ConfigureAwait(false);
+        }
+
+        private static UInt128 TryGetTipChainwork(ulong tipHeight)
+        {
+            var tipHash = BlockStore.GetCanonicalHashAtHeight(tipHeight);
+            if (tipHash is not { Length: 32 })
+                return 0;
+
+            return BlockIndexStore.GetChainwork(tipHash);
         }
 
         private static bool TryGetCanonicalHeight(byte[] hash, out ulong height)

@@ -236,14 +236,16 @@ namespace Qado.CodeBehindHelper
                 }
 
                 bool extendedCanon = false;
+                bool canonicalized = false;
                 ulong newCanonHeight = 0;
                 string? rejectReason = null;
+                bool syncActive = P2PNode.Instance?.IsInitialBlockSyncActive == true;
 
                 lock (Db.Sync)
                 {
                     using var tx = Db.Connection.BeginTransaction();
 
-                    if (TryComputeCanonExtensionHeight(block, tx, out newCanonHeight))
+                    if (!syncActive && TryComputeCanonExtensionHeight(block, tx, out newCanonHeight))
                     {
                         block.BlockHeight = newCanonHeight;
 
@@ -294,13 +296,29 @@ namespace Qado.CodeBehindHelper
                     ? $"✅ Mined + stored: h={newCanonHeight}"
                     : $"✅ Mined + stored (side/reorg candidate): h={block.BlockHeight}");
 
-                if (!extendedCanon)
+                if (syncActive && !extendedCanon)
+                    logSink.Info("Mining", "Initial block sync active; mined side candidate was not adopted into canonical chain.");
+
+                canonicalized = extendedCanon;
+
+                if (!extendedCanon && !syncActive)
                 {
-                    try { ChainSelector.MaybeAdoptNewTip(block.BlockHash!, logSink, mempool); }
+                    try
+                    {
+                        ChainSelector.MaybeAdoptNewTip(block.BlockHash!, logSink, mempool);
+                        if (BlockIndexStore.TryGetStatus(block.BlockHash!, out var status) &&
+                            BlockIndexStore.IsValidatedStatus(status))
+                        {
+                            canonicalized = true;
+                        }
+                    }
                     catch { }
                 }
 
-                try { mempool.RemoveIncluded(block); } catch { }
+                if (canonicalized)
+                {
+                    try { mempool.RemoveIncluded(block); } catch { }
+                }
 
                 UiBeginInvoke(() =>
                 {
@@ -316,12 +334,40 @@ namespace Qado.CodeBehindHelper
 
                 try
                 {
-                    if (P2PNode.Instance != null)
-                        _ = Task.Run(() => P2PNode.Instance.BroadcastBlockAsync(block));
+                    var node = P2PNode.Instance;
+                    if (node != null)
+                    {
+                        _ = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                await node.BroadcastBlockAsync(block).ConfigureAwait(false);
+                            }
+                            catch (Exception ex)
+                            {
+                                logSink.Warn("Gossip", $"Block broadcast task failed: {ex.Message}");
+                            }
+                        });
+                    }
                     else
-                        _ = Task.Run(() => BroadcastBlockFallbackAsync(block, logSink));
+                    {
+                        _ = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                await BroadcastBlockFallbackAsync(block, logSink).ConfigureAwait(false);
+                            }
+                            catch (Exception ex)
+                            {
+                                logSink.Warn("Gossip", $"Block fallback broadcast task failed: {ex.Message}");
+                            }
+                        });
+                    }
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    logSink.Warn("Gossip", $"Failed to schedule block broadcast: {ex.Message}");
+                }
 
                 Interlocked.Exchange(ref _blockStartUtcTicks, DateTime.UtcNow.Ticks);
                 Interlocked.Exchange(ref _hashCount, 0);

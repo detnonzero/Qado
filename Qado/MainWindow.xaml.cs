@@ -440,6 +440,9 @@ namespace Qado
         {
             try
             {
+                if (_p2pNode?.IsInitialBlockSyncActive == true)
+                    return;
+
                 ulong latest = BlockStore.GetLatestHeight();
                 var tip = BlockStore.GetBlockByHeight(latest);
                 var cand = tip?.BlockHash;

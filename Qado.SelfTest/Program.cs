@@ -7,6 +7,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using NSec.Cryptography;
 using Qado.Blockchain;
+using Qado.Logging;
 using Qado.Mempool;
 using Qado.Networking;
 using Qado.Serialization;
@@ -17,48 +18,78 @@ internal static class Program
 {
     private const byte MerkleLeafTag = 0x00;
     private const byte MerkleNodeTag = 0x01;
+    private static readonly byte[] SelfTestEasyTarget = Convert.FromHexString("7" + new string('F', 63));
+
+    private sealed class ListLogSink : ILogSink
+    {
+        public List<string> Lines { get; } = new();
+
+        public void Info(string category, string message) => Lines.Add($"INFO:{category}:{message}");
+        public void Warn(string category, string message) => Lines.Add($"WARN:{category}:{message}");
+        public void Error(string category, string message) => Lines.Add($"ERR:{category}:{message}");
+    }
+
+    private sealed record TestCase(string Name, Action Body);
 
     private static string _tempRoot = string.Empty;
     private static int _passed;
     private static int _failed;
-
-    public static int Main()
+    private static readonly IReadOnlyList<TestCase> Tests = new[]
     {
-        string tempRoot = Path.Combine(Path.GetTempPath(), "qado-selftest-" + Guid.NewGuid().ToString("N"));
+        new TestCase("Genesis_Stored", TestGenesisStored),
+        new TestCase("BlockPayloads_StoredInSqlite", TestBlockPayloadsStoredInSqlite),
+        new TestCase("StateApplier_RejectsNonceGap", TestStateApplierRejectsNonceGap),
+        new TestCase("StateApplier_AcceptsSequentialNonce", TestStateApplierAcceptsSequentialNonce),
+        new TestCase("StateApplier_SelfTransfer_MinedBySender_IsNotInflationary", TestStateApplierSelfTransferMinedBySenderIsNotInflationary),
+        new TestCase("KeyStore_EncryptsAtRest", TestKeyStoreEncryptsAtRest),
+        new TestCase("Merkle_DomainSeparation_Profile", TestMerkleDomainSeparationProfile),
+        new TestCase("TxId_CommitsSignature", TestTxIdCommitsSignature),
+        new TestCase("BlockSerializer_RejectsInvalidTarget", TestBlockSerializerRejectsInvalidTarget),
+        new TestCase("BlockValidator_TipValidation_WorksInsideTransaction", TestBlockValidatorTipValidationWorksInsideTransaction),
+        new TestCase("ChainSelector_Reorg_MempoolReconcile", TestChainSelectorReorgMempoolReconcile),
+        new TestCase("MempoolSelection_RespectsSenderNonceOrder", TestMempoolSelectionRespectsSenderNonceOrder),
+        new TestCase("BlockLocator_FindsForkpoint", TestBlockLocatorFindsForkpoint),
+        new TestCase("BlockSyncProtocol_Chunks4096Blocks", TestBlockSyncProtocolChunks4096Blocks),
+        new TestCase("BlockSyncServer_UsesSmallNetBatchFrames", TestBlockSyncServerUsesSmallNetBatchFrames),
+        new TestCase("SmallNetSyncProtocol_RoundTripsCoreFrames", TestSmallNetSyncProtocolRoundTripsCoreFrames),
+        new TestCase("SmallNetPeerState_ClassifiesGapPragmatically", TestSmallNetPeerStateClassifiesGapPragmatically),
+        new TestCase("SmallNetPeerFlow_PushesCanonicalTailToLaggingPeer", TestSmallNetPeerFlowPushesCanonicalTailToLaggingPeer),
+        new TestCase("SmallNetPeerFlow_ReconnectHandshakePushesTail", TestSmallNetPeerFlowReconnectHandshakePushesTail),
+        new TestCase("SmallNetPeerFlow_CompetingTipRequestsAncestorPack", TestSmallNetPeerFlowCompetingTipRequestsAncestorPack),
+        new TestCase("SmallNetPeerFlow_ActiveBlockSyncSuppressesCoordinatorCatchUpRequests", TestSmallNetPeerFlowActiveBlockSyncSuppressesCoordinatorCatchUpRequests),
+        new TestCase("SmallNetCoordinator_ProducesAggressiveRecoveryActions", TestSmallNetCoordinatorProducesAggressiveRecoveryActions),
+        new TestCase("BulkSyncRuntime_CommitsChunkIntoCanonicalChain", TestBulkSyncRuntimeCommitsChunkIntoCanonicalChain),
+        new TestCase("BulkSyncRuntime_MoreAvailable_KeepsGateAndContinuesBatch", TestBulkSyncRuntimeMoreAvailableKeepsGateAndContinuesBatch),
+        new TestCase("BlockIngressFlow_LiveOrphanRequestsParentAndPromotesAcceptedParent", TestBlockIngressFlowLiveOrphanRequestsParentAndPromotesAcceptedParent),
+        new TestCase("ValidationWorker_PrioritizesLivePush", TestValidationWorkerPrioritizesLivePush),
+        new TestCase("BlockDownloadManager_RequestsRecoveryViaAncestorPack", TestBlockDownloadManagerRequestsRecoveryViaAncestorPack),
+        new TestCase("BlockSyncClient_TipStateStartsSyncWithoutLegacyGetTip", TestBlockSyncClientTipStateStartsSyncWithoutLegacyGetTip),
+        new TestCase("BlockSyncClient_PrefersHigherChainworkOverHeight", TestBlockSyncClientPrefersHigherChainworkOverHeight),
+        new TestCase("BlockSyncClient_MoreAvailable_ContinuesFromCurrentLocalTip", TestBlockSyncClientMoreAvailableContinuesFromCurrentLocalTip),
+        new TestCase("BlockSyncClient_Disconnect_ResumesFromLastCommitted", TestBlockSyncClientDisconnectResumesFromLastCommitted),
+        new TestCase("BlockSyncClient_InvalidBlock_PenalizesAndFallsBack", TestBlockSyncClientInvalidBlockPenalizesAndFallsBack)
+    };
 
-        try
+    public static int Main(string[] args)
+    {
+        if (args != null &&
+            args.Length == 1 &&
+            string.Equals(args[0], "--list", StringComparison.OrdinalIgnoreCase))
         {
-            SetupRuntime(tempRoot);
+            for (int i = 0; i < Tests.Count; i++)
+                Console.WriteLine(Tests[i].Name);
+            return 0;
+        }
 
-            Run("Genesis_Stored", TestGenesisStored);
-            Run("BlockPayloads_StoredInSqlite", TestBlockPayloadsStoredInSqlite);
-            Run("StateApplier_RejectsNonceGap", TestStateApplierRejectsNonceGap);
-            Run("StateApplier_AcceptsSequentialNonce", TestStateApplierAcceptsSequentialNonce);
-            Run("StateApplier_SelfTransfer_MinedBySender_IsNotInflationary", TestStateApplierSelfTransferMinedBySenderIsNotInflationary);
-            Run("KeyStore_EncryptsAtRest", TestKeyStoreEncryptsAtRest);
-            Run("Merkle_DomainSeparation_Profile", TestMerkleDomainSeparationProfile);
-            Run("TxId_CommitsSignature", TestTxIdCommitsSignature);
-            Run("BlockSerializer_RejectsInvalidTarget", TestBlockSerializerRejectsInvalidTarget);
-            Run("BlockValidator_TipValidation_WorksInsideTransaction", TestBlockValidatorTipValidationWorksInsideTransaction);
-            Run("ChainSelector_Reorg_MempoolReconcile", TestChainSelectorReorgMempoolReconcile);
-            Run("MempoolSelection_RespectsSenderNonceOrder", TestMempoolSelectionRespectsSenderNonceOrder);
-            Run("BlockLocator_FindsForkpoint", TestBlockLocatorFindsForkpoint);
-            Run("BlockSyncProtocol_Chunks4096Blocks", TestBlockSyncProtocolChunks4096Blocks);
-            Run("BlockSyncProtocol_TipPayload_RoundTripsChainwork", TestBlockSyncProtocolTipPayloadRoundTripsChainwork);
-            Run("BlockSyncClient_PrefersHigherChainworkOverHeight", TestBlockSyncClientPrefersHigherChainworkOverHeight);
-            Run("BlockSyncClient_Disconnect_ResumesFromLastCommitted", TestBlockSyncClientDisconnectResumesFromLastCommitted);
-            Run("BlockSyncClient_InvalidBlock_PenalizesAndFallsBack", TestBlockSyncClientInvalidBlockPenalizesAndFallsBack);
-        }
-        catch (Exception ex)
+        var selectedTests = SelectTests(args ?? Array.Empty<string>());
+        if (selectedTests.Count == 0)
         {
-            _failed++;
-            Console.WriteLine($"[FAIL] Harness_Setup: {ex.Message}");
+            Console.WriteLine("SelfTest selection matched no tests.");
+            return 1;
         }
-        finally
-        {
-            try { Db.Shutdown(); } catch { }
-            try { if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, true); } catch { }
-        }
+
+        for (int i = 0; i < selectedTests.Count; i++)
+            Run(selectedTests[i]);
 
         Console.WriteLine($"SelfTest complete: passed={_passed} failed={_failed}");
         return _failed == 0 ? 0 : 1;
@@ -70,23 +101,63 @@ internal static class Program
         Directory.CreateDirectory(tempRoot);
         string dbPath = Path.Combine(tempRoot, "qado.db");
 
+        ChainSelector.ResetForTests();
+        Difficulty.SetPowLimitOverrideForTests(SelfTestEasyTarget);
+        DifficultyCalculator.SetFixedTargetOverrideForTests(SelfTestEasyTarget);
         Db.Initialize(dbPath);
         GenesisBlockProvider.EnsureGenesisBlockStored();
     }
 
-    private static void Run(string name, Action test)
+    private static void Run(TestCase testCase)
     {
+        string tempRoot = Path.Combine(Path.GetTempPath(), "qado-selftest-" + Guid.NewGuid().ToString("N"));
+
         try
         {
-            test();
+            TraceTestStep($"Run:{testCase.Name}:before-setup");
+            SetupRuntime(tempRoot);
+            TraceTestStep($"Run:{testCase.Name}:after-setup");
+            TraceTestStep($"Run:{testCase.Name}:before-body");
+            testCase.Body();
+            TraceTestStep($"Run:{testCase.Name}:after-body");
             _passed++;
-            Console.WriteLine($"[PASS] {name}");
+            Console.WriteLine($"[PASS] {testCase.Name}");
         }
         catch (Exception ex)
         {
             _failed++;
-            Console.WriteLine($"[FAIL] {name}: {ex.Message}");
+            Console.WriteLine($"[FAIL] {testCase.Name}: {ex.Message}");
         }
+        finally
+        {
+            try { Db.Shutdown(); } catch { }
+            try { DifficultyCalculator.SetFixedTargetOverrideForTests(null); } catch { }
+            try { Difficulty.SetPowLimitOverrideForTests(null); } catch { }
+            try { if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, true); } catch { }
+        }
+    }
+
+    private static List<TestCase> SelectTests(string[] args)
+    {
+        if (args == null || args.Length == 0)
+            return new List<TestCase>(Tests);
+
+        var selected = new List<TestCase>();
+        for (int i = 0; i < Tests.Count; i++)
+        {
+            var test = Tests[i];
+            for (int j = 0; j < args.Length; j++)
+            {
+                string filter = args[j] ?? string.Empty;
+                if (test.Name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    selected.Add(test);
+                    break;
+                }
+            }
+        }
+
+        return selected;
     }
 
     private static void TestGenesisStored()
@@ -595,23 +666,700 @@ internal static class Program
         Assert(totalBlocks == 4096, $"expected 4096 chunked blocks, got {totalBlocks}");
     }
 
-    private static void TestBlockSyncProtocolTipPayloadRoundTripsChainwork()
+    private static void TestBlockSyncServerUsesSmallNetBatchFrames()
     {
-        byte[] hash = HashFromU64(42UL);
-        UInt128 chainwork = ((UInt128)1 << 80) + 123_456UL;
+        ulong tipHeight = BlockStore.GetLatestHeight();
+        var tipBlock = BlockStore.GetBlockByHeight(tipHeight) ?? throw new InvalidOperationException("missing current tip block");
+        byte[] oldTipHash = tipBlock.BlockHash ?? throw new InvalidOperationException("missing current tip hash");
+        var miner = KeyGenerator.GenerateKeypairHex();
 
-        var payload = BuildTipPayload(42UL, hash, chainwork);
-        Assert(payload.Length == BlockSyncProtocol.TipPayloadBytes, "tip payload size mismatch");
-        Assert(BlockSyncProtocol.TryParseTipPayload(payload, out var frame), "tip payload did not parse");
-        Assert(frame.Height == 42UL, "tip payload height mismatch");
-        Assert(BytesEqual(frame.Hash, hash), "tip payload hash mismatch");
-        Assert(frame.Chainwork == chainwork, "tip payload chainwork mismatch");
+        var nextBlock = BuildMinedBlock(
+            height: tipHeight + 1UL,
+            prevHash: oldTipHash,
+            timestamp: tipBlock.Header!.Timestamp + 61UL,
+            minerPubHex: miner.pubHex);
+        BlockPersistHelper.Persist(nextBlock);
 
-        var legacyPayload = new byte[BlockSyncProtocol.TipPayloadBytesLegacy];
-        BinaryPrimitives.WriteUInt64LittleEndian(legacyPayload.AsSpan(0, 8), 7UL);
-        Buffer.BlockCopy(hash, 0, legacyPayload, 8, 32);
-        Assert(BlockSyncProtocol.TryParseTipPayload(legacyPayload, out var legacyFrame), "legacy tip payload did not parse");
-        Assert(legacyFrame.Chainwork == 0, "legacy tip payload must default chainwork to zero");
+        var sent = new List<(MsgType type, byte[] payload)>();
+        var peer = CreateFakePeer("smallnet-sync-peer");
+        byte[] request = BlockSyncProtocol.BuildGetBlocksFrom(oldTipHash, maxBlocks: 1);
+
+        BlockSyncServer.HandleGetBlocksFromAsync(
+                request,
+                peer,
+                (p, type, payload, ct) =>
+                {
+                    sent.Add((type, (byte[])payload.Clone()));
+                    return Task.CompletedTask;
+                },
+                log: null,
+                CancellationToken.None)
+            .GetAwaiter().GetResult();
+
+        Assert(sent.Count >= 3, $"expected at least 3 frames, got {sent.Count}");
+        Assert(sent[0].type == MsgType.BlocksBatchStart, $"expected BlocksBatchStart first, got {sent[0].type}");
+        Assert(sent[1].type == MsgType.BlocksChunk, $"expected BlocksChunk second, got {sent[1].type}");
+        Assert(sent[^1].type == MsgType.BlocksBatchEnd, $"expected BlocksBatchEnd last, got {sent[^1].type}");
+
+        Assert(SmallNetSyncProtocol.TryParseBlocksBatchStart(sent[0].payload, out var batchStart), "batch start payload did not parse");
+        Assert(batchStart.TotalBlocks == 1, $"expected 1 block in batch, got {batchStart.TotalBlocks}");
+        Assert(batchStart.ForkHeight == tipHeight, "fork height mismatch");
+
+        Assert(SmallNetSyncProtocol.TryParseBlocksChunk(sent[1].payload, out var chunk), "blocks chunk payload did not parse");
+        Assert(chunk.Blocks.Count == 1, $"expected exactly one chunk block, got {chunk.Blocks.Count}");
+
+        Assert(SmallNetSyncProtocol.TryParseBlocksBatchEnd(sent[^1].payload, out var batchEnd), "batch end payload did not parse");
+        Assert(!batchEnd.MoreAvailable, "single-block test batch should finish at tip");
+    }
+
+    private static void TestSmallNetSyncProtocolRoundTripsCoreFrames()
+    {
+        byte[] nodeId = HashFromU64(1UL);
+        byte[] tipHash = HashFromU64(2UL);
+        byte[] stateDigest = HashFromU64(3UL);
+        var recent = new List<byte[]> { HashFromU64(10UL), HashFromU64(11UL), HashFromU64(12UL) };
+
+        var hello = new SmallNetHelloFrame(
+            SmallNetSyncProtocol.CurrentProtocolVersion,
+            nodeId,
+            tipHash,
+            123UL,
+            ((UInt128)1 << 70) + 99UL,
+            stateDigest);
+        byte[] helloPayload = SmallNetSyncProtocol.BuildHello(hello);
+        Assert(SmallNetSyncProtocol.TryParseHello(helloPayload, out var helloRoundTrip), "hello did not roundtrip");
+        Assert(helloRoundTrip.ProtocolVersion == hello.ProtocolVersion, "hello version mismatch");
+        Assert(BytesEqual(helloRoundTrip.NodeId, nodeId), "hello node id mismatch");
+        Assert(BytesEqual(helloRoundTrip.TipHash, tipHash), "hello tip hash mismatch");
+        Assert(helloRoundTrip.TipHeight == 123UL, "hello tip height mismatch");
+        Assert(helloRoundTrip.TipChainwork == hello.TipChainwork, "hello chainwork mismatch");
+        Assert(BytesEqual(helloRoundTrip.StateDigest!, stateDigest), "hello state digest mismatch");
+
+        var tipState = new SmallNetTipStateFrame(124UL, tipHash, 999UL, stateDigest, recent);
+        byte[] tipPayload = SmallNetSyncProtocol.BuildTipState(tipState);
+        Assert(SmallNetSyncProtocol.TryParseTipState(tipPayload, out var tipRoundTrip), "tip state did not roundtrip");
+        Assert(tipRoundTrip.Height == 124UL, "tip state height mismatch");
+        Assert(BytesEqual(tipRoundTrip.TipHash, tipHash), "tip state hash mismatch");
+        Assert(tipRoundTrip.Chainwork == 999UL, "tip state chainwork mismatch");
+        Assert(tipRoundTrip.RecentCanonical.Count == recent.Count, "tip state recent canonical count mismatch");
+
+        byte[] ancestorRequestPayload = SmallNetSyncProtocol.BuildGetAncestorPack(tipHash, 8);
+        Assert(
+            SmallNetSyncProtocol.TryParseGetAncestorPack(ancestorRequestPayload, out var ancestorRequest),
+            "ancestor request did not roundtrip");
+        Assert(BytesEqual(ancestorRequest.StartHash, tipHash), "ancestor request hash mismatch");
+        Assert(ancestorRequest.MaxBlocks == 8, "ancestor request count mismatch");
+
+        var packBlocks = new List<byte[]> { new byte[] { 0x01, 0x02 }, new byte[] { 0x03, 0x04, 0x05 } };
+        byte[] packPayload = SmallNetSyncProtocol.BuildAncestorPack(packBlocks);
+        Assert(SmallNetSyncProtocol.TryParseAncestorPack(packPayload, out var packRoundTrip), "ancestor pack did not roundtrip");
+        Assert(packRoundTrip.Blocks.Count == 2, "ancestor pack count mismatch");
+
+        Guid batchId = Guid.NewGuid();
+        var batchStart = new SmallNetBlocksBatchStartFrame(batchId, HashFromU64(50UL), 55UL, 512, tipHash, 12345UL);
+        byte[] batchStartPayload = SmallNetSyncProtocol.BuildBlocksBatchStart(batchStart);
+        Assert(
+            SmallNetSyncProtocol.TryParseBlocksBatchStart(batchStartPayload, out var batchStartRoundTrip),
+            "batch start did not roundtrip");
+        Assert(batchStartRoundTrip.BatchId == batchId, "batch start batch id mismatch");
+        Assert(batchStartRoundTrip.TotalBlocks == 512, "batch start total blocks mismatch");
+
+        var batchEnd = new SmallNetBlocksBatchEndFrame(batchId, HashFromU64(99UL), 777UL, MoreAvailable: true);
+        byte[] batchEndPayload = SmallNetSyncProtocol.BuildBlocksBatchEnd(batchEnd);
+        Assert(
+            SmallNetSyncProtocol.TryParseBlocksBatchEnd(batchEndPayload, out var batchEndRoundTrip),
+            "batch end did not roundtrip");
+        Assert(batchEndRoundTrip.BatchId == batchId, "batch end batch id mismatch");
+        Assert(batchEndRoundTrip.MoreAvailable, "batch end moreAvailable mismatch");
+    }
+
+    private static void TestSmallNetPeerStateClassifiesGapPragmatically()
+    {
+        var peer = new SmallNetPeerState("peer-smallnet");
+        byte[] sharedRecent = HashFromU64(222UL);
+        byte[] remoteTip = HashFromU64(223UL);
+        byte[] localTip = HashFromU64(224UL);
+
+        peer.UpdateTipState(
+            new SmallNetTipStateFrame(
+                Height: 101UL,
+                TipHash: remoteTip,
+                Chainwork: 5_100UL,
+                StateDigest: null,
+                RecentCanonical: new[] { sharedRecent }),
+            DateTime.UtcNow);
+
+        var local = new SmallNetLocalChainView(
+            Height: 100UL,
+            TipHash: localTip,
+            Chainwork: 5_000UL,
+            RecentCanonical: new[] { sharedRecent },
+            StateDigest: null);
+
+        var decision = peer.ClassifyGap(local, smallGapThreshold: 8);
+        Assert(decision.Kind == SmallNetGapKind.RemoteAheadSmall, $"unexpected gap kind: {decision.Kind}");
+        Assert(decision.BlockGap == 1, $"unexpected gap size: {decision.BlockGap}");
+        Assert(decision.LikelyFork, "shared recent canonical must mark the situation as likely fork/catchup");
+    }
+
+    private static void TestSmallNetPeerFlowPushesCanonicalTailToLaggingPeer()
+    {
+        var peer = CreateFakePeer("peer-tail");
+        byte[] nodeId = HashFromU64(9_001UL);
+        byte[] hash1 = HashFromU64(1UL);
+        byte[] hash2 = HashFromU64(2UL);
+        byte[] hash3 = HashFromU64(3UL);
+        var hashByHeight = new Dictionary<ulong, byte[]>
+        {
+            [1UL] = hash1,
+            [2UL] = hash2,
+            [3UL] = hash3
+        };
+        var payloadByHeight = new Dictionary<ulong, byte[]>
+        {
+            [2UL] = new byte[] { 0xB2 },
+            [3UL] = new byte[] { 0xB3 }
+        };
+        var sent = new List<(MsgType type, byte[] payload)>();
+
+        var client = new BlockSyncClient(
+            sessionSnapshot: () => new[] { peer },
+            sendFrameAsync: (targetPeer, type, payload, ct) => Task.CompletedTask,
+            getLocalTipChainwork: () => 300UL,
+            getLocalTipHash: () => (byte[])hash3.Clone(),
+            prepareBatchAsync: (startHash, startHeight, advertisedTipChainwork, targetPeer, ct) =>
+                Task.FromResult(new BlockSyncPrepareResult(true, string.Empty)),
+            commitChunkAsync: (payloads, height, prevHash, targetPeer, ct) =>
+                Task.FromResult(new BlockSyncChunkCommitResult(true, HashFromU64(height + (ulong)payloads.Count - 1UL), string.Empty)),
+            completeBatchAsync: (targetPeer, status, ct) => Task.CompletedTask,
+            abortBatchAsync: (targetPeer, reason, ct) => Task.CompletedTask,
+            log: null);
+
+        var flow = new SmallNetPeerFlow(
+            nodeId: nodeId,
+            peers: new SmallNetPeerDirectory(),
+            coordinator: new SmallNetCoordinator(),
+            blockSyncClient: client,
+            getLocalChainView: () => new SmallNetLocalChainView(3UL, hash3, 300UL, new[] { hash1, hash2, hash3 }, null),
+            getCanonicalHashAtHeight: height =>
+            {
+                return hashByHeight.TryGetValue(height, out var hash)
+                    ? (byte[])hash.Clone()
+                    : null;
+            },
+            getCanonicalPayloadAtHeight: height =>
+            {
+                return payloadByHeight.TryGetValue(height, out var payload)
+                    ? (byte[])payload.Clone()
+                    : null;
+            },
+            sendFrameAsync: (targetPeer, type, payload, ct) =>
+            {
+                sent.Add((type, (byte[])payload.Clone()));
+                return Task.CompletedTask;
+            },
+            dropSession: (targetPeer, reason) => throw new InvalidOperationException($"unexpected drop: {reason}"),
+            log: null);
+
+        var remoteTip = new SmallNetTipStateFrame(1UL, hash1, 100UL, null, new[] { hash1 });
+        flow.HandleTipStateAsync(SmallNetSyncProtocol.BuildTipState(remoteTip), peer, CancellationToken.None)
+            .GetAwaiter().GetResult();
+
+        Assert(sent.Count == 3, $"expected 3 frames for tail push, got {sent.Count}");
+        Assert(sent[0].type == MsgType.Block, $"expected first frame Block, got {sent[0].type}");
+        Assert(BytesEqual(sent[0].payload, payloadByHeight[2UL]), "first pushed block payload mismatch");
+        Assert(sent[1].type == MsgType.Block, $"expected second frame Block, got {sent[1].type}");
+        Assert(BytesEqual(sent[1].payload, payloadByHeight[3UL]), "second pushed block payload mismatch");
+        Assert(sent[2].type == MsgType.TipState, $"expected last frame TipState, got {sent[2].type}");
+        Assert(SmallNetSyncProtocol.TryParseTipState(sent[2].payload, out var pushedTip), "tail push tipstate did not parse");
+        Assert(pushedTip.Height == 3UL, $"tail push tipstate height mismatch: {pushedTip.Height}");
+        Assert(BytesEqual(pushedTip.TipHash, hash3), "tail push tip hash mismatch");
+    }
+
+    private static void TestSmallNetPeerFlowReconnectHandshakePushesTail()
+    {
+        var peerA = CreateFakePeer("node-a");
+        var peerB = CreateFakePeer("node-b");
+        byte[] hash1 = HashFromU64(101UL);
+        byte[] hash2 = HashFromU64(102UL);
+        byte[] hash3 = HashFromU64(103UL);
+        var chainAHashes = new Dictionary<ulong, byte[]>
+        {
+            [1UL] = hash1,
+            [2UL] = hash2,
+            [3UL] = hash3
+        };
+        var chainAPayloads = new Dictionary<ulong, byte[]>
+        {
+            [2UL] = new byte[] { 0xC2 },
+            [3UL] = new byte[] { 0xC3 }
+        };
+        var nodeBReceivedBlocks = new List<byte[]>();
+        var nodeBRequested = new List<(MsgType type, byte[] payload)>();
+
+        SmallNetPeerFlow? flowB = null;
+        var flowA = new SmallNetPeerFlow(
+            nodeId: HashFromU64(11UL),
+            peers: new SmallNetPeerDirectory(),
+            coordinator: new SmallNetCoordinator(),
+            blockSyncClient: CreateNoopBlockSyncClient(peerA, 300UL, hash3),
+            getLocalChainView: () => new SmallNetLocalChainView(3UL, hash3, 300UL, new[] { hash1, hash2, hash3 }, null),
+            getCanonicalHashAtHeight: height => chainAHashes.TryGetValue(height, out var hash) ? (byte[])hash.Clone() : null,
+            getCanonicalPayloadAtHeight: height => chainAPayloads.TryGetValue(height, out var payload) ? (byte[])payload.Clone() : null,
+            sendFrameAsync: (targetPeer, type, payload, ct) =>
+            {
+                var copy = (byte[])payload.Clone();
+                if (type == MsgType.Block)
+                {
+                    nodeBReceivedBlocks.Add(copy);
+                }
+                else if (type == MsgType.TipState && flowB != null)
+                {
+                    flowB.HandleTipStateAsync(copy, peerA, ct).GetAwaiter().GetResult();
+                }
+
+                return Task.CompletedTask;
+            },
+            dropSession: (targetPeer, reason) => throw new InvalidOperationException($"unexpected drop on node A: {reason}"),
+            log: null);
+
+        flowB = new SmallNetPeerFlow(
+            nodeId: HashFromU64(12UL),
+            peers: new SmallNetPeerDirectory(),
+            coordinator: new SmallNetCoordinator(),
+            blockSyncClient: CreateNoopBlockSyncClient(peerB, 100UL, hash1),
+            getLocalChainView: () => new SmallNetLocalChainView(1UL, hash1, 100UL, new[] { hash1 }, null),
+            getCanonicalHashAtHeight: height => height == 1UL ? (byte[])hash1.Clone() : null,
+            getCanonicalPayloadAtHeight: height => null,
+            sendFrameAsync: (targetPeer, type, payload, ct) =>
+            {
+                nodeBRequested.Add((type, (byte[])payload.Clone()));
+                return Task.CompletedTask;
+            },
+            dropSession: (targetPeer, reason) => throw new InvalidOperationException($"unexpected drop on node B: {reason}"),
+            log: null);
+
+        flowA.HandleHelloAsync(flowB.BuildLocalHelloPayload(), peerB, CancellationToken.None)
+            .GetAwaiter().GetResult();
+        flowA.HandleTipStateAsync(flowB.BuildLocalTipStatePayload(), peerB, CancellationToken.None)
+            .GetAwaiter().GetResult();
+
+        Assert(nodeBRequested.Count >= 1, "lagging peer should request catch-up after reconnect");
+        Assert(nodeBRequested[0].type == MsgType.GetBlocksFrom, $"expected GetBlocksFrom request, got {nodeBRequested[0].type}");
+        Assert(nodeBReceivedBlocks.Count == 2, $"expected 2 pushed tail blocks, got {nodeBReceivedBlocks.Count}");
+        Assert(BytesEqual(nodeBReceivedBlocks[0], chainAPayloads[2UL]), "reconnect tail push first block mismatch");
+        Assert(BytesEqual(nodeBReceivedBlocks[1], chainAPayloads[3UL]), "reconnect tail push second block mismatch");
+    }
+
+    private static void TestSmallNetPeerFlowCompetingTipRequestsAncestorPack()
+    {
+        var peer = CreateFakePeer("peer-competing-tip");
+        byte[] localTip = HashFromU64(401UL);
+        byte[] remoteTip = HashFromU64(402UL);
+        byte[] sharedRecent = HashFromU64(399UL);
+        var sent = new List<(MsgType type, byte[] payload)>();
+
+        var flow = new SmallNetPeerFlow(
+            nodeId: HashFromU64(13UL),
+            peers: new SmallNetPeerDirectory(),
+            coordinator: new SmallNetCoordinator(),
+            blockSyncClient: CreateNoopBlockSyncClient(peer, 800UL, localTip),
+            getLocalChainView: () => new SmallNetLocalChainView(20UL, localTip, 800UL, new[] { sharedRecent, localTip }, null),
+            getCanonicalHashAtHeight: _ => null,
+            getCanonicalPayloadAtHeight: _ => null,
+            sendFrameAsync: (targetPeer, type, payload, ct) =>
+            {
+                sent.Add((type, (byte[])payload.Clone()));
+                return Task.CompletedTask;
+            },
+            dropSession: (targetPeer, reason) => throw new InvalidOperationException($"unexpected drop: {reason}"),
+            log: null);
+
+        var competingTip = new SmallNetTipStateFrame(20UL, remoteTip, 800UL, null, new[] { sharedRecent, remoteTip });
+        flow.HandleTipStateAsync(SmallNetSyncProtocol.BuildTipState(competingTip), peer, CancellationToken.None)
+            .GetAwaiter().GetResult();
+
+        Assert(sent.Count == 1, $"expected one competing-tip recovery frame, got {sent.Count}");
+        Assert(sent[0].type == MsgType.GetAncestorPack, $"expected GetAncestorPack, got {sent[0].type}");
+        Assert(SmallNetSyncProtocol.TryParseGetAncestorPack(sent[0].payload, out var request), "ancestor-pack payload did not parse");
+        Assert(BytesEqual(request.StartHash, remoteTip), "ancestor-pack request targeted the wrong competing tip");
+    }
+
+    private static void TestSmallNetPeerFlowActiveBlockSyncSuppressesCoordinatorCatchUpRequests()
+    {
+        var peer = CreateFakePeer("peer-active-sync");
+        byte[] localTip = HashFromU64(500UL);
+        byte[] remoteTip = HashFromU64(900UL);
+        UInt128 localChainwork = 500UL;
+        UInt128 remoteChainwork = 900UL;
+        var clientSent = new List<(MsgType type, byte[] payload)>();
+        var flowSent = new List<(MsgType type, byte[] payload)>();
+
+        var client = new BlockSyncClient(
+            sessionSnapshot: () => new[] { peer },
+            sendFrameAsync: (targetPeer, type, payload, ct) =>
+            {
+                clientSent.Add((type, (byte[])payload.Clone()));
+                return Task.CompletedTask;
+            },
+            getLocalTipChainwork: () => localChainwork,
+            getLocalTipHash: () => (byte[])localTip.Clone(),
+            prepareBatchAsync: (startHash, startHeight, advertisedTipChainwork, targetPeer, ct) =>
+                Task.FromResult(new BlockSyncPrepareResult(true, string.Empty)),
+            commitChunkAsync: (payloads, height, prevHash, targetPeer, ct) =>
+                Task.FromResult(new BlockSyncChunkCommitResult(true, HashFromU64(height + (ulong)payloads.Count - 1UL), string.Empty)),
+            completeBatchAsync: (targetPeer, status, ct) => Task.CompletedTask,
+            abortBatchAsync: (targetPeer, reason, ct) => Task.CompletedTask,
+            log: null);
+
+        var flow = new SmallNetPeerFlow(
+            nodeId: HashFromU64(99UL),
+            peers: new SmallNetPeerDirectory(),
+            coordinator: new SmallNetCoordinator(),
+            blockSyncClient: client,
+            getLocalChainView: () => new SmallNetLocalChainView(500UL, localTip, localChainwork, new[] { HashFromU64(499UL), localTip }, null),
+            getCanonicalHashAtHeight: _ => null,
+            getCanonicalPayloadAtHeight: _ => null,
+            sendFrameAsync: (targetPeer, type, payload, ct) =>
+            {
+                flowSent.Add((type, (byte[])payload.Clone()));
+                return Task.CompletedTask;
+            },
+            dropSession: (targetPeer, reason) => throw new InvalidOperationException($"unexpected drop: {reason}"),
+            log: null);
+
+        flow.HandleTipStateAsync(
+                SmallNetSyncProtocol.BuildTipState(
+                    new SmallNetTipStateFrame(
+                        Height: 900UL,
+                        TipHash: remoteTip,
+                        Chainwork: remoteChainwork,
+                        StateDigest: null,
+                        RecentCanonical: new[] { HashFromU64(898UL), HashFromU64(899UL), remoteTip })),
+                peer,
+                CancellationToken.None)
+            .GetAwaiter().GetResult();
+
+        Assert(clientSent.Count == 1, $"expected block sync client to emit exactly one sync request, got {clientSent.Count}");
+        Assert(clientSent[0].type == MsgType.GetBlocksByLocator, $"expected client locator request, got {clientSent[0].type}");
+        Assert(flowSent.Count == 0, $"coordinator catch-up requests must be suppressed while block sync is active, got {flowSent.Count}");
+    }
+
+    private static void TestSmallNetCoordinatorProducesAggressiveRecoveryActions()
+    {
+        var coordinator = new SmallNetCoordinator();
+        byte[] localTip = HashFromU64(300UL);
+        byte[] remoteTip = HashFromU64(301UL);
+        byte[] sharedRecent = HashFromU64(299UL);
+        var local = new SmallNetLocalChainView(
+            Height: 100UL,
+            TipHash: localTip,
+            Chainwork: 10_000UL,
+            RecentCanonical: new[] { sharedRecent, localTip },
+            StateDigest: null);
+
+        var peer = new SmallNetPeerState("peer-coordinator");
+        peer.UpdateTipState(
+            new SmallNetTipStateFrame(
+                Height: 103UL,
+                TipHash: remoteTip,
+                Chainwork: 10_300UL,
+                StateDigest: null,
+                RecentCanonical: new[] { sharedRecent, remoteTip }),
+            DateTime.UtcNow);
+
+        var actions = coordinator.OnPeerTipState(peer, local);
+        Assert(actions.Count == 1, $"expected one catch-up action, got {actions.Count}");
+        Assert(actions[0].Kind == SmallNetActionKind.RequestBlocksFrom, $"unexpected action kind: {actions[0].Kind}");
+        Assert(actions[0].MessageType == MsgType.GetBlocksFrom, $"unexpected message type: {actions[0].MessageType}");
+        Assert(BlockSyncProtocol.TryParseGetBlocksFrom(actions[0].Payload, out var fromHash, out var maxBlocks), "GetBlocksFrom payload did not parse");
+        Assert(BytesEqual(fromHash, localTip), "small-gap catch-up must request from local tip");
+        Assert(maxBlocks == 3, $"expected request window of 3 blocks, got {maxBlocks}");
+    }
+
+    private static void TestBulkSyncRuntimeCommitsChunkIntoCanonicalChain()
+    {
+        var mempool = new MempoolManager(
+            senderHex => StateStore.GetBalanceU64(senderHex),
+            senderHex => StateStore.GetNonceU64(senderHex),
+            log: null);
+        using var gate = new SemaphoreSlim(1, 1);
+        bool notified = false;
+        var runtime = new BulkSyncRuntime(gate, mempool, () => notified = true, log: null);
+        var peer = CreateFakePeer("bulk-sync-peer");
+
+        var genesis = BlockStore.GetBlockByHeight(0) ?? throw new InvalidOperationException("missing genesis block");
+        var genesisHash = genesis.BlockHash ?? throw new InvalidOperationException("missing genesis hash");
+        UInt128 localChainwork = BlockIndexStore.GetChainwork(genesisHash);
+        UInt128 advertisedTipChainwork = localChainwork == 0 ? 1UL : localChainwork + 1UL;
+
+        var miner = KeyGenerator.GenerateKeypairHex();
+        var block = BuildMinedBlock(
+            height: 1UL,
+            prevHash: genesisHash,
+            timestamp: genesis.Header!.Timestamp + 61UL,
+            minerPubHex: miner.pubHex);
+
+        int size = BlockBinarySerializer.GetSize(block);
+        var payload = new byte[size];
+        _ = BlockBinarySerializer.Write(payload, block);
+
+        var prepare = runtime.PrepareBatchAsync(genesisHash, 1UL, advertisedTipChainwork, peer, CancellationToken.None)
+            .GetAwaiter().GetResult();
+        Assert(prepare.Success, $"bulk sync prepare failed: {prepare.Error}");
+
+        var commit = runtime.CommitChunkAsync(new[] { payload }, 1UL, genesisHash, peer, CancellationToken.None)
+            .GetAwaiter().GetResult();
+        Assert(commit.Success, $"bulk sync commit failed: {commit.Error}");
+        Assert(BytesEqual(commit.LastBlockHash, block.BlockHash!), "bulk sync returned wrong last block hash");
+
+        runtime.CompleteBatchAsync(peer, BlocksEndStatus.TipReached, CancellationToken.None)
+            .GetAwaiter().GetResult();
+
+        var canonicalHash = BlockStore.GetCanonicalHashAtHeight(1UL) ?? throw new InvalidOperationException("missing canonical hash at height 1");
+        Assert(BytesEqual(canonicalHash, block.BlockHash!), "bulk sync did not install committed block as canonical");
+        Assert(notified, "bulk sync finalize should notify after canonical change");
+
+        bool gateReleased = gate.Wait(0);
+        Assert(gateReleased, "bulk sync finalize did not release validation gate");
+        if (gateReleased)
+            gate.Release();
+    }
+
+    private static void TestBulkSyncRuntimeMoreAvailableKeepsGateAndContinuesBatch()
+    {
+        var mempool = new MempoolManager(
+            senderHex => StateStore.GetBalanceU64(senderHex),
+            senderHex => StateStore.GetNonceU64(senderHex),
+            log: null);
+        using var gate = new SemaphoreSlim(1, 1);
+        bool notified = false;
+        var runtime = new BulkSyncRuntime(gate, mempool, () => notified = true, log: null);
+        var peer = CreateFakePeer("bulk-sync-continue-peer");
+
+        var genesis = BlockStore.GetBlockByHeight(0) ?? throw new InvalidOperationException("missing genesis block");
+        var genesisHash = genesis.BlockHash ?? throw new InvalidOperationException("missing genesis hash");
+        UInt128 localChainwork = BlockIndexStore.GetChainwork(genesisHash);
+        UInt128 advertisedTipChainwork = localChainwork == 0 ? 2UL : localChainwork + 2UL;
+
+        var miner = KeyGenerator.GenerateKeypairHex();
+        var block1 = BuildMinedBlock(
+            height: 1UL,
+            prevHash: genesisHash,
+            timestamp: genesis.Header!.Timestamp + 61UL,
+            minerPubHex: miner.pubHex);
+        var payload1 = SerializeBlock(block1);
+
+        var prepare1 = runtime.PrepareBatchAsync(genesisHash, 1UL, advertisedTipChainwork, peer, CancellationToken.None)
+            .GetAwaiter().GetResult();
+        Assert(prepare1.Success, $"first batch prepare failed: {prepare1.Error}");
+
+        var commit1 = runtime.CommitChunkAsync(new[] { payload1 }, 1UL, genesisHash, peer, CancellationToken.None)
+            .GetAwaiter().GetResult();
+        Assert(commit1.Success, $"first batch commit failed: {commit1.Error}");
+        Assert(BytesEqual(commit1.LastBlockHash, block1.BlockHash!), "first continuation batch returned wrong last block hash");
+
+        runtime.CompleteBatchAsync(peer, BlocksEndStatus.MoreAvailable, CancellationToken.None)
+            .GetAwaiter().GetResult();
+
+        Assert(!gate.Wait(0), "validation gate must remain held across more-available continuation");
+
+        var prepare2 = runtime.PrepareBatchAsync(block1.BlockHash!, 2UL, advertisedTipChainwork + 10UL, peer, CancellationToken.None)
+            .GetAwaiter().GetResult();
+        Assert(prepare2.Success, $"continuation batch prepare failed: {prepare2.Error}");
+
+        var block2 = BuildLooseMinedBlock(
+            height: 2UL,
+            prevHash: block1.BlockHash!,
+            timestamp: block1.Header!.Timestamp + 61UL,
+            minerPubHex: miner.pubHex);
+        var payload2 = SerializeBlock(block2);
+
+        var commit2 = runtime.CommitChunkAsync(new[] { payload2 }, 2UL, block1.BlockHash!, peer, CancellationToken.None)
+            .GetAwaiter().GetResult();
+        Assert(commit2.Success, $"continuation batch commit failed: {commit2.Error}");
+        Assert(BytesEqual(commit2.LastBlockHash, block2.BlockHash!), "continuation batch returned wrong last block hash");
+
+        runtime.CompleteBatchAsync(peer, BlocksEndStatus.TipReached, CancellationToken.None)
+            .GetAwaiter().GetResult();
+
+        var canonicalHash1 = BlockStore.GetCanonicalHashAtHeight(1UL) ?? throw new InvalidOperationException("missing canonical hash at height 1");
+        var canonicalHash2 = BlockStore.GetCanonicalHashAtHeight(2UL) ?? throw new InvalidOperationException("missing canonical hash at height 2");
+        Assert(BytesEqual(canonicalHash1, block1.BlockHash!), "first continuation block not canonical");
+        Assert(BytesEqual(canonicalHash2, block2.BlockHash!), "second continuation block not canonical");
+        Assert(notified, "continuation sync should notify after canonical progress/finalization");
+
+        bool gateReleased = gate.Wait(0);
+        Assert(gateReleased, "validation gate must be released after final tip-reached completion");
+        if (gateReleased)
+            gate.Release();
+    }
+
+    private static void TestBlockIngressFlowLiveOrphanRequestsParentAndPromotesAcceptedParent()
+    {
+        var peer = CreateFakePeer("peer-ingress-orphan");
+        var mempool = new MempoolManager(
+            senderHex => StateStore.GetBalanceU64(senderHex),
+            senderHex => StateStore.GetNonceU64(senderHex),
+            log: null);
+        var log = new ListLogSink();
+        byte[] requestedParent = Array.Empty<byte>();
+        byte[] promotedParent = Array.Empty<byte>();
+        string requestSource = string.Empty;
+        bool orphanStored = false;
+        string invalidReason = string.Empty;
+
+        var client = CreateNoopBlockSyncClient(peer, 0UL, new byte[32]);
+        var downloadManager = new BlockDownloadManager(
+            sessionSnapshot: () => new[] { peer },
+            sendFrameAsync: (targetPeer, type, payload, ct) => Task.CompletedTask,
+            haveBlock: _ => false,
+            enqueueValidator: _ => true,
+            revalidateStoredBlock: _ => { },
+            log: log);
+        var flow = new BlockIngressFlow(
+            blockDownloadManager: downloadManager,
+            blockSyncClient: client,
+            mempool: mempool,
+            getPeerKey: targetPeer => targetPeer.SessionKey,
+            allowInboundBlock: _ => true,
+            shouldRequestMissingHeaderResync: () => false,
+            requestSyncNow: _ => { },
+            tryStoreOrphan: (byte[] payload, Block block, PeerSession targetPeer, string peerKey, BlockIngressKind ingress, out string reason) =>
+            {
+                orphanStored = true;
+                reason = string.Empty;
+                return true;
+            },
+            requestParentFromPeer: (targetPeer, hash, source) =>
+            {
+                requestedParent = (byte[])hash.Clone();
+                requestSource = source;
+            },
+            markStoredBlockInvalid: (_, _, reason) => invalidReason = reason,
+            passesSidechainAdmission: (Block block, byte[]? canonicalTipHash, ulong prevHeight, int payloadBytes, out string reason) =>
+            {
+                reason = string.Empty;
+                return true;
+            },
+            logKnownBlockAlready: _ => { },
+            notifyUiAfterAcceptedBlock: () => { },
+            relayValidatedBlockAsync: (_, _, _) => Task.CompletedTask,
+            promoteOrphansForParentAsync: (parentHash, targetPeer, ct) =>
+            {
+                promotedParent = (byte[])parentHash.Clone();
+                return Task.CompletedTask;
+            },
+            log: log);
+
+        byte[] missingParentHash = HashFromU64(70_001UL);
+        var orphanMiner = KeyGenerator.GenerateKeypairHex();
+        var orphan = BuildLooseMinedBlock(
+            height: 2UL,
+            prevHash: missingParentHash,
+            timestamp: (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            minerPubHex: orphanMiner.pubHex);
+        Assert(
+            BlockValidator.ValidateNetworkOrphanBlockStateless(orphan, out var orphanReason),
+            $"loose orphan helper built invalid block: {orphanReason}");
+
+        flow.HandleBlockAsync(SerializeBlock(orphan), peer, CancellationToken.None, BlockIngressKind.LivePush, enforceRateLimitOverride: null)
+            .GetAwaiter().GetResult();
+
+        Assert(orphanStored, $"live orphan should be buffered; invalid={invalidReason}; logs={string.Join(" || ", log.Lines)}");
+        Assert(BytesEqual(requestedParent, missingParentHash), "live orphan must request the missing parent from the same peer");
+        Assert(string.Equals(requestSource, "live-orphan-parent", StringComparison.Ordinal), $"unexpected parent request source: {requestSource}");
+        Assert(downloadManager.IsOutOfPlanFallbackHash(missingParentHash), "missing parent should be armed as out-of-plan fallback");
+
+        var genesis = BlockStore.GetBlockByHeight(0) ?? throw new InvalidOperationException("missing genesis block");
+        var genesisHash = genesis.BlockHash ?? throw new InvalidOperationException("missing genesis hash");
+        var parentMiner = KeyGenerator.GenerateKeypairHex();
+        var parent = BuildMinedBlock(
+            height: 1UL,
+            prevHash: genesisHash,
+            timestamp: genesis.Header!.Timestamp + 61UL,
+            minerPubHex: parentMiner.pubHex);
+
+        flow.HandleBlockAsync(SerializeBlock(parent), peer, CancellationToken.None, BlockIngressKind.LivePush, enforceRateLimitOverride: null)
+            .GetAwaiter().GetResult();
+
+        Assert(BytesEqual(promotedParent, parent.BlockHash!), "accepted parent must trigger orphan promotion callback");
+    }
+
+    private static void TestValidationWorkerPrioritizesLivePush()
+    {
+        var peer = CreateFakePeer("validation-priority-peer");
+        var seen = new List<BlockIngressKind>(2);
+        using var release = new ManualResetEventSlim(false);
+        using var done = new ManualResetEventSlim(false);
+        using var cts = new CancellationTokenSource();
+        using var worker = new ValidationWorker(
+            async (item, ct) =>
+            {
+                release.Wait(ct);
+                lock (seen)
+                {
+                    seen.Add(item.Ingress);
+                    if (seen.Count >= 2)
+                        done.Set();
+                }
+
+                await Task.CompletedTask;
+            },
+            log: null);
+
+        Assert(worker.Enqueue(new ValidationWorkItem(new byte[] { 0x01 }, peer, BlockIngressKind.SyncPlan)),
+            "failed to enqueue sync-plan work item");
+        Assert(worker.Enqueue(new ValidationWorkItem(new byte[] { 0x02 }, peer, BlockIngressKind.LivePush)),
+            "failed to enqueue live-push work item");
+
+        worker.Start(1, cts.Token);
+        release.Set();
+
+        Assert(done.Wait(TimeSpan.FromSeconds(2)), "validation worker did not process both test items");
+        lock (seen)
+        {
+            Assert(seen.Count == 2, $"expected 2 processed items, got {seen.Count}");
+            Assert(seen[0] == BlockIngressKind.LivePush, "live push must preempt queued sync-plan work");
+            Assert(seen[1] == BlockIngressKind.SyncPlan, "sync-plan work should run after live push");
+        }
+    }
+
+    private static void TestBlockDownloadManagerRequestsRecoveryViaAncestorPack()
+    {
+        var peer = CreateFakePeer("recovery-request-peer");
+        byte[] wanted = HashFromU64(777UL);
+        var sent = new List<(MsgType type, byte[] payload)>();
+        using var requested = new ManualResetEventSlim(false);
+        using var manager = new BlockDownloadManager(
+            sessionSnapshot: () => new[] { peer },
+            sendFrameAsync: (p, type, payload, ct) =>
+            {
+                lock (sent)
+                    sent.Add((type, (byte[])payload.Clone()));
+                if (type == MsgType.GetAncestorPack)
+                    requested.Set();
+                return Task.CompletedTask;
+            },
+            haveBlock: _ => false,
+            enqueueValidator: _ => true,
+            revalidateStoredBlock: _ => { },
+            log: null);
+
+        Assert(manager.QueueOutOfPlanFallback(wanted, "selftest") == 1, "recovery hash was not queued");
+        manager.Start(CancellationToken.None);
+        manager.OnPeerReady(peer);
+
+        Assert(requested.Wait(TimeSpan.FromSeconds(10)), "queued recovery hash was not requested");
+
+        lock (sent)
+        {
+            Assert(sent.Count == 1, $"expected exactly one immediate request, got {sent.Count}");
+            Assert(sent[0].type == MsgType.GetAncestorPack, "recovery request must use GetAncestorPack");
+            Assert(SmallNetSyncProtocol.TryParseGetAncestorPack(sent[0].payload, out var frame), "ancestor-pack request did not parse");
+            Assert(frame.MaxBlocks == 1, $"expected single-block recovery request, got {frame.MaxBlocks}");
+            Assert(BytesEqual(frame.StartHash, wanted), "ancestor-pack request targeted the wrong hash");
+        }
     }
 
     private static void TestBlockSyncClientPrefersHigherChainworkOverHeight()
@@ -645,19 +1393,67 @@ internal static class Program
             abortBatchAsync: (peer, reason, ct) => Task.CompletedTask,
             log: null);
 
-        client.OnTipAsync(peerTall, BuildTipPayload(200UL, HashFromU64(200UL), 1_100UL), CancellationToken.None)
+        client.OnTipStateAsync(peerTall, new SmallNetTipStateFrame(200UL, HashFromU64(200UL), 1_100UL, null, new[] { HashFromU64(199UL), HashFromU64(200UL) }), CancellationToken.None)
             .GetAwaiter().GetResult();
-        client.OnTipAsync(peerStrong, BuildTipPayload(150UL, HashFromU64(150UL), 1_200UL), CancellationToken.None)
+        client.OnTipStateAsync(peerStrong, new SmallNetTipStateFrame(150UL, HashFromU64(150UL), 1_200UL, null, new[] { HashFromU64(149UL), HashFromU64(150UL) }), CancellationToken.None)
             .GetAwaiter().GetResult();
         Assert(sent.Count == 0, $"expected no sync request while local chainwork stays ahead, got {sent.Count}");
 
         localChainwork = 1_000UL;
-        client.OnTipAsync(peerTall, BuildTipPayload(200UL, HashFromU64(200UL), 1_100UL), CancellationToken.None)
+        client.OnTipStateAsync(peerTall, new SmallNetTipStateFrame(200UL, HashFromU64(200UL), 1_100UL, null, new[] { HashFromU64(199UL), HashFromU64(200UL) }), CancellationToken.None)
             .GetAwaiter().GetResult();
 
         Assert(sent.Count == 1, $"expected one sync request after lowering local chainwork, got {sent.Count}");
         Assert(sent[0].peer == peerStrong.SessionKey, "client must prefer the higher-chainwork peer even at lower height");
         Assert(sent[0].type == MsgType.GetBlocksByLocator, "initial sync request must use locator-based sync");
+    }
+
+    private static void TestBlockSyncClientTipStateStartsSyncWithoutLegacyGetTip()
+    {
+        byte[] localTip = HashFromU64(100UL);
+        UInt128 localChainwork = 1_000UL;
+        var sent = new List<(string peer, MsgType type, byte[] payload)>();
+        var sessions = new List<PeerSession>();
+        var peer = CreateFakePeer("peer-tipstate");
+        sessions.Add(peer);
+
+        var client = new BlockSyncClient(
+            sessionSnapshot: () => sessions.ToArray(),
+            sendFrameAsync: (targetPeer, type, payload, ct) =>
+            {
+                sent.Add((targetPeer.SessionKey, type, (byte[])payload.Clone()));
+                return Task.CompletedTask;
+            },
+            getLocalTipChainwork: () => localChainwork,
+            getLocalTipHash: () => (byte[])localTip.Clone(),
+            prepareBatchAsync: (startHash, startHeight, advertisedTipChainwork, targetPeer, ct) =>
+                Task.FromResult(new BlockSyncPrepareResult(true, string.Empty)),
+            commitChunkAsync: (payloads, height, prevHash, targetPeer, ct) =>
+            {
+                ulong lastHeight = height + (ulong)payloads.Count - 1UL;
+                return Task.FromResult(new BlockSyncChunkCommitResult(true, HashFromU64(lastHeight), string.Empty));
+            },
+            completeBatchAsync: (targetPeer, status, ct) => Task.CompletedTask,
+            abortBatchAsync: (targetPeer, reason, ct) => Task.CompletedTask,
+            log: null);
+
+        client.OnPeerReadyAsync(peer, CancellationToken.None).GetAwaiter().GetResult();
+        Assert(sent.Count == 0, $"peer-ready must not emit legacy tip requests, got {sent.Count} frame(s)");
+
+        client.OnTipStateAsync(
+                peer,
+                new SmallNetTipStateFrame(
+                    Height: 120UL,
+                    TipHash: HashFromU64(120UL),
+                    Chainwork: 1_200UL,
+                    StateDigest: null,
+                    RecentCanonical: new[] { HashFromU64(119UL), HashFromU64(120UL) }),
+                CancellationToken.None)
+            .GetAwaiter().GetResult();
+
+        Assert(sent.Count == 1, $"tip-state should trigger one sync request, got {sent.Count}");
+        Assert(sent[0].peer == peer.SessionKey, "tip-state sync request must target the announcing peer");
+        Assert(sent[0].type == MsgType.GetBlocksByLocator, "tip-state sync must start with locator-based batch request");
     }
 
     private static void TestBlockSyncClientDisconnectResumesFromLastCommitted()
@@ -697,16 +1493,16 @@ internal static class Program
         byte[] startHash = (byte[])localTip.Clone();
         byte[] remoteTipHash = HashFromU64(20UL);
 
-        client.OnTipAsync(peer1, BuildTipPayload(20UL, remoteTipHash, 20UL), CancellationToken.None).GetAwaiter().GetResult();
+        client.OnTipStateAsync(peer1, new SmallNetTipStateFrame(20UL, remoteTipHash, 20UL, null, new[] { HashFromU64(19UL), remoteTipHash }), CancellationToken.None).GetAwaiter().GetResult();
         Assert(sent.Count == 1, $"expected 1 initial sync request, got {sent.Count}");
         Assert(sent[0].peer == peer1.SessionKey && sent[0].type == MsgType.GetBlocksByLocator,
             "first sync request must be locator-based");
 
-        client.OnBlocksBeginAsync(peer1, BlockSyncProtocol.BuildBlocksBegin(startHash, 11UL, 2), CancellationToken.None)
+        client.OnBlocksBatchStartAsync(peer1, new SmallNetBlocksBatchStartFrame(Guid.NewGuid(), startHash, 10UL, 2, remoteTipHash, 20UL), CancellationToken.None)
             .GetAwaiter().GetResult();
-        client.OnBlockChunkAsync(
+        client.OnBlocksChunkAsync(
                 peer1,
-                BlockSyncProtocol.BuildBlockChunk(11UL, new[] { new byte[] { 0x01 } }),
+                SmallNetSyncProtocol.BuildBlocksChunk(11UL, new[] { new byte[] { 0x01 } }),
                 CancellationToken.None)
             .GetAwaiter().GetResult();
 
@@ -717,7 +1513,7 @@ internal static class Program
         client.OnPeerDisconnectedAsync(peer1, CancellationToken.None).GetAwaiter().GetResult();
 
         sessions.Add(peer2);
-        client.OnTipAsync(peer2, BuildTipPayload(20UL, remoteTipHash, 20UL), CancellationToken.None).GetAwaiter().GetResult();
+        client.OnTipStateAsync(peer2, new SmallNetTipStateFrame(20UL, remoteTipHash, 20UL, null, new[] { HashFromU64(19UL), remoteTipHash }), CancellationToken.None).GetAwaiter().GetResult();
 
         Assert(sent.Count == 1, $"expected exactly one resume request, got {sent.Count}");
         Assert(sent[0].peer == peer2.SessionKey && sent[0].type == MsgType.GetBlocksFrom,
@@ -726,6 +1522,71 @@ internal static class Program
             "resume request payload did not parse");
         Assert(BytesEqual(fromHash, localTip), "resume request did not use last committed hash");
         Assert(maxBlocks == BlockSyncProtocol.BatchMaxBlocks, "resume request max_blocks mismatch");
+    }
+
+    private static void TestBlockSyncClientMoreAvailableContinuesFromCurrentLocalTip()
+    {
+        byte[] localTip = HashFromU64(10UL);
+        UInt128 localChainwork = 10UL;
+        var sent = new List<(string peer, MsgType type, byte[] payload)>();
+        var peer = CreateFakePeer("peer-more-available");
+        var sessions = new List<PeerSession> { peer };
+
+        var client = new BlockSyncClient(
+            sessionSnapshot: () => sessions.ToArray(),
+            sendFrameAsync: (targetPeer, type, payload, ct) =>
+            {
+                sent.Add((targetPeer.SessionKey, type, (byte[])payload.Clone()));
+                return Task.CompletedTask;
+            },
+            getLocalTipChainwork: () => localChainwork,
+            getLocalTipHash: () => (byte[])localTip.Clone(),
+            prepareBatchAsync: (startHash, startHeight, advertisedTipChainwork, targetPeer, ct) =>
+                Task.FromResult(new BlockSyncPrepareResult(true, string.Empty)),
+            commitChunkAsync: (payloads, height, prevHash, targetPeer, ct) =>
+            {
+                localTip = HashFromU64(height + 10_000UL);
+                localChainwork = height;
+                return Task.FromResult(new BlockSyncChunkCommitResult(true, (byte[])localTip.Clone(), string.Empty));
+            },
+            completeBatchAsync: (targetPeer, status, ct) => Task.CompletedTask,
+            abortBatchAsync: (targetPeer, reason, ct) => Task.CompletedTask,
+            log: null);
+
+        byte[] batchForkHash = (byte[])localTip.Clone();
+        byte[] remoteTipHash = HashFromU64(25UL);
+
+        client.OnTipStateAsync(peer, new SmallNetTipStateFrame(25UL, remoteTipHash, 25UL, null, new[] { HashFromU64(24UL), remoteTipHash }), CancellationToken.None)
+            .GetAwaiter().GetResult();
+        Assert(sent.Count == 1, $"expected initial locator sync request, got {sent.Count}");
+        Assert(sent[0].type == MsgType.GetBlocksByLocator, $"expected locator request first, got {sent[0].type}");
+
+        sent.Clear();
+        client.OnBlocksBatchStartAsync(peer, new SmallNetBlocksBatchStartFrame(Guid.NewGuid(), batchForkHash, 10UL, 1, remoteTipHash, 25UL), CancellationToken.None)
+            .GetAwaiter().GetResult();
+        client.OnBlocksChunkAsync(
+                peer,
+                SmallNetSyncProtocol.BuildBlocksChunk(11UL, new[] { new byte[] { 0x01 } }),
+                CancellationToken.None)
+            .GetAwaiter().GetResult();
+
+        byte[] committedTip = (byte[])localTip.Clone();
+        localTip = HashFromU64(12_000UL);
+        localChainwork = 12UL;
+
+        client.OnBlocksBatchEndAsync(
+                peer,
+                new SmallNetBlocksBatchEndFrame(Guid.NewGuid(), committedTip, 11UL, MoreAvailable: true),
+                CancellationToken.None)
+            .GetAwaiter().GetResult();
+
+        Assert(sent.Count == 1, $"expected one continuation request after more-available, got {sent.Count}");
+        Assert(sent[0].type == MsgType.GetBlocksFrom, $"expected GetBlocksFrom continuation, got {sent[0].type}");
+        Assert(BlockSyncProtocol.TryParseGetBlocksFrom(sent[0].payload, out var fromHash, out var maxBlocks),
+            "continuation request payload did not parse");
+        Assert(BytesEqual(fromHash, localTip), "continuation request must use the current local canonical tip");
+        Assert(!BytesEqual(fromHash, committedTip), "continuation request must not reuse the stale batch end hash when local tip advanced");
+        Assert(maxBlocks == BlockSyncProtocol.BatchMaxBlocks, "continuation request max_blocks mismatch");
     }
 
     private static void TestBlockSyncClientInvalidBlockPenalizesAndFallsBack()
@@ -760,17 +1621,17 @@ internal static class Program
 
         byte[] startHash = (byte[])localTip.Clone();
         byte[] remoteTipHash = HashFromU64(25UL);
-        var tipPayload = BuildTipPayload(25UL, remoteTipHash, 25UL);
+        var tipState = new SmallNetTipStateFrame(25UL, remoteTipHash, 25UL, null, new[] { HashFromU64(24UL), remoteTipHash });
 
-        client.OnTipAsync(peer1, tipPayload, CancellationToken.None).GetAwaiter().GetResult();
-        client.OnTipAsync(peer2, tipPayload, CancellationToken.None).GetAwaiter().GetResult();
-        client.OnBlocksBeginAsync(peer1, BlockSyncProtocol.BuildBlocksBegin(startHash, 11UL, 1), CancellationToken.None)
+        client.OnTipStateAsync(peer1, tipState, CancellationToken.None).GetAwaiter().GetResult();
+        client.OnTipStateAsync(peer2, tipState, CancellationToken.None).GetAwaiter().GetResult();
+        client.OnBlocksBatchStartAsync(peer1, new SmallNetBlocksBatchStartFrame(Guid.NewGuid(), startHash, 10UL, 1, remoteTipHash, 25UL), CancellationToken.None)
             .GetAwaiter().GetResult();
 
         sent.Clear();
-        client.OnBlockChunkAsync(
+        client.OnBlocksChunkAsync(
                 peer1,
-                BlockSyncProtocol.BuildBlockChunk(11UL, new[] { new byte[] { 0xFF } }),
+                SmallNetSyncProtocol.BuildBlocksChunk(11UL, new[] { new byte[] { 0xFF } }),
                 CancellationToken.None)
             .GetAwaiter().GetResult();
 
@@ -898,6 +1759,65 @@ internal static class Program
         return block;
     }
 
+    private static Block BuildLooseMinedBlock(
+        ulong height,
+        byte[] prevHash,
+        ulong timestamp,
+        string minerPubHex,
+        IEnumerable<Transaction>? txs = null)
+    {
+        txs ??= Array.Empty<Transaction>();
+
+        ulong totalFees = 0;
+        var list = new List<Transaction>();
+        foreach (var tx in txs)
+        {
+            if (tx == null) continue;
+            if (TransactionValidator.IsCoinbase(tx))
+                throw new InvalidOperationException("non-coinbase tx list contains coinbase");
+
+            checked { totalFees += tx.Fee; }
+            list.Add(tx);
+        }
+
+        ulong subsidy = RewardCalculator.GetBlockSubsidy(height);
+        ulong coinbaseAmount = checked(subsidy + totalFees);
+        var blockTxs = new List<Transaction>(1 + list.Count)
+        {
+            BuildCoinbase(minerPubHex, coinbaseAmount)
+        };
+        blockTxs.AddRange(list);
+
+        var block = new Block
+        {
+            BlockHeight = height,
+            Header = new BlockHeader
+            {
+                Version = 1,
+                PreviousBlockHash = (byte[])prevHash.Clone(),
+                MerkleRoot = new byte[32],
+                Timestamp = timestamp,
+                Target = (byte[])SelfTestEasyTarget.Clone(),
+                Nonce = 0,
+                Miner = Convert.FromHexString(minerPubHex)
+            },
+            Transactions = blockTxs,
+            BlockHash = new byte[32]
+        };
+
+        block.RecomputeAndSetMerkleRoot();
+        MineBlockInPlace(block);
+        return block;
+    }
+
+    private static byte[] SerializeBlock(Block block)
+    {
+        int size = BlockBinarySerializer.GetSize(block);
+        var payload = new byte[size];
+        _ = BlockBinarySerializer.Write(payload, block);
+        return payload;
+    }
+
     private static byte[] ComputeExpectedTargetForHeight(ulong nextHeight, byte[] prevHash)
     {
         if (nextHeight == 0)
@@ -930,21 +1850,67 @@ internal static class Program
 
     private static void MineBlockInPlace(Block block)
     {
+        const int NonceBatchSize = 4096;
         var target = block.Header?.Target ?? throw new InvalidOperationException("target missing");
+        var header = block.Header!;
+        int workers = Math.Max(1, Environment.ProcessorCount);
+        int found = 0;
+        ulong winningNonce = 0;
+        byte[]? winningHash = null;
+        object winnerGate = new();
 
-        for (ulong nonce = 0; ; nonce++)
-        {
-            block.Header!.Nonce = nonce;
-            var hash = block.ComputeBlockHash();
-            if (Difficulty.Meets(hash, target))
+        Parallel.For(
+            fromInclusive: 0,
+            toExclusive: workers,
+            body: (workerIndex, state) =>
             {
-                block.BlockHash = hash;
-                return;
-            }
+                ulong nonce = (ulong)workerIndex * (ulong)NonceBatchSize;
+                ulong step = (ulong)workers * (ulong)NonceBatchSize;
 
-            if (nonce == ulong.MaxValue)
-                throw new InvalidOperationException("mining failed: nonce exhausted");
-        }
+                while (Volatile.Read(ref found) == 0)
+                {
+                    ulong limit = nonce;
+                    if (ulong.MaxValue - limit < (ulong)NonceBatchSize - 1UL)
+                        limit = ulong.MaxValue - ((ulong)NonceBatchSize - 1UL);
+
+                    for (ulong candidate = nonce; candidate <= limit; candidate++)
+                    {
+                        if (Volatile.Read(ref found) != 0)
+                        {
+                            state.Stop();
+                            return;
+                        }
+
+                        var hash = Blake3Util.Hash(header.ToHashBytesWithNonce(candidate));
+                        if (!Difficulty.Meets(hash, target))
+                            continue;
+
+                        lock (winnerGate)
+                        {
+                            if (winningHash == null)
+                            {
+                                winningNonce = candidate;
+                                winningHash = hash;
+                                Volatile.Write(ref found, 1);
+                            }
+                        }
+
+                        state.Stop();
+                        return;
+                    }
+
+                    if (ulong.MaxValue - nonce < step)
+                        break;
+
+                    nonce += step;
+                }
+            });
+
+        if (winningHash is not { Length: 32 })
+            throw new InvalidOperationException("mining failed: nonce exhausted");
+
+        header.Nonce = winningNonce;
+        block.BlockHash = winningHash;
     }
 
     private static void SeedAccount(string addrHex, ulong balance, ulong nonce)
@@ -971,6 +1937,20 @@ internal static class Program
         return true;
     }
 
+    private static BlockSyncClient CreateNoopBlockSyncClient(PeerSession peer, UInt128 localTipChainwork, byte[] localTipHash)
+        => new(
+            sessionSnapshot: () => new[] { peer },
+            sendFrameAsync: (targetPeer, type, payload, ct) => Task.CompletedTask,
+            getLocalTipChainwork: () => localTipChainwork,
+            getLocalTipHash: () => (byte[])localTipHash.Clone(),
+            prepareBatchAsync: (startHash, startHeight, advertisedTipChainwork, targetPeer, ct) =>
+                Task.FromResult(new BlockSyncPrepareResult(true, string.Empty)),
+            commitChunkAsync: (payloads, height, prevHash, targetPeer, ct) =>
+                Task.FromResult(new BlockSyncChunkCommitResult(true, HashFromU64(height + (ulong)payloads.Count - 1UL), string.Empty)),
+            completeBatchAsync: (targetPeer, status, ct) => Task.CompletedTask,
+            abortBatchAsync: (targetPeer, reason, ct) => Task.CompletedTask,
+            log: null);
+
     private static PeerSession CreateFakePeer(string key)
         => new()
         {
@@ -982,9 +1962,6 @@ internal static class Program
             IsInbound = false
         };
 
-    private static byte[] BuildTipPayload(ulong height, byte[] hash, UInt128 chainwork)
-        => BlockSyncProtocol.BuildTipPayload(height, hash, chainwork);
-
     private static byte[] HashFromU64(ulong value)
     {
         Span<byte> buf = stackalloc byte[8];
@@ -995,6 +1972,25 @@ internal static class Program
     private static void Assert(bool condition, string message)
     {
         if (!condition) throw new InvalidOperationException(message);
+    }
+
+    private static void TraceTestStep(string message)
+    {
+        string? trace = Environment.GetEnvironmentVariable("QADO_SELFTEST_TRACE");
+        if (!string.Equals(trace, "1", StringComparison.Ordinal))
+            return;
+
+        string line = $"[TRACE] {DateTime.UtcNow:O} {message}{Environment.NewLine}";
+        Console.Write(line);
+        Console.Out.Flush();
+
+        try
+        {
+            File.AppendAllText(Path.Combine(Environment.CurrentDirectory, "selftest_trace_steps.log"), line);
+        }
+        catch
+        {
+        }
     }
 
     private static byte[] HashLeaf(byte[] leaf)

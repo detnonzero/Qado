@@ -6,13 +6,10 @@ namespace Qado.Networking
 
         InvTx = 2,
         Tx = 3,
-        InvBlock = 4,
         Block = 5,
 
         GetBlock = 6,
         BlockAt = 7,
-        GetTip = 8,
-        Tip = 9,
 
         GetPeers = 10,
         Peers = 11,
@@ -22,16 +19,20 @@ namespace Qado.Networking
 
         GetTx = 14,
 
-        GetData = 15,
         Headers = 16,
         GetHeaders = 17,
 
         GetBlocksByLocator = 18,
         GetBlocksFrom = 19,
-        BlocksBegin = 20,
-        BlockChunk = 21,
-        BlocksEnd = 22,
-        NoCommonAncestor = 23
+        NoCommonAncestor = 23,
+
+        Hello = 24,
+        TipState = 25,
+        GetAncestorPack = 26,
+        AncestorPack = 27,
+        BlocksBatchStart = 28,
+        BlocksChunk = 29,
+        BlocksBatchEnd = 30
     }
 }
 

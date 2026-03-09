@@ -1,5 +1,4 @@
 using System;
-using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Threading;
@@ -14,33 +13,25 @@ namespace Qado.Networking
     {
         public const int MaxInflightGlobal = 1;
         public const int MaxInflightPerPeer = 1;
-        public const int MaxInvHashes = 50_000;
-        public const int GetDataBatchSize = 1;
+        public const int RecoveryRequestBatchSize = 1;
         public const int SequentialChunkSize = 240;
         public static readonly TimeSpan RequestedTimeout = TimeSpan.FromSeconds(12);
-        public static readonly int MaxHashListPayloadBytes = 4 + (MaxInvHashes * 32);
 
-        private const int MaxInvSeenEntries = 200_000;
-        private static readonly TimeSpan InvSeenTtl = TimeSpan.FromMinutes(30);
         private static readonly TimeSpan PeerFailureCooldownBase = TimeSpan.FromSeconds(25);
         private static readonly TimeSpan PeerFailureCooldownCap = TimeSpan.FromMinutes(10);
         private static readonly TimeSpan PeerFailureStreakResetAfter = TimeSpan.FromMinutes(15);
         private static readonly TimeSpan OutOfPlanFallbackTtl = TimeSpan.FromMinutes(2);
         private static readonly TimeSpan LatencyFreshWindow = TimeSpan.FromMinutes(2);
         private const int MaxOutOfPlanFallbackHashes = 1024;
-        private const int MaxOutOfPlanFallbackPerInv = 64;
 
         private readonly object _gate = new();
         private readonly Queue<byte[]> _missingQueue = new();
         private readonly HashSet<string> _queuedSet = new(StringComparer.Ordinal);
-        private readonly HashSet<string> _activePlanHashes = new(StringComparer.Ordinal);
         private readonly Dictionary<string, InflightRequest> _inflightByHash = new(StringComparer.Ordinal);
         private readonly Dictionary<string, HashSet<string>> _inflightByPeer = new(StringComparer.Ordinal);
-        private readonly Dictionary<string, DateTime> _invSeenByHash = new(StringComparer.Ordinal);
         private readonly Dictionary<string, DateTime> _peerCooldownUntilUtc = new(StringComparer.Ordinal);
         private readonly Dictionary<string, PeerFailureState> _peerFailureStateByKey = new(StringComparer.Ordinal);
         private readonly Dictionary<string, DateTime> _outOfPlanFallbackUntilUtc = new(StringComparer.Ordinal);
-        private readonly Queue<(string key, DateTime seenUtc)> _invSeenOrder = new();
         private readonly ConcurrentDictionary<string, BlockSyncItemState> _stateByHash = new(StringComparer.Ordinal);
 
         private readonly Func<IReadOnlyCollection<PeerSession>> _sessionSnapshot;
@@ -136,12 +127,16 @@ namespace Qado.Networking
             _ = Task.Run(() => RecoverUnvalidatedBlocksAsync(ct), CancellationToken.None);
         }
 
-        public bool EnqueueBlockPayload(PeerSession peer, byte[] payload, bool? enforceRateLimitOverride = null)
+        public bool EnqueueBlockPayload(
+            PeerSession peer,
+            byte[] payload,
+            BlockIngressKind ingress = BlockIngressKind.SyncPlan,
+            bool? enforceRateLimitOverride = null)
         {
             if (peer == null || payload == null || payload.Length == 0)
                 return false;
 
-            return _enqueueValidator(new ValidationWorkItem(payload, peer, enforceRateLimitOverride));
+            return _enqueueValidator(new ValidationWorkItem(payload, peer, ingress, enforceRateLimitOverride));
         }
 
         public void OnPeerReady(PeerSession peer)
@@ -196,88 +191,6 @@ namespace Qado.Networking
 
             if (requeued > 0)
                 RequestPump();
-        }
-
-        public void OnInv(PeerSession peer, byte[] payload)
-        {
-            if (peer == null)
-                return;
-
-            if (payload == null || payload.Length == 0)
-                return;
-
-            if (!TryParseHashListPayload(payload, MaxInvHashes, out var hashes))
-            {
-                _log?.Warn("Sync", "Invalid inv payload ignored.");
-                return;
-            }
-
-            var inPlan = new List<byte[]>(hashes.Count);
-            var outOfPlanUnknown = new List<byte[]>(hashes.Count);
-            var outOfPlanFetchable = new List<byte[]>(Math.Min(hashes.Count, MaxOutOfPlanFallbackPerInv));
-
-            lock (_gate)
-            {
-                for (int i = 0; i < hashes.Count; i++)
-                {
-                    var hash = hashes[i];
-                    if (hash is not { Length: 32 })
-                        continue;
-
-                    string hex = ToHex(hash);
-                    if (_activePlanHashes.Contains(hex))
-                    {
-                        inPlan.Add(hash);
-                        continue;
-                    }
-
-                    outOfPlanUnknown.Add((byte[])hash.Clone());
-                }
-            }
-
-            for (int i = 0; i < outOfPlanUnknown.Count; i++)
-            {
-                var hash = outOfPlanUnknown[i];
-                if (SafeHaveBlock(hash))
-                    continue;
-                if (BlockIndexStore.ContainsHash(hash))
-                    continue;
-                if (BlockIndexStore.IsBadOrHasBadAncestor(hash))
-                    continue;
-
-                if (outOfPlanFetchable.Count < MaxOutOfPlanFallbackPerInv)
-                    outOfPlanFetchable.Add(hash);
-            }
-
-            int fallbackArmed = 0;
-            int fallbackQueued = 0;
-            if (outOfPlanFetchable.Count > 0)
-            {
-                lock (_gate)
-                {
-                    DateTime now = DateTime.UtcNow;
-                    PruneOutOfPlanFallback_NoLock(now);
-                    fallbackArmed = AddOutOfPlanFallback_NoLock(outOfPlanFetchable, now);
-                    if (fallbackArmed > 0)
-                    {
-                        int duplicates = 0;
-                        fallbackQueued = EnqueueMissingHashes_NoLock(
-                            outOfPlanFetchable,
-                            source: "inv-out-of-plan-fallback",
-                            ref duplicates,
-                            now);
-                    }
-                }
-
-                if (fallbackQueued > 0)
-                    RequestPump();
-            }
-
-            if (inPlan.Count > 0)
-                EnqueueMissingHashes(inPlan, source: "inv");
-
-            if (fallbackArmed > 0 || fallbackQueued > 0)
-                _log?.Info("Sync", $"INV out-of-plan fallback: armed={fallbackArmed}, queued={fallbackQueued}");
         }
 
         public int QueueOutOfPlanFallback(byte[] hash, string source = "manual-out-of-plan")
@@ -342,8 +255,7 @@ namespace Qado.Networking
                 else
                 {
                     _queuedSet.Remove(hashHex);
-                    if (_activePlanHashes.Contains(hashHex))
-                        _stateByHash[hashHex] = BlockSyncItemState.HaveBlock;
+                    _stateByHash[hashHex] = BlockSyncItemState.HaveBlock;
                     arrivalKind = BlockArrivalKind.Unsolicited;
                 }
             }
@@ -362,16 +274,6 @@ namespace Qado.Networking
             lock (_gate)
                 _outOfPlanFallbackUntilUtc.Remove(hashHex);
             _stateByHash[hashHex] = valid ? BlockSyncItemState.Validated : BlockSyncItemState.Invalid;
-        }
-
-        public bool IsHashInActivePlan(byte[] hash)
-        {
-            if (hash is not { Length: 32 })
-                return false;
-
-            string hex = ToHex(hash);
-            lock (_gate)
-                return _activePlanHashes.Contains(hex);
         }
 
         public bool IsOutOfPlanFallbackHash(byte[] hash)
@@ -494,7 +396,7 @@ namespace Qado.Networking
                 if (peerFree <= 0)
                     return;
 
-                int toTake = Math.Min(GetDataBatchSize, Math.Min(peerFree, Math.Min(globalFree, chunkRemaining)));
+                int toTake = Math.Min(RecoveryRequestBatchSize, Math.Min(peerFree, Math.Min(globalFree, chunkRemaining)));
                 if (toTake <= 0)
                     return;
 
@@ -502,16 +404,16 @@ namespace Qado.Networking
                 if (selectedHashes.Count == 0)
                     return;
 
-                if (selectedHashes.Count > GetDataBatchSize)
+                if (selectedHashes.Count > RecoveryRequestBatchSize)
                 {
-                    for (int i = GetDataBatchSize; i < selectedHashes.Count; i++)
+                    for (int i = RecoveryRequestBatchSize; i < selectedHashes.Count; i++)
                     {
                         var overflowHash = selectedHashes[i];
                         if (overflowHash is { Length: 32 })
                             RequeueHash_NoLock(overflowHash, ToHex(overflowHash));
                     }
 
-                    selectedHashes = selectedHashes.GetRange(0, GetDataBatchSize);
+                    selectedHashes = selectedHashes.GetRange(0, RecoveryRequestBatchSize);
                 }
 
                 ReserveInflight_NoLock(selectedHashes, selectedPeerKey, now);
@@ -528,8 +430,8 @@ namespace Qado.Networking
             MsgType requestType;
             try
             {
-                payload = BuildHashListPayload(selectedHashes, selectedHashes.Count);
-                requestType = MsgType.GetData;
+                payload = SmallNetSyncProtocol.BuildGetAncestorPack(selectedHashes[0], 1);
+                requestType = MsgType.GetAncestorPack;
             }
             catch
             {
@@ -557,24 +459,6 @@ namespace Qado.Networking
                 RequestPump();
         }
 
-        private void EnqueueMissingHashes(List<byte[]> hashes, string source)
-        {
-            int added;
-            int duplicates = 0;
-            DateTime now = DateTime.UtcNow;
-
-            lock (_gate)
-            {
-                added = EnqueueMissingHashes_NoLock(hashes, source, ref duplicates, now);
-            }
-
-            if (added > 0)
-                RequestPump();
-
-            if (added > 0 || duplicates > 0)
-                _log?.Info("Sync", $"{source}: queued={added}, duplicates={duplicates}");
-        }
-
         private int EnqueueMissingHashes_NoLock(
             IReadOnlyList<byte[]>? hashes,
             string source,
@@ -586,8 +470,6 @@ namespace Qado.Networking
 
             int added = 0;
             DateTime now = nowOverride ?? DateTime.UtcNow;
-            bool applyInvDedup = string.Equals(source, "inv", StringComparison.OrdinalIgnoreCase);
-            bool allowInvalidRetry = !applyInvDedup;
 
             for (int i = 0; i < hashes.Count; i++)
             {
@@ -596,12 +478,6 @@ namespace Qado.Networking
                     continue;
 
                 string hex = ToHex(hash);
-                if (applyInvDedup && IsDuplicateInv_NoLock(hex, now))
-                {
-                    duplicates++;
-                    continue;
-                }
-
                 if (!IsHashDownloadCandidate_NoLock(hash, hex))
                 {
                     continue;
@@ -617,9 +493,6 @@ namespace Qado.Networking
                 {
                     if (state == BlockSyncItemState.Invalid)
                     {
-                        if (!allowInvalidRetry)
-                            continue;
-
                         _stateByHash.TryRemove(hex, out _);
                     }
                     else if (state == BlockSyncItemState.Requested ||
@@ -639,54 +512,19 @@ namespace Qado.Networking
             return added;
         }
 
-        private int EnqueueMissingHashes_NoLock(IReadOnlyList<byte[]>? hashes, string source)
-        {
-            int duplicates = 0;
-            return EnqueueMissingHashes_NoLock(hashes, source, ref duplicates, DateTime.UtcNow);
-        }
-
-        private bool IsDuplicateInv_NoLock(string hashHex, DateTime now)
-        {
-            bool duplicate = _invSeenByHash.TryGetValue(hashHex, out var seenUtc) &&
-                             (now - seenUtc) < InvSeenTtl;
-
-            _invSeenByHash[hashHex] = now;
-            _invSeenOrder.Enqueue((hashHex, now));
-
-            while (_invSeenOrder.Count > 0)
-            {
-                var (key, ts) = _invSeenOrder.Peek();
-                bool staleByAge = (now - ts) > InvSeenTtl;
-                bool staleBySize = _invSeenByHash.Count > MaxInvSeenEntries;
-
-                if (!staleByAge && !staleBySize)
-                    break;
-
-                _invSeenOrder.Dequeue();
-
-                if (_invSeenByHash.TryGetValue(key, out var current) && current == ts)
-                    _invSeenByHash.Remove(key);
-            }
-
-            return duplicate;
-        }
-
         private int AddOutOfPlanFallback_NoLock(IReadOnlyList<byte[]> hashes, DateTime now)
         {
             if (hashes == null || hashes.Count == 0)
                 return 0;
 
             int armed = 0;
-            for (int i = 0; i < hashes.Count && armed < MaxOutOfPlanFallbackPerInv; i++)
+            for (int i = 0; i < hashes.Count; i++)
             {
                 var hash = hashes[i];
                 if (hash is not { Length: 32 })
                     continue;
 
                 string hex = ToHex(hash);
-                if (_activePlanHashes.Contains(hex))
-                    continue;
-
                 if (_stateByHash.TryGetValue(hex, out var state) &&
                     (state == BlockSyncItemState.Requested ||
                      state == BlockSyncItemState.HaveBlock ||
@@ -777,7 +615,9 @@ namespace Qado.Networking
             var ordered = new List<PeerSession>(peers.Count);
             foreach (var peer in peers)
             {
-                if (peer == null || !peer.HandshakeOk || !peer.Client.Connected)
+                if (peer == null || !peer.HandshakeOk)
+                    continue;
+                if (peer.Client != null && !peer.Client.Connected)
                     continue;
 
                 string peerKey = NormalizePeerKey(peer.SessionKey);
@@ -947,8 +787,7 @@ namespace Qado.Networking
                         state == BlockSyncItemState.Validated)
                         continue;
 
-                    if (state == BlockSyncItemState.Invalid &&
-                        !_activePlanHashes.Contains(hex))
+                    if (state == BlockSyncItemState.Invalid)
                         continue;
                 }
 
@@ -1080,89 +919,6 @@ LIMIT 50000;";
             try { _pumpSignal.Release(); } catch (SemaphoreFullException) { }
         }
 
-        public static byte[] BuildHashListPayload(IReadOnlyList<byte[]> hashes, int maxHashes = MaxInvHashes)
-        {
-            if (hashes == null || hashes.Count == 0)
-            {
-                var empty = new byte[4];
-                BinaryPrimitives.WriteUInt32LittleEndian(empty, 0);
-                return empty;
-            }
-
-            if (maxHashes <= 0)
-                maxHashes = 1;
-
-            var valid = new List<byte[]>(Math.Min(maxHashes, hashes.Count));
-            for (int i = 0; i < hashes.Count && valid.Count < maxHashes; i++)
-            {
-                if (hashes[i] is { Length: 32 } h)
-                    valid.Add(h);
-            }
-
-            var payload = new byte[4 + (valid.Count * 32)];
-            BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(0, 4), (uint)valid.Count);
-
-            int o = 4;
-            for (int i = 0; i < valid.Count; i++)
-            {
-                valid[i].AsSpan(0, 32).CopyTo(payload.AsSpan(o, 32));
-                o += 32;
-            }
-
-            return payload;
-        }
-
-        public static bool TryParseHashListPayload(byte[] payload, int maxHashes, out List<byte[]> hashes)
-        {
-            hashes = new List<byte[]>();
-            if (payload == null)
-                return false;
-
-            // Canonical format: [u32 count][count * 32-byte hashes]
-            if (payload.Length >= 4)
-            {
-                uint declared = BinaryPrimitives.ReadUInt32LittleEndian(payload.AsSpan(0, 4));
-                if (declared <= int.MaxValue)
-                {
-                    int count = (int)declared;
-                    if (count >= 0 && count <= maxHashes)
-                    {
-                        int expected = 4 + (count * 32);
-                        if (payload.Length == expected)
-                        {
-                            hashes = new List<byte[]>(count);
-                            int o = 4;
-                            for (int i = 0; i < count; i++)
-                            {
-                                hashes.Add(payload.AsSpan(o, 32).ToArray());
-                                o += 32;
-                            }
-
-                            return true;
-                        }
-                    }
-                }
-            }
-
-            // Legacy compatibility format: [count * 32-byte hashes] (without leading count).
-            if (payload.Length == 0 || (payload.Length % 32) != 0)
-                return false;
-
-            int legacyCount = payload.Length / 32;
-            if (legacyCount > maxHashes)
-                return false;
-
-            hashes = new List<byte[]>(legacyCount);
-            int legacyOffset = 0;
-            for (int i = 0; i < legacyCount; i++)
-            {
-                hashes.Add(payload.AsSpan(legacyOffset, 32).ToArray());
-                legacyOffset += 32;
-            }
-
-            return true;
-        }
-
         private bool IsHashDownloadCandidate(byte[] hash)
         {
             if (hash is not { Length: 32 })
@@ -1178,13 +934,11 @@ LIMIT 50000;";
             if (hash is not { Length: 32 })
                 return false;
 
-            bool inActivePlan = _activePlanHashes.Contains(hashHex);
-            if (!inActivePlan)
+            var now = DateTime.UtcNow;
+            PruneOutOfPlanFallback_NoLock(now);
+            if (!_outOfPlanFallbackUntilUtc.TryGetValue(hashHex, out var until) || until <= now)
             {
-                var now = DateTime.UtcNow;
-                PruneOutOfPlanFallback_NoLock(now);
-                if (!_outOfPlanFallbackUntilUtc.TryGetValue(hashHex, out var until) || until <= now)
-                    return false;
+                return false;
             }
 
             try

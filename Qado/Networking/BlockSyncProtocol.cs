@@ -1,7 +1,6 @@
 using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
-using Qado.Utils;
 
 namespace Qado.Networking
 {
@@ -11,11 +10,7 @@ namespace Qado.Networking
         MoreAvailable = 1
     }
 
-    public readonly record struct BlocksBeginFrame(byte[] StartHash, ulong StartHeight, int TotalBlocks);
-
     public readonly record struct BlockChunkFrame(ulong FirstHeight, IReadOnlyList<byte[]> Blocks);
-
-    public readonly record struct TipFrame(ulong Height, byte[] Hash, UInt128 Chainwork);
 
     public static class BlockSyncProtocol
     {
@@ -23,15 +18,11 @@ namespace Qado.Networking
         public const int ChunkBlocks = 64;
         public const int MaxLocatorHashes = 64;
         public const int MaxSerializedBlockBytes = 64 * 1024;
-        public const int TipPayloadBytesLegacy = 8 + 32;
-        public const int TipPayloadBytes = TipPayloadBytesLegacy + 16;
         public static readonly int MaxBlockChunkPayloadBytes =
             8 + 4 + (ChunkBlocks * (4 + MaxSerializedBlockBytes));
         public static readonly int MaxFramePayloadBytes = Math.Max(
             MaxBlockChunkPayloadBytes,
-            Math.Max(
-                4 + (MaxLocatorHashes * 32) + 4,
-                Math.Max(32 + 4, TipPayloadBytes)));
+            4 + (MaxLocatorHashes * 32) + 4);
 
         public static byte[] BuildGetBlocksByLocator(IReadOnlyList<byte[]> locatorHashes, int maxBlocks = BatchMaxBlocks)
         {
@@ -119,36 +110,6 @@ namespace Qado.Networking
             return true;
         }
 
-        public static byte[] BuildBlocksBegin(byte[] startHash, ulong startHeight, int totalBlocks)
-        {
-            if (startHash is not { Length: 32 })
-                throw new ArgumentException("startHash must be 32 bytes", nameof(startHash));
-            if (totalBlocks < 0 || totalBlocks > BatchMaxBlocks)
-                throw new ArgumentOutOfRangeException(nameof(totalBlocks));
-
-            var payload = new byte[32 + 8 + 4];
-            startHash.CopyTo(payload, 0);
-            BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(32, 8), startHeight);
-            BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(40, 4), (uint)totalBlocks);
-            return payload;
-        }
-
-        public static bool TryParseBlocksBegin(byte[] payload, out BlocksBeginFrame frame)
-        {
-            frame = default;
-            if (payload == null || payload.Length != 44)
-                return false;
-
-            byte[] startHash = payload.AsSpan(0, 32).ToArray();
-            ulong startHeight = BinaryPrimitives.ReadUInt64LittleEndian(payload.AsSpan(32, 8));
-            uint totalBlocks = BinaryPrimitives.ReadUInt32LittleEndian(payload.AsSpan(40, 4));
-            if (totalBlocks > BatchMaxBlocks)
-                return false;
-
-            frame = new BlocksBeginFrame(startHash, startHeight, (int)totalBlocks);
-            return true;
-        }
-
         public static byte[] BuildBlockChunk(ulong firstHeight, IReadOnlyList<byte[]> blocks)
         {
             blocks ??= Array.Empty<byte[]>();
@@ -219,49 +180,6 @@ namespace Qado.Networking
                 return false;
 
             frame = new BlockChunkFrame(firstHeight, blocks);
-            return true;
-        }
-
-        public static byte[] BuildBlocksEnd(BlocksEndStatus status)
-            => new[] { (byte)status };
-
-        public static bool TryParseBlocksEnd(byte[] payload, out BlocksEndStatus status)
-        {
-            status = BlocksEndStatus.TipReached;
-            if (payload == null || payload.Length != 1)
-                return false;
-
-            if (!Enum.IsDefined(typeof(BlocksEndStatus), payload[0]))
-                return false;
-
-            status = (BlocksEndStatus)payload[0];
-            return true;
-        }
-
-        public static byte[] BuildTipPayload(ulong height, byte[] hash, UInt128 chainwork)
-        {
-            if (hash is not { Length: 32 })
-                throw new ArgumentException("tip hash must be 32 bytes", nameof(hash));
-
-            var payload = new byte[TipPayloadBytes];
-            BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(0, 8), height);
-            hash.CopyTo(payload, 8);
-            U128.WriteBE(payload.AsSpan(TipPayloadBytesLegacy, 16), chainwork);
-            return payload;
-        }
-
-        public static bool TryParseTipPayload(byte[] payload, out TipFrame frame)
-        {
-            frame = default;
-            if (payload == null || (payload.Length != TipPayloadBytesLegacy && payload.Length != TipPayloadBytes))
-                return false;
-
-            ulong height = BinaryPrimitives.ReadUInt64LittleEndian(payload.AsSpan(0, 8));
-            byte[] hash = payload.AsSpan(8, 32).ToArray();
-            UInt128 chainwork = payload.Length == TipPayloadBytes
-                ? U128.ReadBE(payload.AsSpan(TipPayloadBytesLegacy, 16))
-                : 0;
-            frame = new TipFrame(height, hash, chainwork);
             return true;
         }
 

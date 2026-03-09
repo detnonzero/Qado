@@ -17,10 +17,6 @@ namespace Qado.Blockchain
         private const int ReorgRequeueGossipBurstSize = 16;
         private static readonly TimeSpan ReorgRequeueGossipPause = TimeSpan.FromMilliseconds(20);
         private static readonly LruSet ReorgRequeueGossipSeen = new(capacity: 200_000, ttl: TimeSpan.FromMinutes(30));
-        private static readonly object AdoptionCooldownGate = new();
-        private static readonly Dictionary<string, DateTime> AdoptionCooldownByTip = new(StringComparer.Ordinal);
-        private static readonly TimeSpan AdoptionCooldownTtl = TimeSpan.FromMinutes(15);
-        private const int MaxAdoptionCooldownEntries = 4096;
         private static readonly object PrefetchFailureGate = new();
         private static DateTime _prefetchFailureCooldownUntilUtc = DateTime.MinValue;
         private static readonly TimeSpan PrefetchFailureCooldown = TimeSpan.FromSeconds(3);
@@ -41,6 +37,26 @@ namespace Qado.Blockchain
             public DateTime LastSeenUtc = DateTime.MinValue;
         }
 
+        public static void ResetForTests()
+        {
+            try
+            {
+                lock (PrefetchFailureGate)
+                    _prefetchFailureCooldownUntilUtc = DateTime.MinValue;
+
+                lock (MissingCandidateGate)
+                    MissingCandidateByHash.Clear();
+
+                lock (MissingPayloadRecoveryGate)
+                    _nextMissingPayloadRecoveryAllowedUtc = DateTime.MinValue;
+
+                ReorgRequeueGossipSeen.Clear();
+            }
+            catch
+            {
+            }
+        }
+
         public static void MaybeAdoptNewTip(byte[] candidateTipHash, ILogSink? log = null, MempoolManager? mempool = null)
         {
             if (candidateTipHash is not { Length: 32 })
@@ -52,9 +68,6 @@ namespace Qado.Blockchain
                 return;
 
             if (BlockIndexStore.IsBadOrHasBadAncestor(candidateTipHash))
-                return;
-
-            if (IsInAdoptionCooldown(candidateTipHash, out _))
                 return;
 
             var canonTipHeight = BlockStore.GetLatestHeight();
@@ -100,10 +113,7 @@ namespace Qado.Blockchain
             }
 
             if (IsMissingCandidateBlocked_NoThrow(newCanonAsc, out _, out _, out _))
-            {
-                RememberAdoptionCooldown_NoThrow(candidateTipHash);
                 return;
-            }
 
             log?.Warn("ChainSel", $"Adopting stronger chain (oldTip={ToHex(canonTipHash, 16)} -> newTip={ToHex(candidateTipHash, 16)}).");
 
@@ -118,7 +128,6 @@ namespace Qado.Blockchain
             {
                 if (!TryPrefetchBlocksAscending(newCanonAsc, out newBlocksAsc, log))
                 {
-                    RememberAdoptionCooldown_NoThrow(candidateTipHash);
                     RememberPrefetchFailure_NoThrow();
                     log?.Warn("ChainSel", "Failed to prefetch candidate blocks; skipping adoption.");
                     return;
@@ -130,7 +139,6 @@ namespace Qado.Blockchain
 
                 if (!TryPrefetchOldCanonDescending(fromHeight, rollbackTop, tx, out var oldCanonDesc, log))
                 {
-                    RememberAdoptionCooldown_NoThrow(candidateTipHash);
                     log?.Warn("ChainSel", "Failed to prefetch old canonical hashes; skipping adoption.");
                     tx.Rollback();
                     return;
@@ -165,7 +173,6 @@ namespace Qado.Blockchain
                     }
 
                     tx.Commit();
-                    ClearAdoptionCooldown_NoThrow(candidateTipHash);
                     log?.Info("ChainSel", $"Adopted tip {ToHex(candidateTipHash, 16)} @ height {candTipHeight} (fromHeight={fromHeight}).");
                 }
                 catch (Exception ex)
@@ -179,7 +186,6 @@ namespace Qado.Blockchain
                 if (stateFailedBlockHash is { Length: 32 })
                     MarkStateInvalid_NoThrow(stateFailedBlockHash, log);
 
-                RememberAdoptionCooldown_NoThrow(candidateTipHash);
                 log?.Error("ChainSel", $"Atomic adoption failed: {adoptionError}");
                 TryNotifyUiReload();
                 return;
@@ -203,7 +209,6 @@ namespace Qado.Blockchain
             }
             catch (Exception ex)
             {
-                RememberAdoptionCooldown_NoThrow(candidateTipHash);
                 log?.Warn("ChainSel", $"Unhandled adoption error: {ex.Message}");
             }
         }
@@ -540,91 +545,6 @@ namespace Qado.Blockchain
             }
 
             return 0;
-        }
-
-        private static bool IsInAdoptionCooldown(byte[] tipHash, out TimeSpan remaining)
-        {
-            remaining = TimeSpan.Zero;
-            if (tipHash is not { Length: 32 }) return false;
-
-            string key = Hex(tipHash);
-            lock (AdoptionCooldownGate)
-            {
-                var now = DateTime.UtcNow;
-                PruneAdoptionCooldown_NoThrow(now);
-                if (!AdoptionCooldownByTip.TryGetValue(key, out var until))
-                    return false;
-
-                if (until <= now)
-                {
-                    AdoptionCooldownByTip.Remove(key);
-                    return false;
-                }
-
-                remaining = until - now;
-                return true;
-            }
-        }
-
-        private static void RememberAdoptionCooldown_NoThrow(byte[] tipHash)
-        {
-            if (tipHash is not { Length: 32 }) return;
-
-            try
-            {
-                string key = Hex(tipHash);
-                lock (AdoptionCooldownGate)
-                {
-                    var now = DateTime.UtcNow;
-                    AdoptionCooldownByTip[key] = now + AdoptionCooldownTtl;
-                    PruneAdoptionCooldown_NoThrow(now);
-                }
-            }
-            catch
-            {
-            }
-        }
-
-        private static void ClearAdoptionCooldown_NoThrow(byte[] tipHash)
-        {
-            if (tipHash is not { Length: 32 }) return;
-
-            try
-            {
-                string key = Hex(tipHash);
-                lock (AdoptionCooldownGate)
-                {
-                    AdoptionCooldownByTip.Remove(key);
-                }
-            }
-            catch
-            {
-            }
-        }
-
-        private static void PruneAdoptionCooldown_NoThrow(DateTime now)
-        {
-            if (AdoptionCooldownByTip.Count == 0)
-                return;
-
-            var stale = new List<string>();
-            foreach (var kv in AdoptionCooldownByTip)
-            {
-                if (kv.Value <= now)
-                    stale.Add(kv.Key);
-            }
-
-            for (int i = 0; i < stale.Count; i++)
-                AdoptionCooldownByTip.Remove(stale[i]);
-
-            if (AdoptionCooldownByTip.Count <= MaxAdoptionCooldownEntries)
-                return;
-
-            var ordered = new List<KeyValuePair<string, DateTime>>(AdoptionCooldownByTip);
-            ordered.Sort((a, b) => a.Value.CompareTo(b.Value));
-            int remove = ordered.Count - MaxAdoptionCooldownEntries;
-            for (int i = 0; i < remove; i++)
-                AdoptionCooldownByTip.Remove(ordered[i].Key);
         }
 
         private static void MarkStateInvalid_NoThrow(byte[] blockHash, ILogSink? log)

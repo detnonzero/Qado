@@ -17,6 +17,8 @@ namespace Qado.Networking
 
     public readonly record struct BlockSyncChunkCommitResult(bool Success, byte[] LastBlockHash, string Error);
 
+    internal readonly record struct PeerTipState(ulong Height, byte[] Hash, UInt128 Chainwork);
+
     public sealed class BlockSyncClient : IDisposable
     {
         public static readonly TimeSpan BatchResponseTimeout = TimeSpan.FromSeconds(20);
@@ -34,7 +36,7 @@ namespace Qado.Networking
         private readonly Action<PeerSession, string>? _penalizePeer;
         private readonly ILogSink? _log;
 
-        private readonly Dictionary<string, TipFrame> _tipByPeerKey = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, PeerTipState> _tipByPeerKey = new(StringComparer.Ordinal);
         private readonly Dictionary<string, DateTime> _cooldownUntilByPeerKey = new(StringComparer.Ordinal);
         private readonly CancellationTokenSource _disposeCts = new();
 
@@ -97,7 +99,7 @@ namespace Qado.Networking
             if (peer == null)
                 return;
 
-            await RequestTipAsync(peer, ct).ConfigureAwait(false);
+            await TryStartSyncAsync(ct).ConfigureAwait(false);
         }
 
         public void RequestResync(string reason = "manual")
@@ -138,38 +140,29 @@ namespace Qado.Networking
             }
 
             _log?.Info("Sync", $"Block sync resync requested ({reason}).");
-            _ = RequestTipsFromAllPeersAsync(CancellationToken.None);
+            _ = TryStartSyncAsync(CancellationToken.None);
         }
 
-        public async Task OnTipAsync(PeerSession peer, byte[] payload, CancellationToken ct)
+        public async Task OnTipStateAsync(PeerSession peer, SmallNetTipStateFrame frame, CancellationToken ct)
         {
             if (peer == null)
                 return;
 
-            if (!BlockSyncProtocol.TryParseTipPayload(payload, out var tip))
-                return;
-
             lock (_gate)
             {
-                _tipByPeerKey[peer.SessionKey] = new TipFrame(tip.Height, SafeCloneHash(tip.Hash), tip.Chainwork);
+                _tipByPeerKey[peer.SessionKey] = new PeerTipState(frame.Height, SafeCloneHash(frame.TipHash), frame.Chainwork);
             }
 
             await TryStartSyncAsync(ct).ConfigureAwait(false);
         }
 
-        public async Task OnBlocksBeginAsync(PeerSession peer, byte[] payload, CancellationToken ct)
+        public async Task OnBlocksBatchStartAsync(PeerSession peer, SmallNetBlocksBatchStartFrame frame, CancellationToken ct)
         {
             if (peer == null)
                 return;
 
-            if (!BlockSyncProtocol.TryParseBlocksBegin(payload, out var frame))
-            {
-                await HandleBatchFailureAsync(peer, "invalid blocks-begin payload", forceLocator: true, ct).ConfigureAwait(false);
-                return;
-            }
-
             bool shouldPrepare;
-            TipFrame advertisedTip = default;
+            PeerTipState advertisedTip = default;
             UInt128 advertisedTipChainwork = 0;
             lock (_gate)
             {
@@ -184,7 +177,8 @@ namespace Qado.Networking
             if (!shouldPrepare)
                 return;
 
-            var prep = await _prepareBatchAsync(frame.StartHash, frame.StartHeight, advertisedTipChainwork, peer, ct).ConfigureAwait(false);
+            ulong startHeight = frame.ForkHeight + 1UL;
+            var prep = await _prepareBatchAsync(frame.ForkHash, startHeight, advertisedTipChainwork, peer, ct).ConfigureAwait(false);
             if (!prep.Success)
             {
                 await HandleBatchFailureAsync(peer, $"batch prepare failed: {prep.Error}", forceLocator: true, ct).ConfigureAwait(false);
@@ -201,15 +195,15 @@ namespace Qado.Networking
 
                 _batchPrepared = true;
                 _state = BlockSyncState.ReceivingBatch;
-                _expectedPrevHash = SafeCloneHash(frame.StartHash);
-                _expectedHeight = frame.StartHeight;
+                _expectedPrevHash = SafeCloneHash(frame.ForkHash);
+                _expectedHeight = startHeight;
                 _expectedBlocksInBatch = frame.TotalBlocks;
                 _receivedBlocksInBatch = 0;
                 ArmTimeout_NoLock(peer.SessionKey);
             }
         }
 
-        public async Task OnBlockChunkAsync(PeerSession peer, byte[] payload, CancellationToken ct)
+        public async Task OnBlocksChunkAsync(PeerSession peer, byte[] payload, CancellationToken ct)
         {
             if (peer == null)
                 return;
@@ -277,16 +271,12 @@ namespace Qado.Networking
             }
         }
 
-        public async Task OnBlocksEndAsync(PeerSession peer, byte[] payload, CancellationToken ct)
+        public async Task OnBlocksBatchEndAsync(PeerSession peer, SmallNetBlocksBatchEndFrame frame, CancellationToken ct)
         {
             if (peer == null)
                 return;
 
-            if (!BlockSyncProtocol.TryParseBlocksEnd(payload, out var status))
-            {
-                await HandleBatchFailureAsync(peer, "invalid blocks-end payload", forceLocator: true, ct).ConfigureAwait(false);
-                return;
-            }
+            var status = frame.MoreAvailable ? BlocksEndStatus.MoreAvailable : BlocksEndStatus.TipReached;
 
             bool isActive;
             int received;
@@ -330,7 +320,13 @@ namespace Qado.Networking
                 return;
             }
 
-            await SendGetBlocksFromAsync(peer, SafeCloneHash(_resumeFromHash), ct).ConfigureAwait(false);
+            byte[] continueFrom;
+            lock (_gate)
+            {
+                continueFrom = GetContinuationHash_NoLock();
+            }
+
+            await SendGetBlocksFromAsync(peer, continueFrom, ct).ConfigureAwait(false);
         }
 
         public async Task OnNoCommonAncestorAsync(PeerSession peer, CancellationToken ct)
@@ -392,8 +388,9 @@ namespace Qado.Networking
                 _receivedBlocksInBatch = 0;
                 _expectedHeight = 0;
                 _expectedPrevHash = Array.Empty<byte>();
-                useLocator = _useLocatorNext || _resumeFromHash is not { Length: 32 };
-                fromHash = SafeCloneHash(_resumeFromHash is { Length: 32 } ? _resumeFromHash : _getLocalTipHash());
+                var continuationHash = GetContinuationHash_NoLock();
+                useLocator = _useLocatorNext || continuationHash is not { Length: 32 };
+                fromHash = continuationHash;
             }
 
             if (useLocator)
@@ -485,30 +482,6 @@ namespace Qado.Networking
                 _penalizePeer?.Invoke(peer, reason);
 
             _log?.Warn("Sync", $"Block sync reset: {reason}");
-            await RequestTipsFromAllPeersAsync(ct).ConfigureAwait(false);
-        }
-
-        private async Task RequestTipsFromAllPeersAsync(CancellationToken ct)
-        {
-            var peers = _sessionSnapshot();
-            foreach (var peer in peers)
-            {
-                if (peer == null || !peer.HandshakeOk)
-                    continue;
-
-                await RequestTipAsync(peer, ct).ConfigureAwait(false);
-            }
-        }
-
-        private async Task RequestTipAsync(PeerSession peer, CancellationToken ct)
-        {
-            try
-            {
-                await _sendFrameAsync(peer, MsgType.GetTip, Array.Empty<byte>(), ct).ConfigureAwait(false);
-            }
-            catch
-            {
-            }
         }
 
         private void ArmTimeout_NoLock(string peerKey)
@@ -613,6 +586,18 @@ namespace Qado.Networking
 
             for (int i = 0; i < stale.Count; i++)
                 _cooldownUntilByPeerKey.Remove(stale[i]);
+        }
+
+        private byte[] GetContinuationHash_NoLock()
+        {
+            var localTipHash = SafeCloneHash(_getLocalTipHash());
+            if (localTipHash is { Length: 32 })
+            {
+                _resumeFromHash = SafeCloneHash(localTipHash);
+                return localTipHash;
+            }
+
+            return SafeCloneHash(_resumeFromHash);
         }
 
         private static byte[] SafeCloneHash(byte[]? hash)

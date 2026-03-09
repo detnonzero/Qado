@@ -9,14 +9,13 @@ namespace Qado.Blockchain
 
         private static readonly byte[] _powLimit =
             Convert.FromHexString("0000000" + new string('F', 57)); // 32-byte big-endian target
+        private static byte[]? _powLimitOverrideForTests;
 
         private static readonly byte[] _minTarget =
             Convert.FromHexString("0000000000000000000000000000000000000000000000000000000000000001");
 
-        public static ReadOnlySpan<byte> PowLimit => _powLimit;
+        public static ReadOnlySpan<byte> PowLimit => (_powLimitOverrideForTests ?? _powLimit).AsSpan();
         public static ReadOnlySpan<byte> MinTarget => _minTarget;
-
-        private static readonly BigInteger PowLimitInt = new(_powLimit, isUnsigned: true, isBigEndian: true);
         private static readonly BigInteger MinTargetInt = BigInteger.One;
 
         static Difficulty()
@@ -24,6 +23,22 @@ namespace Qado.Blockchain
             if (_powLimit.Length != HashSize) throw new InvalidOperationException("PowLimit must be 32 bytes.");
             if (_minTarget.Length != HashSize) throw new InvalidOperationException("MinTarget must be 32 bytes.");
             if (CompareBE(_minTarget, _powLimit) > 0) throw new InvalidOperationException("MinTarget must be <= PowLimit.");
+        }
+
+        public static void SetPowLimitOverrideForTests(byte[]? powLimit)
+        {
+            if (powLimit == null)
+            {
+                _powLimitOverrideForTests = null;
+                return;
+            }
+
+            if (powLimit.Length != HashSize)
+                throw new ArgumentException("powLimit must be 32 bytes", nameof(powLimit));
+            if (CompareBE(_minTarget, powLimit) > 0)
+                throw new ArgumentException("powLimit must be >= min target", nameof(powLimit));
+
+            _powLimitOverrideForTests = (byte[])powLimit.Clone();
         }
 
         public static bool Meets(byte[] hash, byte[] target)
@@ -42,7 +57,7 @@ namespace Qado.Blockchain
             if (target is not { Length: HashSize }) return false;
             if (IsZero32(target)) return false;
             if (CompareBE(target, _minTarget) < 0) return false;
-            if (CompareBE(target, _powLimit) > 0) return false;
+            if (CompareBE(target, PowLimit) > 0) return false;
             return true;
         }
 
@@ -57,8 +72,8 @@ namespace Qado.Blockchain
             if (CompareBE(target, _minTarget) < 0)
                 return (byte[])_minTarget.Clone();
 
-            if (CompareBE(target, _powLimit) > 0)
-                return (byte[])_powLimit.Clone();
+            if (CompareBE(target, PowLimit) > 0)
+                return PowLimit.ToArray();
 
             return (byte[])target.Clone();
         }
@@ -80,9 +95,9 @@ namespace Qado.Blockchain
                 return;
             }
 
-            if (CompareBE(target, _powLimit) > 0)
+            if (CompareBE(target, PowLimit) > 0)
             {
-                _powLimit.AsSpan().CopyTo(dst);
+                PowLimit.CopyTo(dst);
                 return;
             }
 
@@ -93,19 +108,22 @@ namespace Qado.Blockchain
         {
             var tClamped = ClampTarget(target);
             var t = new BigInteger(tClamped, isUnsigned: true, isBigEndian: true);
+            var powLimitInt = new BigInteger(PowLimit, isUnsigned: true, isBigEndian: true);
 
             if (t <= 0) return BigInteger.One;
 
-            var d = PowLimitInt / t;
+            var d = powLimitInt / t;
             return d <= 0 ? BigInteger.One : d;
         }
 
         public static byte[] DifficultyToTarget(BigInteger difficulty)
         {
             if (difficulty <= 1)
-                return (byte[])_powLimit.Clone();
+                return PowLimit.ToArray();
 
-            BigInteger t = PowLimitInt / difficulty;
+            var powLimitInt = new BigInteger(PowLimit, isUnsigned: true, isBigEndian: true);
+
+            BigInteger t = powLimitInt / difficulty;
             if (t <= 0) t = MinTargetInt;
 
             var bytes = BigIntegerToTarget32(t);

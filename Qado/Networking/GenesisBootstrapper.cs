@@ -20,6 +20,7 @@ namespace Qado.Networking
             _ = node.ConnectSeedAndKnownPeersAsync(ct);
 
             node.StartPeerExchangeLoop(ct);
+            node.StartInventoryRefreshLoop(ct);
             node.StartReconnectLoop(ct);
             node.StartLatencyProbeLoop(ct);
 

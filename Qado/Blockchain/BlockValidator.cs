@@ -28,11 +28,23 @@ namespace Qado.Blockchain
                 requirePrevKnown: requirePrevKnown,
                 enforceTipExtending: false,
                 validateStateAgainstCanonical: false,
+                skipHeightSensitiveChecksWithoutParent: false,
                 tx: tx,
                 out reason);
 
         public static bool ValidateNetworkBlockStatelessCandidate(Block block, out string reason, SqliteTransaction? tx = null)
             => ValidateNetworkSideBlockStateless(block, out reason, tx);
+
+        public static bool ValidateNetworkOrphanBlockStateless(Block block, out string reason, SqliteTransaction? tx = null)
+            => ValidateCommon(
+                block,
+                strictTxChecks: true,
+                requirePrevKnown: false,
+                enforceTipExtending: false,
+                validateStateAgainstCanonical: false,
+                skipHeightSensitiveChecksWithoutParent: true,
+                tx: tx,
+                out reason);
 
 
         public static bool ValidateSelfMinedBlock(Block block, out string reason, SqliteTransaction? tx = null)
@@ -42,6 +54,7 @@ namespace Qado.Blockchain
                 requirePrevKnown: true,
                 enforceTipExtending: true,
                 validateStateAgainstCanonical: true,
+                skipHeightSensitiveChecksWithoutParent: false,
                 tx: tx,
                 out reason);
 
@@ -52,6 +65,7 @@ namespace Qado.Blockchain
                 requirePrevKnown: true,
                 enforceTipExtending: true,
                 validateStateAgainstCanonical: true,
+                skipHeightSensitiveChecksWithoutParent: false,
                 tx: tx,
                 out reason);
 
@@ -67,6 +81,7 @@ namespace Qado.Blockchain
                 requirePrevKnown: true,
                 enforceTipExtending: true,
                 validateStateAgainstCanonical: true,
+                skipHeightSensitiveChecksWithoutParent: false,
                 tx: tx,
                 out reason,
                 canonicalTipOverride: canonicalTip,
@@ -79,6 +94,7 @@ namespace Qado.Blockchain
                 requirePrevKnown: true,
                 enforceTipExtending: false,
                 validateStateAgainstCanonical: false,
+                skipHeightSensitiveChecksWithoutParent: false,
                 tx: tx,
                 out reason);
 
@@ -89,6 +105,7 @@ namespace Qado.Blockchain
             bool requirePrevKnown,
             bool enforceTipExtending,
             bool validateStateAgainstCanonical,
+            bool skipHeightSensitiveChecksWithoutParent,
             SqliteTransaction? tx,
             out string reason,
             Block? canonicalTipOverride = null,
@@ -309,14 +326,21 @@ namespace Qado.Blockchain
                 totalFees += f;
             }
 
-            ulong expectedSubsidy = RewardCalculator.GetBlockSubsidy(block.BlockHeight);
-            if (ulong.MaxValue - expectedSubsidy < totalFees) { reason = "Coinbase sum overflow"; return false; }
-
-            ulong expectedCoinbase = expectedSubsidy + totalFees;
-            if (coinbase.Amount != expectedCoinbase)
+            bool skipCoinbaseAmountCheck =
+                skipHeightSensitiveChecksWithoutParent &&
+                !isGenesisCandidate &&
+                prevBlock == null;
+            if (!skipCoinbaseAmountCheck)
             {
-                reason = "Coinbase amount mismatch";
-                return false;
+                ulong expectedSubsidy = RewardCalculator.GetBlockSubsidy(block.BlockHeight);
+                if (ulong.MaxValue - expectedSubsidy < totalFees) { reason = "Coinbase sum overflow"; return false; }
+
+                ulong expectedCoinbase = expectedSubsidy + totalFees;
+                if (coinbase.Amount != expectedCoinbase)
+                {
+                    reason = "Coinbase amount mismatch";
+                    return false;
+                }
             }
 
             if (validateStateAgainstCanonical)

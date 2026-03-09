@@ -11,6 +11,21 @@ namespace Qado.Blockchain
         private const int WindowSolveTimes = 60;
 
         private const int MaxAdjustFactor = 2;
+        private static byte[]? _fixedTargetOverrideForTests;
+
+        public static void SetFixedTargetOverrideForTests(byte[]? target)
+        {
+            if (target == null)
+            {
+                _fixedTargetOverrideForTests = null;
+                return;
+            }
+
+            if (!Difficulty.IsValidTarget(target))
+                throw new ArgumentException("target must be a valid consensus target", nameof(target));
+
+            _fixedTargetOverrideForTests = (byte[])target.Clone();
+        }
 
         public static byte[] GetTargetForHeight(ulong height, Func<ulong, Block?>? getBlock = null)
         {
@@ -21,6 +36,9 @@ namespace Qado.Blockchain
         public static byte[] GetNextTarget(ulong nextHeight, Func<ulong, Block?> getBlock)
         {
             if (getBlock is null) throw new ArgumentNullException(nameof(getBlock));
+
+            if (nextHeight > 0 && _fixedTargetOverrideForTests is { Length: 32 } overrideTarget)
+                return (byte[])overrideTarget.Clone();
 
             if (nextHeight == 0)
                 return Difficulty.PowLimit.ToArray();
