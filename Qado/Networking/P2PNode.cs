@@ -219,7 +219,7 @@ namespace Qado.Networking
             _reachability.DecayIfExpired(PublicReachabilityTimeout);
 
             _listener = new TcpListener(IPAddress.Any, port); // IPv4 only
-            _listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+            _listener.Server.ExclusiveAddressUse = true;
             _listener.Start();
 
             int workerCount = Math.Max(1, Environment.ProcessorCount / 2);
@@ -961,23 +961,22 @@ namespace Qado.Networking
                 return;
             }
 
+            ushort portRaw = BinaryPrimitives.ReadUInt16LittleEndian(payload.AsSpan(34, 2));
+            bool claimsListening = portRaw != 0;
+            int port = claimsListening ? portRaw : DefaultPort;
+
             var peerId = payload.AsSpan(2, 32); // peerId is untrusted metadata; use only for self-loop detection.
             if (peerId.SequenceEqual(_nodeId))
             {
                 var endpointIp = (s.Client.Client.RemoteEndPoint as IPEndPoint)?.Address?.ToString()
                                  ?? s.RemoteEndpoint;
-                SelfPeerGuard.RememberSelf(endpointIp);
-                SelfPeerGuard.RememberSelf(s.RemoteEndpoint);
+                SelfPeerGuard.RememberSelf(endpointIp, port);
 
                 _log?.Warn("P2P", $"Rejected self-loop handshake from {EndpointLogFormatter.FormatHost(endpointIp)}.");
                 try { s.Client.Close(); } catch { }
                 _sessions.TryRemove(s.RemoteEndpoint, out _);
                 return;
             }
-
-            ushort portRaw = BinaryPrimitives.ReadUInt16LittleEndian(payload.AsSpan(34, 2));
-            bool claimsListening = portRaw != 0;
-            int port = claimsListening ? portRaw : DefaultPort;
 
             var ip = (s.Client.Client.RemoteEndPoint as IPEndPoint)?.Address?.ToString()
                      ?? s.RemoteEndpoint;

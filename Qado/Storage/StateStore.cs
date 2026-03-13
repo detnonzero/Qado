@@ -58,7 +58,7 @@ namespace Qado.Storage
         {
             var addr = Convert.FromHexString(addrHex);
             var balBlob = U64ToBlobLE(balance);
-            long nonceI64 = ToSqliteInt64Checked(nonce);
+            var nonceBlob = U64ToBlobLE(nonce);
 
             const string sql = @"
 INSERT INTO accounts(addr,balance,nonce) VALUES($a,$b,$n)
@@ -71,7 +71,7 @@ ON CONFLICT(addr) DO UPDATE SET balance=excluded.balance, nonce=excluded.nonce;"
                 cmd.CommandText = sql;
                 cmd.Parameters.AddWithValue("$a", addr);
                 cmd.Parameters.AddWithValue("$b", balBlob);
-                cmd.Parameters.AddWithValue("$n", nonceI64);
+                cmd.Parameters.AddWithValue("$n", nonceBlob);
                 cmd.ExecuteNonQuery();
                 return;
             }
@@ -82,7 +82,7 @@ ON CONFLICT(addr) DO UPDATE SET balance=excluded.balance, nonce=excluded.nonce;"
                 cmd.CommandText = sql;
                 cmd.Parameters.AddWithValue("$a", addr);
                 cmd.Parameters.AddWithValue("$b", balBlob);
-                cmd.Parameters.AddWithValue("$n", nonceI64);
+                cmd.Parameters.AddWithValue("$n", nonceBlob);
                 cmd.ExecuteNonQuery();
             }
         }
@@ -97,14 +97,6 @@ ON CONFLICT(addr) DO UPDATE SET balance=excluded.balance, nonce=excluded.nonce;"
             BinaryPrimitives.WriteUInt64LittleEndian(b, v);
             return b;
         }
-
-        private static long ToSqliteInt64Checked(ulong v)
-        {
-            if (v > (ulong)long.MaxValue)
-                throw new OverflowException($"Value {v} exceeds SQLite INTEGER range.");
-            return (long)v;
-        }
-
 
         internal static byte[] U64ToBlob(ulong v) => U64ToBlobLE(v);
 

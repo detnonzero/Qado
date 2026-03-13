@@ -1,14 +1,14 @@
 using System;
 using System.Collections.Generic;
 using System.Net;
-using System.Threading;
 
 namespace Qado.Networking
 {
     public static class SelfPeerGuard
     {
         private static readonly object Sync = new();
-        private static readonly HashSet<string> SelfIps = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly HashSet<string> SelfHosts = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly HashSet<string> VerifiedSelfEndpoints = new(StringComparer.OrdinalIgnoreCase);
 
         private static bool _initialized;
         private static int _listenPort = GenesisConfig.P2PPort;
@@ -20,8 +20,7 @@ namespace Qado.Networking
                 if (_initialized) return;
 
                 _listenPort = listenPort > 0 ? listenPort : GenesisConfig.P2PPort;
-                SeedLocalIps_NoThrow();
-                SeedPublicIp_NoThrow();
+                SeedLocalHosts_NoThrow();
                 _initialized = true;
             }
         }
@@ -37,20 +36,32 @@ namespace Qado.Networking
             string normalized = NormalizeHost(hostOrIp);
             if (normalized.Length == 0) return false;
 
-            return SelfIps.Contains(normalized);
+            lock (Sync)
+            {
+                if (SelfHosts.Contains(normalized))
+                    return true;
+
+                return TryBuildEndpointKey(normalized, port, out var endpointKey) &&
+                    VerifiedSelfEndpoints.Contains(endpointKey);
+            }
         }
 
-        public static void RememberSelf(string? hostOrIp)
+        public static void RememberSelf(string? hostOrIp, int port)
         {
             if (string.IsNullOrWhiteSpace(hostOrIp)) return;
             EnsureInitialized();
 
+            if (port > 0 && _listenPort > 0 && port != _listenPort)
+                return;
+
             string normalized = NormalizeHost(hostOrIp);
             if (normalized.Length == 0) return;
+            if (!TryBuildEndpointKey(normalized, port, out var endpointKey))
+                return;
 
             lock (Sync)
             {
-                SelfIps.Add(normalized);
+                VerifiedSelfEndpoints.Add(endpointKey);
             }
         }
 
@@ -60,19 +71,23 @@ namespace Qado.Networking
             InitializeAtStartup(GenesisConfig.P2PPort);
         }
 
-        private static void SeedLocalIps_NoThrow()
+        private static void SeedLocalHosts_NoThrow()
         {
             try
             {
-                SelfIps.Add("localhost");
-                SelfIps.Add("127.0.0.1");
-                SelfIps.Add("::1");
+                SelfHosts.Add("localhost");
+                SelfHosts.Add("127.0.0.1");
+                SelfHosts.Add("::1");
+
+                string hostName = NormalizeHost(Dns.GetHostName());
+                if (hostName.Length > 0)
+                    SelfHosts.Add(hostName);
 
                 foreach (var addr in Dns.GetHostAddresses(Dns.GetHostName()))
                 {
                     string normalized = NormalizeHost(addr.ToString());
                     if (normalized.Length > 0)
-                        SelfIps.Add(normalized);
+                        SelfHosts.Add(normalized);
                 }
             }
             catch
@@ -80,19 +95,16 @@ namespace Qado.Networking
             }
         }
 
-        private static void SeedPublicIp_NoThrow()
+        private static bool TryBuildEndpointKey(string normalizedHost, int port, out string key)
         {
-            try
-            {
-                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(6));
-                string? publicIp = IpHelper.GetPublicIpAsync(cts.Token).GetAwaiter().GetResult();
-                string normalized = NormalizeHost(publicIp);
-                if (normalized.Length > 0)
-                    SelfIps.Add(normalized);
-            }
-            catch
-            {
-            }
+            key = string.Empty;
+            if (normalizedHost.Length == 0)
+                return false;
+            if (port <= 0 || port > 65535)
+                return false;
+
+            key = $"{normalizedHost}:{port}";
+            return true;
         }
 
         private static string NormalizeHost(string? value)

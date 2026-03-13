@@ -404,9 +404,15 @@ namespace Qado.Blockchain
                 var sb = GetBal(s);
                 var sn = GetNonce(s);
 
-                if (transaction.TxNonce != sn + 1)
+                if (!NonceRules.TryGetExpectedNextNonce(sn, out var expectedNonce))
                 {
-                    reason = $"TX[{i}] nonce mismatch (have {transaction.TxNonce}, expected {sn + 1})";
+                    reason = $"TX[{i}] sender nonce exhausted";
+                    return false;
+                }
+
+                if (transaction.TxNonce != expectedNonce)
+                {
+                    reason = $"TX[{i}] nonce mismatch (have {transaction.TxNonce}, expected {expectedNonce})";
                     return false;
                 }
 

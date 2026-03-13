@@ -134,7 +134,10 @@ namespace Qado.Storage
                 if (sBal < totalCost)
                     throw new OverflowException("balance underflow");
 
-                if (!TryAddU64(sNonce, 1UL, out var expectedNonce) || t.TxNonce != expectedNonce)
+                if (!NonceRules.TryGetExpectedNextNonce(sNonce, out var expectedNonce))
+                    throw new InvalidOperationException($"Sender nonce exhausted for sender {senderHex}");
+
+                if (t.TxNonce != expectedNonce)
                     throw new InvalidOperationException($"Nonce mismatch for sender {senderHex}: expected {expectedNonce}, got {t.TxNonce}");
 
                 sBal -= totalCost;
@@ -195,9 +198,6 @@ namespace Qado.Storage
 
         private static void SetAccount(string addrHex, ulong balance, ulong nonce, SqliteTransaction tx)
         {
-            if (nonce > (ulong)long.MaxValue)
-                throw new OverflowException($"Nonce {nonce} exceeds SQLite INTEGER range.");
-
             using var cmd = tx.Connection!.CreateCommand();
             cmd.Transaction = tx;
             cmd.CommandText = @"
@@ -205,7 +205,7 @@ INSERT INTO accounts(addr, balance, nonce) VALUES($a, $b, $n)
 ON CONFLICT(addr) DO UPDATE SET balance=excluded.balance, nonce=excluded.nonce;";
             cmd.Parameters.AddWithValue("$a", Convert.FromHexString(addrHex));
             cmd.Parameters.AddWithValue("$b", StateStore.U64ToBlob(balance));
-            cmd.Parameters.AddWithValue("$n", (long)nonce);
+            cmd.Parameters.AddWithValue("$n", StateStore.U64ToBlob(nonce));
             cmd.ExecuteNonQuery();
         }
 

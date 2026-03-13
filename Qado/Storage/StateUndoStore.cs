@@ -2,6 +2,7 @@ using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using Microsoft.Data.Sqlite;
+using Qado.Blockchain;
 
 namespace Qado.Storage
 {
@@ -126,9 +127,6 @@ ON CONFLICT(block_hash) DO UPDATE SET payload=excluded.payload;";
 
         private static void SetAccount(byte[] addr, ulong balance, ulong nonce, SqliteTransaction tx)
         {
-            if (nonce > (ulong)long.MaxValue)
-                throw new OverflowException($"Nonce {nonce} exceeds SQLite INTEGER range.");
-
             using var cmd = tx.Connection!.CreateCommand();
             cmd.Transaction = tx;
             cmd.CommandText = @"
@@ -136,7 +134,7 @@ INSERT INTO accounts(addr, balance, nonce) VALUES($a, $b, $n)
 ON CONFLICT(addr) DO UPDATE SET balance=excluded.balance, nonce=excluded.nonce;";
             cmd.Parameters.AddWithValue("$a", addr);
             cmd.Parameters.AddWithValue("$b", StateStore.U64ToBlob(balance));
-            cmd.Parameters.AddWithValue("$n", (long)nonce);
+            cmd.Parameters.AddWithValue("$n", StateStore.U64ToBlob(nonce));
             cmd.ExecuteNonQuery();
         }
 

@@ -39,7 +39,7 @@ The app starts:
 - Active profile: `mainnet` (compile-time switch in `Qado/Networking/NetworkParams.cs`)
 - Chain ID: `1`
 - Network ID: `0x01`
-- P2P port: `33000`
+- P2P port: `33333`
 - API port: `18080` (override via `QADO_API_PORT`)
 - Seed host: `212.227.21.183`
 

@@ -26,7 +26,7 @@ namespace Qado.Storage
 CREATE TABLE IF NOT EXISTS accounts(
   addr    BLOB(32) PRIMARY KEY,
   balance BLOB(8)  NOT NULL, -- ulong (u64) as raw 8 bytes (LE)
-  nonce   INTEGER  NOT NULL CHECK(nonce >= 0) -- ulong logical; stored as signed int64
+  nonce   BLOB(8)  NOT NULL  -- ulong (u64) as raw 8 bytes (LE)
 ) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS peers(
@@ -120,6 +120,9 @@ CREATE INDEX IF NOT EXISTS idx_tx_txid   ON tx_index(txid);
         private static void ValidateEndgameSchemaOrThrow(SqliteTransaction tx)
         {
             RequireColumns(tx, "accounts", new[] { "addr", "balance", "nonce" });
+            RequireColumnTypePrefix(tx, "accounts", "addr", "BLOB");
+            RequireColumnTypePrefix(tx, "accounts", "balance", "BLOB");
+            RequireColumnTypePrefix(tx, "accounts", "nonce", "BLOB");
 
             RequireColumns(tx, "block_index", new[]
             {
@@ -161,6 +164,33 @@ CREATE INDEX IF NOT EXISTS idx_tx_txid   ON tx_index(txid);
                         $"No migrations are supported. Delete the database file and restart.");
                 }
             }
+        }
+
+        private static void RequireColumnTypePrefix(SqliteTransaction tx, string table, string column, string expectedPrefix)
+        {
+            using var cmd = Db.Connection.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = $"PRAGMA table_info({table});";
+
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+            {
+                var name = r.GetString(1);
+                if (!string.Equals(name, column, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                string declaredType = r.IsDBNull(2) ? string.Empty : r.GetString(2);
+                if (declaredType.StartsWith(expectedPrefix, StringComparison.OrdinalIgnoreCase))
+                    return;
+
+                throw new InvalidOperationException(
+                    $"SQLite schema mismatch: table '{table}' column '{column}' has type '{declaredType}', " +
+                    $"expected '{expectedPrefix}'. No migrations are supported. Delete the database file and restart.");
+            }
+
+            throw new InvalidOperationException(
+                $"SQLite schema mismatch: table '{table}' missing column '{column}'. " +
+                $"No migrations are supported. Delete the database file and restart.");
         }
     }
 }

@@ -72,6 +72,9 @@ namespace Qado.Blockchain
             if (Amount == 0)
                 throw new InvalidOperationException("Amount must be > 0.");
 
+            if (!NonceRules.IsUsableTransactionNonce(TxNonce))
+                throw new InvalidOperationException("Nonce out of range.");
+
             if (Signature is not { Length: SignatureSize })
                 throw new InvalidOperationException("Non-coinbase Signature must be 64 bytes.");
         }

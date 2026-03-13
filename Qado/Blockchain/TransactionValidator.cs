@@ -33,6 +33,7 @@ namespace Qado.Blockchain
             if (!isCoinbase)
             {
                 if (tx.Amount == 0) { reason = "Amount must be greater than 0"; return false; }
+                if (!NonceRules.IsUsableTransactionNonce(tx.TxNonce)) { reason = "Nonce out of range"; return false; }
                 if (tx.Signature is null || tx.Signature.Length != SigSize) { reason = "Invalid or missing signature"; return false; }
 
                 if (!VerifySignature(tx))
@@ -85,10 +86,15 @@ namespace Qado.Blockchain
                 return false;
             }
 
-            if (!TryAddU64(confirmedNonce, (ulong)pendingTxCount, out var tmp) ||
-                !TryAddU64(tmp, 1UL, out var expectedNonce))
+            if (!TryAddU64(confirmedNonce, (ulong)pendingTxCount, out var tmp))
             {
                 reason = "Nonce overflow";
+                return false;
+            }
+
+            if (!NonceRules.TryGetExpectedNextNonce(tmp, out var expectedNonce))
+            {
+                reason = "Sender nonce exhausted";
                 return false;
             }
 

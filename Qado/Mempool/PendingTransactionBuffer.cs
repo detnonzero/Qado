@@ -75,6 +75,7 @@ namespace Qado.Mempool
             if (tx is null) return false;
             if (TransactionValidator.IsCoinbase(tx)) return false;
             if (tx.Sender is null || tx.Sender.Length != 32) return false;
+            if (!NonceRules.IsUsableTransactionNonce(tx.TxNonce)) return false;
 
             string senderHex = Hex(tx.Sender);
             byte[] txidBytes = tx.ComputeTransactionHash();
@@ -97,7 +98,7 @@ namespace Qado.Mempool
 
                 ulong runningBalance = _getBalance(senderHex);
 
-                if (!TryAddU64(confirmedNonce, 1UL, out ulong expectedNonce))
+                if (!NonceRules.TryGetExpectedNextNonce(confirmedNonce, out ulong expectedNonce))
                     return false;
 
                 foreach (var kvp in list)
@@ -109,7 +110,7 @@ namespace Qado.Mempool
 
                     runningBalance -= totalCost;
 
-                    if (!TryAddU64(expectedNonce, 1UL, out expectedNonce))
+                    if (!NonceRules.TryGetExpectedNextNonce(expectedNonce, out expectedNonce))
                         return false;
                 }
 
@@ -174,7 +175,7 @@ namespace Qado.Mempool
                 ulong confirmedNonce = _getConfirmedNonce(senderHex);
                 var ready = new List<Transaction>();
 
-                if (!TryAddU64(confirmedNonce, 1UL, out ulong expected))
+                if (!NonceRules.TryGetExpectedNextNonce(confirmedNonce, out ulong expected))
                     return ready;
 
                 ulong runningBalance = _getBalance(senderHex);
@@ -187,7 +188,7 @@ namespace Qado.Mempool
                     runningBalance -= cost;
                     ready.Add(tx);
 
-                    if (!TryAddU64(expected, 1UL, out expected))
+                    if (!NonceRules.TryGetExpectedNextNonce(expected, out expected))
                         break;
                 }
 
@@ -324,7 +325,7 @@ namespace Qado.Mempool
                     ulong confirmedNonce = _getConfirmedNonce(senderHex);
                     ulong runningBalance = _getBalance(senderHex);
 
-                    if (!TryAddU64(confirmedNonce, 1UL, out ulong expectedNonce))
+                    if (!NonceRules.TryGetExpectedNextNonce(confirmedNonce, out ulong expectedNonce))
                         continue;
 
                     var chain = new Queue<Transaction>();
@@ -336,7 +337,7 @@ namespace Qado.Mempool
                         runningBalance -= cost;
                         chain.Enqueue(tx);
 
-                        if (!TryAddU64(expectedNonce, 1UL, out expectedNonce))
+                        if (!NonceRules.TryGetExpectedNextNonce(expectedNonce, out expectedNonce))
                             break;
                     }
 

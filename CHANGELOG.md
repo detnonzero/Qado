@@ -2,6 +2,24 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.0] - 2026-03-13
+
+### Changed
+- Account nonce storage in SQLite was moved from `INTEGER` to `BLOB(8)`:
+  - `accounts.nonce` now stores the raw `ulong` value directly
+  - nonce read paths remain tolerant so serialized historical data can still be interpreted correctly during validation/apply
+
+### Fixed
+- Nonce handling was hardened consistently across mempool admission, block validation, and state application:
+  - sender nonces must match the exact next expected nonce
+  - nonce exhaustion is now handled explicitly instead of relying on unchecked `senderNonce + 1`
+  - nonce edge cases around rollback/reorg and pending-transaction sequencing were covered by additional SelfTests
+- Fixed the old `INTEGER`-storage ceiling mismatch where a block could validate near the nonce limit but fail later during state persistence.
+- Local node/process coordination was hardened:
+  - only one `Qado` instance per machine and network profile can now run at a time
+  - the P2P listener now binds exclusively instead of allowing shared local port reuse
+  - self-peer detection no longer treats a shared public WAN IP as `self`, avoiding false positives for separate hosts/VMs behind the same NAT
+
 ## [0.3.3] - 2026-03-09
 
 ### Changed

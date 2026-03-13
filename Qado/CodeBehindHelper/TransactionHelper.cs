@@ -122,7 +122,7 @@ namespace Qado.CodeBehindHelper
             if (pending < 0) return false;
 
             if (!TryAddU64(confirmed, (ulong)pending, out var tmp)) return false;
-            if (!TryAddU64(tmp, 1UL, out nextNonce)) return false;
+            if (!NonceRules.TryGetExpectedNextNonce(tmp, out nextNonce)) return false;
 
             return true;
         }

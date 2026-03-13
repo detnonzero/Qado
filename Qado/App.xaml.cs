@@ -10,6 +10,8 @@ namespace Qado
 {
     public partial class App : Application
     {
+        private SingleInstanceGuard? _singleInstanceGuard;
+
         protected override void OnStartup(StartupEventArgs e)
         {
             base.OnStartup(e);
@@ -17,6 +19,18 @@ namespace Qado
 
             try
             {
+                _singleInstanceGuard = SingleInstanceGuard.AcquireForCurrentNetwork();
+                if (!_singleInstanceGuard.HasHandle)
+                {
+                    ReleaseSingleInstanceGuard();
+                    MessageBox.Show(
+                        $"QADO is already running on this machine for {NetworkParams.Name}.",
+                        "QADO", MessageBoxButton.OK, MessageBoxImage.Information);
+
+                    Shutdown();
+                    return;
+                }
+
                 SelfPeerGuard.InitializeAtStartup(GenesisConfig.P2PPort);
 
                 var dataDir = Path.Combine(AppContext.BaseDirectory, NetworkParams.DataDirectoryName);
@@ -29,6 +43,7 @@ namespace Qado
             }
             catch (Exception ex)
             {
+                ReleaseSingleInstanceGuard();
                 MessageBox.Show(
                     $"Startup failed:\n{ex.Message}",
                     "QADO", MessageBoxButton.OK, MessageBoxImage.Error);
@@ -42,8 +57,15 @@ namespace Qado
         {
             try { MiningHelper.StopMiningForShutdown(); } catch { }
             try { Db.Shutdown(); } catch { }
+            ReleaseSingleInstanceGuard();
 
             base.OnExit(e);
+        }
+
+        private void ReleaseSingleInstanceGuard()
+        {
+            try { _singleInstanceGuard?.Dispose(); } catch { }
+            _singleInstanceGuard = null;
         }
     }
 }

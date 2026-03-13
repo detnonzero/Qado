@@ -41,13 +41,18 @@ internal static class Program
         new TestCase("StateApplier_RejectsNonceGap", TestStateApplierRejectsNonceGap),
         new TestCase("StateApplier_AcceptsSequentialNonce", TestStateApplierAcceptsSequentialNonce),
         new TestCase("StateApplier_SelfTransfer_MinedBySender_IsNotInflationary", TestStateApplierSelfTransferMinedBySenderIsNotInflationary),
+        new TestCase("StateUndoStore_RollbackRestoresNonce", TestStateUndoStoreRollbackRestoresNonce),
+        new TestCase("StateStore_RoundTripsFullUlongNonce", TestStateStoreRoundTripsFullUlongNonce),
         new TestCase("KeyStore_EncryptsAtRest", TestKeyStoreEncryptsAtRest),
         new TestCase("Merkle_DomainSeparation_Profile", TestMerkleDomainSeparationProfile),
         new TestCase("TxId_CommitsSignature", TestTxIdCommitsSignature),
         new TestCase("BlockSerializer_RejectsInvalidTarget", TestBlockSerializerRejectsInvalidTarget),
         new TestCase("BlockValidator_TipValidation_WorksInsideTransaction", TestBlockValidatorTipValidationWorksInsideTransaction),
+        new TestCase("BlockValidator_AcceptsLegacyLongMaxNonceBoundary", TestBlockValidatorAcceptsLegacyLongMaxNonceBoundary),
+        new TestCase("BlockValidator_RejectsExhaustedSenderNonce", TestBlockValidatorRejectsExhaustedSenderNonce),
         new TestCase("ChainSelector_Reorg_MempoolReconcile", TestChainSelectorReorgMempoolReconcile),
         new TestCase("MempoolSelection_RespectsSenderNonceOrder", TestMempoolSelectionRespectsSenderNonceOrder),
+        new TestCase("PendingTransactionBuffer_RejectsExhaustedSenderNonce", TestPendingTransactionBufferRejectsExhaustedSenderNonce),
         new TestCase("BlockLocator_FindsForkpoint", TestBlockLocatorFindsForkpoint),
         new TestCase("BlockSyncProtocol_Chunks4096Blocks", TestBlockSyncProtocolChunks4096Blocks),
         new TestCase("BlockSyncServer_UsesSmallNetBatchFrames", TestBlockSyncServerUsesSmallNetBatchFrames),
@@ -210,6 +215,79 @@ internal static class Program
         }
     }
 
+    private static void TestBlockValidatorRejectsExhaustedSenderNonce()
+    {
+        var sender = KeyGenerator.GenerateKeypairHex();
+        var recipient = KeyGenerator.GenerateKeypairHex();
+        var miner = KeyGenerator.GenerateKeypairHex();
+
+        byte[] prev = BlockStore.GetCanonicalHashAtHeight(0) ?? throw new InvalidOperationException("missing genesis hash");
+        var tx = BuildSignedTx(
+            senderPrivHex: sender.privHex,
+            senderPubHex: sender.pubHex,
+            recipientPubHex: recipient.pubHex,
+            amount: 1UL,
+            fee: 1UL,
+            nonce: NonceRules.MaxAccountNonce);
+        var block = BuildMinedBlock(
+            height: 1UL,
+            prevHash: prev,
+            timestamp: (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            minerPubHex: miner.pubHex,
+            txs: new[] { tx });
+
+        lock (Db.Sync)
+        {
+            using var sqlTx = Db.Connection.BeginTransaction();
+            StateStore.Set(sender.pubHex, balance: 10_000UL, nonce: NonceRules.MaxAccountNonce, sqlTx);
+
+            bool ok = BlockValidator.ValidateNetworkTipBlock(block, out var reason, sqlTx);
+            Assert(!ok, "tip validation must reject exhausted sender nonce");
+            Assert(reason.Contains("exhausted", StringComparison.OrdinalIgnoreCase) ||
+                   reason.Contains("out of range", StringComparison.OrdinalIgnoreCase),
+                $"unexpected rejection reason: {reason}");
+            sqlTx.Rollback();
+        }
+    }
+
+    private static void TestBlockValidatorAcceptsLegacyLongMaxNonceBoundary()
+    {
+        var sender = KeyGenerator.GenerateKeypairHex();
+        var recipient = KeyGenerator.GenerateKeypairHex();
+        var miner = KeyGenerator.GenerateKeypairHex();
+
+        byte[] prev = BlockStore.GetCanonicalHashAtHeight(0) ?? throw new InvalidOperationException("missing genesis hash");
+        ulong legacyMaxNonce = (ulong)long.MaxValue;
+        var tx = BuildSignedTx(
+            senderPrivHex: sender.privHex,
+            senderPubHex: sender.pubHex,
+            recipientPubHex: recipient.pubHex,
+            amount: 1UL,
+            fee: 1UL,
+            nonce: legacyMaxNonce);
+        var block = BuildMinedBlock(
+            height: 1UL,
+            prevHash: prev,
+            timestamp: (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            minerPubHex: miner.pubHex,
+            txs: new[] { tx });
+
+        lock (Db.Sync)
+        {
+            using var sqlTx = Db.Connection.BeginTransaction();
+            StateStore.Set(sender.pubHex, balance: 10_000UL, nonce: legacyMaxNonce - 1UL, sqlTx);
+
+            bool ok = BlockValidator.ValidateNetworkTipBlock(block, out var reason, sqlTx);
+            Assert(ok, $"tip validation must accept legacy nonce boundary: {reason}");
+
+            StateApplier.ApplyBlock(block, sqlTx);
+            Assert(StateStore.GetNonce(sender.pubHex, sqlTx) == legacyMaxNonce,
+                "state apply must persist the legacy nonce boundary");
+
+            sqlTx.Rollback();
+        }
+    }
+
     private static void TestStateApplierRejectsNonceGap()
     {
         var sender = KeyGenerator.GenerateKeypairHex();
@@ -278,6 +356,62 @@ internal static class Program
             Assert(senderNonce == 1UL, "sender nonce mismatch");
             Assert(recipientBal == amount, "recipient balance mismatch");
             Assert(minerBal == expectedCoinbase, "miner balance mismatch");
+
+            sqlTx.Rollback();
+        }
+    }
+
+    private static void TestStateUndoStoreRollbackRestoresNonce()
+    {
+        var sender = KeyGenerator.GenerateKeypairHex();
+        var recipient = KeyGenerator.GenerateKeypairHex();
+        var miner = KeyGenerator.GenerateKeypairHex();
+
+        byte[] prev = BlockStore.GetCanonicalHashAtHeight(0) ?? throw new InvalidOperationException("missing genesis hash");
+
+        const ulong startBalance = 20_000UL;
+        const ulong amount = 1_000UL;
+        const ulong fee = 10UL;
+
+        var tx = BuildSignedTx(sender.privHex, sender.pubHex, recipient.pubHex, amount, fee, nonce: 1UL);
+        var coinbase = BuildCoinbase(miner.pubHex, RewardCalculator.GetBlockSubsidy(1) + fee);
+        var block = BuildBlock(height: 1, prevHash: prev, minerPubHex: miner.pubHex, txs: new[] { coinbase, tx });
+        block.BlockHash = HashFromU64(90_001UL);
+
+        lock (Db.Sync)
+        {
+            using var sqlTx = Db.Connection.BeginTransaction();
+            StateStore.Set(sender.pubHex, balance: startBalance, nonce: 0UL, sqlTx);
+
+            StateApplier.ApplyBlockWithUndo(block, sqlTx);
+            Assert(StateStore.GetNonce(sender.pubHex, sqlTx) == 1UL, "sender nonce must advance before rollback");
+
+            StateUndoStore.RollbackBlock(block.BlockHash, sqlTx);
+
+            Assert(StateStore.GetNonce(sender.pubHex, sqlTx) == 0UL, "sender nonce must be restored by rollback");
+            Assert(StateStore.GetBalance(sender.pubHex, sqlTx) == startBalance, "sender balance must be restored by rollback");
+            sqlTx.Rollback();
+        }
+    }
+
+    private static void TestStateStoreRoundTripsFullUlongNonce()
+    {
+        var account = KeyGenerator.GenerateKeypairHex();
+
+        lock (Db.Sync)
+        {
+            using var sqlTx = Db.Connection.BeginTransaction();
+            StateStore.Set(account.pubHex, balance: 123UL, nonce: ulong.MaxValue, sqlTx);
+
+            ulong storedNonce = StateStore.GetNonce(account.pubHex, sqlTx);
+            Assert(storedNonce == ulong.MaxValue, "state store must round-trip ulong.MaxValue nonce");
+
+            using var cmd = sqlTx.Connection!.CreateCommand();
+            cmd.Transaction = sqlTx;
+            cmd.CommandText = "SELECT nonce FROM accounts WHERE addr=$a LIMIT 1;";
+            cmd.Parameters.AddWithValue("$a", Convert.FromHexString(account.pubHex));
+            object raw = cmd.ExecuteScalar() ?? throw new InvalidOperationException("nonce row missing");
+            Assert(raw is byte[] { Length: 8 }, "nonce must be stored as 8-byte blob");
 
             sqlTx.Rollback();
         }
@@ -613,6 +747,26 @@ internal static class Program
 
             lastNonceBySender[sender] = tx.TxNonce;
         }
+    }
+
+    private static void TestPendingTransactionBufferRejectsExhaustedSenderNonce()
+    {
+        var sender = KeyGenerator.GenerateKeypairHex();
+        var recipient = KeyGenerator.GenerateKeypairHex();
+
+        var buffer = new PendingTransactionBuffer(
+            getConfirmedNonce: _ => NonceRules.MaxAccountNonce,
+            getBalance: _ => 1_000_000UL);
+
+        var tx = BuildSignedTx(
+            senderPrivHex: sender.privHex,
+            senderPubHex: sender.pubHex,
+            recipientPubHex: recipient.pubHex,
+            amount: 1UL,
+            fee: 1UL,
+            nonce: 1UL);
+
+        Assert(!buffer.Add(tx), "buffer must reject transactions once sender nonce is exhausted");
     }
 
     private static void TestBlockLocatorFindsForkpoint()
