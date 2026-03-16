@@ -58,6 +58,7 @@ namespace Qado.Networking
         private static readonly TimeSpan InventoryRefreshInterval = TimeSpan.FromSeconds(20);
         private static readonly TimeSpan LatencyProbeInterval = TimeSpan.FromSeconds(60);
         private static readonly TimeSpan LatencyProbeTimeout = TimeSpan.FromSeconds(10);
+        private static readonly TimeSpan ConnectedPeerSeenRefreshInterval = TimeSpan.FromHours(1);
 
         public static P2PNode? Instance { get; private set; }
         public bool IsPubliclyReachable => _reachability.IsPublic;
@@ -73,6 +74,7 @@ namespace Qado.Networking
         private int _peerExchangeLoopStarted;
         private int _inventoryRefreshLoopStarted;
         private int _latencyProbeLoopStarted;
+        private DateTime _nextConnectedPeerSeenRefreshUtc = DateTime.MinValue;
 
         private readonly byte[] _nodeId;
         private readonly ReachabilityState _reachability = new();
@@ -505,6 +507,8 @@ namespace Qado.Networking
                     {
                     }
 
+                    RefreshConnectedPeerLastSeenNoThrow();
+
                     var baseDelay = HasAnyHandshakePeerConnected()
                         ? ReconnectSteadyDelay
                         : ReconnectWhenDisconnectedDelay;
@@ -549,6 +553,53 @@ namespace Qado.Networking
                     continue;
 
                 await SendLatencyProbeAsync(s, ct).ConfigureAwait(false);
+            }
+        }
+
+        private void RefreshConnectedPeerLastSeenNoThrow()
+        {
+            try
+            {
+                var nowUtc = DateTime.UtcNow;
+                if (nowUtc < _nextConnectedPeerSeenRefreshUtc)
+                    return;
+
+                var endpoints = new List<(string ip, int port)>();
+                var seen = new HashSet<string>(StringComparer.Ordinal);
+
+                foreach (var kv in _sessions)
+                {
+                    var s = kv.Value;
+                    if (s == null || !s.HandshakeOk || !s.Client.Connected)
+                        continue;
+                    if (!s.RemoteIsPublic)
+                        continue;
+                    if (string.IsNullOrWhiteSpace(s.RemoteIpAdvertised))
+                        continue;
+                    if (s.RemotePortAdvertised is not int p || p <= 0 || p > 65535)
+                        continue;
+                    if (!IsPublicRoutableIPv4Literal(s.RemoteIpAdvertised!))
+                        continue;
+                    if (SelfPeerGuard.IsSelf(s.RemoteIpAdvertised!, p))
+                        continue;
+
+                    string key = $"{NormalizeBanKey(s.RemoteIpAdvertised!)}:{p}";
+                    if (!seen.Add(key))
+                        continue;
+
+                    endpoints.Add((s.RemoteIpAdvertised!, p));
+                }
+
+                _nextConnectedPeerSeenRefreshUtc = nowUtc + ConnectedPeerSeenRefreshInterval;
+                if (endpoints.Count == 0)
+                    return;
+
+                ulong nowUnix = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                PeerStore.MarkSeenBatch(endpoints, nowUnix, GenesisConfig.NetworkId);
+            }
+            catch
+            {
+                _nextConnectedPeerSeenRefreshUtc = DateTime.UtcNow + ConnectedPeerSeenRefreshInterval;
             }
         }
 

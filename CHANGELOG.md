@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.1] - 2026-03-16
+
+### Changed
+- Integrated optional `OpenCL` mining directly into the GUI:
+  - mining backend can now be switched between `CPU` and `OpenCL`
+  - detected `OpenCL` devices can be selected from the mining panel
+  - the selected mining backend and device are persisted across restarts
+- Wallet/key selection UX was improved:
+  - the last selected key is now restored on the next application start
+
+### Fixed
+- Stopping mining in `OpenCL` mode no longer races the active worker and logs a spurious `NullReferenceException`.
+- Connected public peers now refresh `last_seen` in hourly batched updates so long-lived live peers do not disappear from the peer list just because the original handshake is old.
+
 ## [0.4.0] - 2026-03-13
 
 ### Changed

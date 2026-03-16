@@ -16,6 +16,7 @@ using Qado.Blockchain;
 using Qado.CodeBehindHelper;
 using Qado.Logging;
 using Qado.Mempool;
+using Qado.Mining;
 using Qado.Networking;
 using Qado.Api;
 using Qado.Storage;
@@ -92,6 +93,10 @@ namespace Qado
         private static readonly string _appLogPath = Path.Combine(AppContext.BaseDirectory, "data", "app.log");
         private static readonly object _addressBookFileSync = new();
         private static readonly string _addressBookPath = Path.Combine(AppContext.BaseDirectory, "data", "addressbook.txt");
+        private const string MiningBackendMetaKey = "MiningBackend";
+        private const string MiningOpenClDeviceMetaKey = "MiningOpenClDevice";
+        private const string SelectedKeyMetaKey = "SelectedKey";
+        private const string SelectedKeyNewValue = "new";
 
         private sealed class RightClickCellContext
         {
@@ -200,6 +205,7 @@ namespace Qado
                 }, null, MempoolCleanupInterval, MempoolCleanupInterval);
 
                 PopulateKeyDropdown();
+                InitializeMiningControls();
                 if (KeyStore.IsPortablePlaintextModeEnabled)
                 {
                     Warn("Security", "Portable plaintext keystore mode is enabled (QADO_KEYSTORE_MODE=portable_plaintext). Private keys are stored unencrypted.");
@@ -491,6 +497,8 @@ namespace Qado
                     ReloadPersonalTransactions();
                 }
             }
+
+            PersistSelectedPrivateKeyNoThrow();
         }
 
         private void AcceptPrivateKeyButton_Click(object sender, RoutedEventArgs e)
@@ -532,6 +540,7 @@ namespace Qado
 
                 BalanceHelper.UpdateBalanceUI(BalanceTextBlock, privateKey);
                 ReloadPersonalTransactions();
+                PersistSelectedPrivateKeyNoThrow();
             }
             catch
             {
@@ -564,6 +573,7 @@ namespace Qado
 
             BalanceHelper.UpdateBalanceUI(BalanceTextBlock, newPrivateKey);
             ReloadPersonalTransactions();
+            PersistSelectedPrivateKeyNoThrow();
             Info("Key", "New private key generated.");
         }
 
@@ -605,8 +615,73 @@ namespace Qado
             foreach (var key in keys)
                 PrivateKeyComboBox.Items.Add(key);
 
-            PrivateKeyComboBox.SelectedIndex = 0;
-            PrivateKeyComboBox.Text = "";
+            string? selectedKey = TryResolveSavedPrivateKey(keys);
+            if (!string.IsNullOrWhiteSpace(selectedKey))
+            {
+                PrivateKeyComboBox.SelectedItem = selectedKey;
+            }
+            else if (keys.Count > 0)
+            {
+                PrivateKeyComboBox.SelectedItem = keys[0];
+            }
+            else
+            {
+                PrivateKeyComboBox.SelectedItem = "New";
+            }
+        }
+
+        private string? TryResolveSavedPrivateKey(List<string> keys)
+        {
+            try
+            {
+                string? saved = MetaStore.Get(SelectedKeyMetaKey);
+                if (string.IsNullOrWhiteSpace(saved))
+                    return null;
+
+                if (string.Equals(saved, SelectedKeyNewValue, StringComparison.Ordinal))
+                    return "New";
+
+                if (!saved.StartsWith("pub:", StringComparison.Ordinal))
+                    return null;
+
+                string savedPubKey = saved[4..];
+                for (int i = 0; i < keys.Count; i++)
+                {
+                    try
+                    {
+                        string pubKey = KeyGenerator.GetPublicKeyFromPrivateKeyHex(keys[i]);
+                        if (string.Equals(pubKey, savedPubKey, StringComparison.OrdinalIgnoreCase))
+                            return keys[i];
+                    }
+                    catch
+                    {
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            return null;
+        }
+
+        private void PersistSelectedPrivateKeyNoThrow()
+        {
+            try
+            {
+                string? selected = PrivateKeyComboBox?.SelectedItem as string;
+                if (string.IsNullOrWhiteSpace(selected) || string.Equals(selected, "New", StringComparison.Ordinal))
+                {
+                    MetaStore.Set(SelectedKeyMetaKey, SelectedKeyNewValue);
+                    return;
+                }
+
+                string pubKey = KeyGenerator.GetPublicKeyFromPrivateKeyHex(selected).ToLowerInvariant();
+                MetaStore.Set(SelectedKeyMetaKey, "pub:" + pubKey);
+            }
+            catch
+            {
+            }
         }
 
         private void StartMiningButton_Click(object sender, RoutedEventArgs e)
@@ -627,8 +702,15 @@ namespace Qado
             }
             else
             {
+                var backendKind = GetSelectedMiningBackendKind();
+                var openClDevice = backendKind == MiningBackendKind.OpenCl
+                    ? (MiningDeviceComboBox.SelectedItem as OpenClMiningDevice)
+                    : null;
+
                 MiningHelper.StartMining(
                     privateKey,
+                    backendKind,
+                    openClDevice,
                     Mempool,
                     this,
                     StartMiningButton,
@@ -639,6 +721,132 @@ namespace Qado
                     BalanceTextBlock,
                     StartUiTimer
                 );
+            }
+        }
+
+        private void InitializeMiningControls()
+        {
+            try
+            {
+                MiningBackendComboBox.Items.Clear();
+                MiningBackendComboBox.Items.Add("CPU");
+                MiningBackendComboBox.Items.Add("OpenCL");
+
+                string? savedBackend = null;
+                string? savedDeviceId = null;
+                try
+                {
+                    savedBackend = MetaStore.Get(MiningBackendMetaKey);
+                    savedDeviceId = MetaStore.Get(MiningOpenClDeviceMetaKey);
+                }
+                catch
+                {
+                }
+
+                MiningBackendComboBox.SelectedItem = string.Equals(savedBackend, "opencl", StringComparison.OrdinalIgnoreCase)
+                    ? "OpenCL"
+                    : "CPU";
+
+                RefreshOpenClDevices(savedDeviceId);
+                ApplyMiningBackendSelectionUi();
+            }
+            catch (Exception ex)
+            {
+                Warn("Mining", $"Failed to initialize mining controls: {ex.Message}");
+            }
+        }
+
+        private void RefreshOpenClDevices(string? preferredDeviceId = null)
+        {
+            try
+            {
+                var devices = OpenClDiscovery.DiscoverDevices(this);
+                string? preferred = preferredDeviceId;
+                if (string.IsNullOrWhiteSpace(preferred))
+                {
+                    try { preferred = MetaStore.Get(MiningOpenClDeviceMetaKey); } catch { }
+                }
+
+                MiningDeviceComboBox.Items.Clear();
+                for (int i = 0; i < devices.Count; i++)
+                    MiningDeviceComboBox.Items.Add(devices[i]);
+
+                if (MiningDeviceComboBox.Items.Count == 0)
+                {
+                    MiningDeviceComboBox.SelectedItem = null;
+                    return;
+                }
+
+                OpenClMiningDevice? selected = null;
+                if (!string.IsNullOrWhiteSpace(preferred))
+                {
+                    for (int i = 0; i < MiningDeviceComboBox.Items.Count; i++)
+                    {
+                        if (MiningDeviceComboBox.Items[i] is OpenClMiningDevice device &&
+                            string.Equals(device.Id, preferred, StringComparison.Ordinal))
+                        {
+                            selected = device;
+                            break;
+                        }
+                    }
+                }
+
+                MiningDeviceComboBox.SelectedItem = selected ?? MiningDeviceComboBox.Items[0];
+            }
+            catch (Exception ex)
+            {
+                Warn("Mining", $"OpenCL device refresh failed: {ex.Message}");
+            }
+        }
+
+        private void MiningBackendComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (GuiUtils.IsDesignMode) return;
+
+            if (GetSelectedMiningBackendKind() == MiningBackendKind.OpenCl && MiningDeviceComboBox.Items.Count == 0)
+                RefreshOpenClDevices();
+
+            ApplyMiningBackendSelectionUi();
+            PersistMiningPreferencesNoThrow();
+        }
+
+        private void MiningDeviceComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (GuiUtils.IsDesignMode) return;
+            PersistMiningPreferencesNoThrow();
+        }
+
+        private void ApplyMiningBackendSelectionUi()
+        {
+            if (MiningDevicePanel == null)
+                return;
+
+            MiningDevicePanel.Visibility = GetSelectedMiningBackendKind() == MiningBackendKind.OpenCl
+                ? Visibility.Visible
+                : Visibility.Collapsed;
+        }
+
+        private MiningBackendKind GetSelectedMiningBackendKind()
+        {
+            string selected = MiningBackendComboBox?.SelectedItem as string ?? "CPU";
+            return string.Equals(selected, "OpenCL", StringComparison.OrdinalIgnoreCase)
+                ? MiningBackendKind.OpenCl
+                : MiningBackendKind.Cpu;
+        }
+
+        private void PersistMiningPreferencesNoThrow()
+        {
+            try
+            {
+                MetaStore.Set(
+                    MiningBackendMetaKey,
+                    GetSelectedMiningBackendKind() == MiningBackendKind.OpenCl ? "opencl" : "cpu");
+
+                var selectedDevice = MiningDeviceComboBox?.SelectedItem as OpenClMiningDevice;
+                MetaStore.Set(MiningOpenClDeviceMetaKey, selectedDevice?.Id ?? string.Empty);
+            }
+            catch
+            {
             }
         }
 

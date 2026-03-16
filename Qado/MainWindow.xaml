@@ -70,6 +70,24 @@
 
                 <GroupBox Header="Mining" Padding="10" Margin="0,0,0,12">
                     <StackPanel>
+                        <StackPanel Orientation="Vertical" Margin="0,0,0,8">
+                            <TextBlock Text="Backend" FontWeight="Bold"/>
+                            <ComboBox x:Name="MiningBackendComboBox"
+                                      Width="220"
+                                      HorizontalAlignment="Left"
+                                      Margin="0,6,0,0"
+                                      SelectionChanged="MiningBackendComboBox_SelectionChanged"/>
+                        </StackPanel>
+
+                        <StackPanel x:Name="MiningDevicePanel" Orientation="Vertical" Margin="0,0,0,8">
+                            <TextBlock Text="OpenCL Device" FontWeight="Bold"/>
+                            <ComboBox x:Name="MiningDeviceComboBox"
+                                      Width="420"
+                                      HorizontalAlignment="Left"
+                                      Margin="0,6,0,0"
+                                      SelectionChanged="MiningDeviceComboBox_SelectionChanged"/>
+                        </StackPanel>
+
                         <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
                             <Button x:Name="StartMiningButton" Content="Start Mining" Width="140" Margin="0,0,8,0"
                                     Click="StartMiningButton_Click"/>

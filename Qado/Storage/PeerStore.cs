@@ -104,6 +104,41 @@ namespace Qado.Storage
         public static void MarkSeen(string ip, int port, ulong lastSeen, byte networkId, SqliteTransaction? tx = null)
             => UpsertByEndpointInternal(ip, port, lastSeen, networkId, bypassQuarantine: true, tx);
 
+        public static void MarkSeenBatch(IEnumerable<(string ip, int port)> endpoints, ulong lastSeen, byte networkId)
+        {
+            if (endpoints == null)
+                return;
+
+            var unique = new HashSet<string>(StringComparer.Ordinal);
+            var rows = new List<(string ip, int port)>();
+
+            foreach (var (ip, port) in endpoints)
+            {
+                if (string.IsNullOrWhiteSpace(ip) || port <= 0 || port > 65535)
+                    continue;
+
+                string key = $"{NormalizeHost(ip)}:{port}";
+                if (!unique.Add(key))
+                    continue;
+
+                rows.Add((ip, port));
+            }
+
+            if (rows.Count == 0)
+                return;
+
+            lock (Db.Sync)
+            {
+                using var tx = Db.Connection.BeginTransaction();
+                for (int i = 0; i < rows.Count; i++)
+                    UpsertByEndpointInternal(rows[i].ip, rows[i].port, lastSeen, networkId, bypassQuarantine: true, tx);
+
+                tx.Commit();
+            }
+
+            RaisePeerListChanged();
+        }
+
         // Announce-only insert from PEX. Does not update last_seen for existing entries.
         public static bool AnnouncePeer(string ip, int port, SqliteTransaction? tx = null)
             => AnnouncePeer(ip, port, networkId: GenesisConfig.NetworkId, tx);

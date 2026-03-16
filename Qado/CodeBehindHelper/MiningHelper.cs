@@ -11,6 +11,7 @@ using Qado.Blockchain;
 using Qado.Serialization;
 using Qado.Logging;
 using Qado.Mempool;
+using Qado.Mining;
 using Qado.Networking;
 using Qado.Storage;
 
@@ -26,6 +27,8 @@ namespace Qado.CodeBehindHelper
         private static long _hashCount;
 
         private static Miner? _currentMiner;
+        private static OpenClMiner? _currentOpenClMiner;
+        private static Func<ulong> _currentNonceProvider = static () => 0UL;
 
         private const int GossipMaxPeers = 64;
         private const int GossipConcurrency = 12;
@@ -39,6 +42,8 @@ namespace Qado.CodeBehindHelper
 
         public static void StartMining(
             string privateKeyHex,
+            MiningBackendKind backendKind,
+            OpenClMiningDevice? openClDevice,
             MempoolManager mempool,
             ILogSink logSink,
             Button startMiningButton,
@@ -54,6 +59,12 @@ namespace Qado.CodeBehindHelper
             if (!IsValidHex(privateKeyHex, 32) || IsAllZeroHex(privateKeyHex))
             {
                 logSink.Error("Mining", "Invalid private key.");
+                return;
+            }
+
+            if (backendKind == MiningBackendKind.OpenCl && openClDevice == null)
+            {
+                logSink.Error("Mining", "No OpenCL device selected.");
                 return;
             }
 
@@ -76,6 +87,8 @@ namespace Qado.CodeBehindHelper
                 Interlocked.Exchange(ref _blockStartUtcTicks, DateTime.UtcNow.Ticks);
                 Interlocked.Exchange(ref _hashCount, 0);
                 _currentMiner = null;
+                _currentOpenClMiner = null;
+                _currentNonceProvider = static () => 0UL;
             }
 
             UiInvoke(() =>
@@ -98,7 +111,9 @@ namespace Qado.CodeBehindHelper
                 nonceText.Text = $"Nonce: {GetCurrentNonceUnsafe()}";
             });
 
-            _ = Task.Run(() => MiningLoopAsync(privateKeyHex, mempool, logSink, balanceTextBlock, newCts.Token));
+            _ = backendKind == MiningBackendKind.OpenCl
+                ? Task.Run(() => OpenClMiningLoopAsync(privateKeyHex, openClDevice!, mempool, logSink, balanceTextBlock, newCts.Token))
+                : Task.Run(() => MiningLoopAsync(privateKeyHex, mempool, logSink, balanceTextBlock, newCts.Token));
         }
 
         public static void StopMining(
@@ -125,6 +140,8 @@ namespace Qado.CodeBehindHelper
                 old = _cts;
                 _cts = null;
                 _currentMiner = null;
+                _currentOpenClMiner = null;
+                _currentNonceProvider = static () => 0UL;
             }
 
             try { old?.Cancel(); } catch { }
@@ -145,6 +162,8 @@ namespace Qado.CodeBehindHelper
                 old = _cts;
                 _cts = null;
                 _currentMiner = null;
+                _currentOpenClMiner = null;
+                _currentNonceProvider = static () => 0UL;
             }
 
             try { old?.Cancel(); } catch { }
@@ -177,6 +196,7 @@ namespace Qado.CodeBehindHelper
         {
             logSink.Info("Mining", "Mining loop started");
 
+            Miner? miner = null;
             try
             {
                 while (true)
@@ -188,7 +208,7 @@ namespace Qado.CodeBehindHelper
 
                     var buffer = mempool.GetBuffer();
 
-                    var miner = new Miner(
+                    miner = new Miner(
                         privateKeyHex,
                         () => buffer.GetAllReadyTransactionsSortedByFee(),
                         async (block) => await OnBlockMinedAsync(block, privateKeyHex, mempool, logSink, balanceTextBlock).ConfigureAwait(false),
@@ -198,6 +218,7 @@ namespace Qado.CodeBehindHelper
                     );
 
                     lock (_gate) _currentMiner = miner;
+                    lock (_gate) _currentNonceProvider = () => miner.CurrentNonce;
 
                     await miner.StartMiningAsync(token).ConfigureAwait(false);
 
@@ -215,8 +236,72 @@ namespace Qado.CodeBehindHelper
             }
             finally
             {
-                lock (_gate) _currentMiner = null;
+                lock (_gate)
+                {
+                    if (ReferenceEquals(_currentMiner, miner))
+                        _currentMiner = null;
+                    if (_currentMiner == null && _currentOpenClMiner == null)
+                        _currentNonceProvider = static () => 0UL;
+                }
                 logSink.Warn("Mining", "Mining loop stopped");
+            }
+        }
+
+        private static async Task OpenClMiningLoopAsync(
+            string privateKeyHex,
+            OpenClMiningDevice openClDevice,
+            MempoolManager mempool,
+            ILogSink logSink,
+            TextBlock balanceTextBlock,
+            CancellationToken token)
+        {
+            logSink.Info("Mining", $"OpenCL mining loop started on {openClDevice.DisplayName}");
+
+            OpenClMiner? miner = null;
+            try
+            {
+                var buffer = mempool.GetBuffer();
+                miner = new OpenClMiner(
+                    openClDevice,
+                    privateKeyHex,
+                    () => buffer.GetAllReadyTransactionsSortedByFee(),
+                    async block => await OnBlockMinedAsync(block, privateKeyHex, mempool, logSink, balanceTextBlock).ConfigureAwait(false),
+                    _ => { },
+                    () =>
+                    {
+                        Interlocked.Exchange(ref _blockStartUtcTicks, DateTime.UtcNow.Ticks);
+                        Interlocked.Exchange(ref _hashCount, 0);
+                    },
+                    hashes => Interlocked.Add(ref _hashCount, hashes),
+                    logSink);
+
+                lock (_gate)
+                {
+                    _currentOpenClMiner = miner;
+                    _currentNonceProvider = () => miner.CurrentNonce;
+                }
+
+                await miner.StartMiningAsync(token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                logSink.Error("Mining", $"OpenCL mining loop crashed: {ex}");
+            }
+            finally
+            {
+                lock (_gate)
+                {
+                    if (ReferenceEquals(_currentOpenClMiner, miner))
+                        _currentOpenClMiner = null;
+                    if (_currentMiner == null && _currentOpenClMiner == null)
+                        _currentNonceProvider = static () => 0UL;
+                }
+
+                try { miner?.Dispose(); } catch { }
+                logSink.Warn("Mining", "OpenCL mining loop stopped");
             }
         }
 
@@ -489,7 +574,7 @@ namespace Qado.CodeBehindHelper
         private static ulong GetCurrentNonceUnsafe()
         {
             lock (_gate)
-                return _currentMiner?.CurrentNonce ?? 0UL;
+                return _currentNonceProvider();
         }
 
         private static void UiInvoke(Action a)
