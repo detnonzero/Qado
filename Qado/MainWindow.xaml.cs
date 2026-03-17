@@ -715,9 +715,11 @@ namespace Qado
                     this,
                     StartMiningButton,
                     MiningStatsPanel,
+                    NetworkHashrateText,
                     BlockUptimeText,
                     CurrentHashrateText,
                     NonceText,
+                    NextBlockProbabilityText,
                     BalanceTextBlock,
                     StartUiTimer
                 );
@@ -747,7 +749,7 @@ namespace Qado
                     ? "OpenCL"
                     : "CPU";
 
-                RefreshOpenClDevices(savedDeviceId);
+                RefreshMiningDevices(savedDeviceId);
                 ApplyMiningBackendSelectionUi();
             }
             catch (Exception ex)
@@ -756,46 +758,34 @@ namespace Qado
             }
         }
 
-        private void RefreshOpenClDevices(string? preferredDeviceId = null)
+        private void RefreshMiningDevices(string? preferredDeviceId = null)
         {
             try
             {
-                var devices = OpenClDiscovery.DiscoverDevices(this);
+                MiningDeviceComboBox.Items.Clear();
+
                 string? preferred = preferredDeviceId;
                 if (string.IsNullOrWhiteSpace(preferred))
-                {
-                    try { preferred = MetaStore.Get(MiningOpenClDeviceMetaKey); } catch { }
-                }
+                    preferred = GetSavedMiningDeviceIdNoThrow();
 
-                MiningDeviceComboBox.Items.Clear();
-                for (int i = 0; i < devices.Count; i++)
-                    MiningDeviceComboBox.Items.Add(devices[i]);
-
-                if (MiningDeviceComboBox.Items.Count == 0)
+                switch (GetSelectedMiningBackendKind())
                 {
-                    MiningDeviceComboBox.SelectedItem = null;
-                    return;
-                }
-
-                OpenClMiningDevice? selected = null;
-                if (!string.IsNullOrWhiteSpace(preferred))
-                {
-                    for (int i = 0; i < MiningDeviceComboBox.Items.Count; i++)
+                    case MiningBackendKind.OpenCl:
                     {
-                        if (MiningDeviceComboBox.Items[i] is OpenClMiningDevice device &&
-                            string.Equals(device.Id, preferred, StringComparison.Ordinal))
-                        {
-                            selected = device;
-                            break;
-                        }
+                        var devices = OpenClDiscovery.DiscoverDevices(this);
+                        for (int i = 0; i < devices.Count; i++)
+                            MiningDeviceComboBox.Items.Add(devices[i]);
+                        SelectPreferredMiningDevice(preferred, item => (item as OpenClMiningDevice)?.Id);
+                        return;
                     }
+                    default:
+                        MiningDeviceComboBox.SelectedItem = null;
+                        return;
                 }
-
-                MiningDeviceComboBox.SelectedItem = selected ?? MiningDeviceComboBox.Items[0];
             }
             catch (Exception ex)
             {
-                Warn("Mining", $"OpenCL device refresh failed: {ex.Message}");
+                Warn("Mining", $"Mining device refresh failed: {ex.Message}");
             }
         }
 
@@ -803,8 +793,8 @@ namespace Qado
         {
             if (GuiUtils.IsDesignMode) return;
 
-            if (GetSelectedMiningBackendKind() == MiningBackendKind.OpenCl && MiningDeviceComboBox.Items.Count == 0)
-                RefreshOpenClDevices();
+            if (GetSelectedMiningBackendKind() != MiningBackendKind.Cpu)
+                RefreshMiningDevices();
 
             ApplyMiningBackendSelectionUi();
             PersistMiningPreferencesNoThrow();
@@ -818,12 +808,14 @@ namespace Qado
 
         private void ApplyMiningBackendSelectionUi()
         {
-            if (MiningDevicePanel == null)
+            if (MiningDevicePanel == null || MiningDeviceLabelText == null)
                 return;
 
-            MiningDevicePanel.Visibility = GetSelectedMiningBackendKind() == MiningBackendKind.OpenCl
-                ? Visibility.Visible
-                : Visibility.Collapsed;
+            var backendKind = GetSelectedMiningBackendKind();
+            MiningDevicePanel.Visibility = backendKind == MiningBackendKind.Cpu
+                ? Visibility.Collapsed
+                : Visibility.Visible;
+            MiningDeviceLabelText.Text = "OpenCL Device";
         }
 
         private MiningBackendKind GetSelectedMiningBackendKind()
@@ -838,16 +830,59 @@ namespace Qado
         {
             try
             {
+                var backendKind = GetSelectedMiningBackendKind();
                 MetaStore.Set(
                     MiningBackendMetaKey,
-                    GetSelectedMiningBackendKind() == MiningBackendKind.OpenCl ? "opencl" : "cpu");
+                    backendKind == MiningBackendKind.OpenCl
+                        ? "opencl"
+                        : "cpu");
 
-                var selectedDevice = MiningDeviceComboBox?.SelectedItem as OpenClMiningDevice;
-                MetaStore.Set(MiningOpenClDeviceMetaKey, selectedDevice?.Id ?? string.Empty);
+                if (backendKind == MiningBackendKind.OpenCl)
+                {
+                    var selectedOpenClDevice = MiningDeviceComboBox?.SelectedItem as OpenClMiningDevice;
+                    MetaStore.Set(MiningOpenClDeviceMetaKey, selectedOpenClDevice?.Id ?? string.Empty);
+                }
             }
             catch
             {
             }
+        }
+
+        private string? GetSavedMiningDeviceIdNoThrow()
+        {
+            try
+            {
+                return MetaStore.Get(MiningOpenClDeviceMetaKey);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private void SelectPreferredMiningDevice(string? preferredDeviceId, Func<object?, string?> getDeviceId)
+        {
+            if (MiningDeviceComboBox.Items.Count == 0)
+            {
+                MiningDeviceComboBox.SelectedItem = null;
+                return;
+            }
+
+            object? selected = null;
+            if (!string.IsNullOrWhiteSpace(preferredDeviceId))
+            {
+                for (int i = 0; i < MiningDeviceComboBox.Items.Count; i++)
+                {
+                    var candidate = MiningDeviceComboBox.Items[i];
+                    if (string.Equals(getDeviceId(candidate), preferredDeviceId, StringComparison.Ordinal))
+                    {
+                        selected = candidate;
+                        break;
+                    }
+                }
+            }
+
+            MiningDeviceComboBox.SelectedItem = selected ?? MiningDeviceComboBox.Items[0];
         }
 
         private void AmountTextBox_TextChanged(object sender, TextChangedEventArgs e)
@@ -1150,9 +1185,11 @@ namespace Qado
             AttachTextBlockCopySupport(BalanceTextBlock);
             AttachTextBlockCopySupport(MempoolCountText);
             AttachTextBlockCopySupport(PeerCountText);
+            AttachTextBlockCopySupport(NetworkHashrateText);
             AttachTextBlockCopySupport(BlockUptimeText);
             AttachTextBlockCopySupport(CurrentHashrateText);
             AttachTextBlockCopySupport(NonceText);
+            AttachTextBlockCopySupport(NextBlockProbabilityText);
             AttachTextBlockCopySupport(SendStatusText);
             AttachTextBlockCopySupport(TxHeaderText);
             AttachTextBlockCopySupport(PersonalTxHeaderText);

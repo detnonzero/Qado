@@ -10,54 +10,58 @@
             <RowDefinition Height="220"/>
         </Grid.RowDefinitions>
 
-        <Border Grid.Row="0" Padding="10" BorderThickness="1">
-            <Grid>
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="Auto"/>
-                    <ColumnDefinition Width="Auto"/>
-                </Grid.ColumnDefinitions>
+        <Border Grid.Row="0" Padding="10" BorderThickness="1" BorderBrush="#D0D7DE">
+            <ScrollViewer HorizontalScrollBarVisibility="Auto"
+                          VerticalScrollBarVisibility="Auto"
+                          CanContentScroll="False">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
 
-                <StackPanel Orientation="Vertical">
-                    <TextBlock Text="Node Status" FontWeight="Bold" FontSize="14"/>
-                    <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
-                        <TextBlock Text="Height:" FontWeight="Bold"/>
-                        <TextBlock x:Name="TipHeightText" Margin="8,0,18,0"/>
-                        <TextBlock Text="Tip Hash:" FontWeight="Bold"/>
-                        <TextBlock x:Name="TipHashText" Margin="8,0,0,0"
-                                   TextTrimming="CharacterEllipsis" Width="520"/>
+                    <StackPanel Orientation="Vertical">
+                        <TextBlock Text="Node Status" FontWeight="Bold" FontSize="14"/>
+                        <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                            <TextBlock Text="Height:" FontWeight="Bold"/>
+                            <TextBlock x:Name="TipHeightText" Margin="8,0,18,0"/>
+                            <TextBlock Text="Tip Hash:" FontWeight="Bold"/>
+                            <TextBlock x:Name="TipHashText" Margin="8,0,0,0"
+                                       TextTrimming="CharacterEllipsis" Width="520"/>
+                        </StackPanel>
+
+                        <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                            <TextBlock Text="Balance:" FontWeight="Bold"/>
+                            <TextBlock x:Name="BalanceTextBlock" Margin="8,0,18,0"/>
+                            <TextBlock Text="Mempool:" FontWeight="Bold"/>
+                            <TextBlock x:Name="MempoolCountText" Margin="8,0,18,0"/>
+                            <TextBlock Text="Peers:" FontWeight="Bold"/>
+                            <TextBlock x:Name="PeerCountText" Margin="8,0,0,0"/>
+                        </StackPanel>
                     </StackPanel>
 
-                    <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
-                        <TextBlock Text="Balance:" FontWeight="Bold"/>
-                        <TextBlock x:Name="BalanceTextBlock" Margin="8,0,18,0"/>
-                        <TextBlock Text="Mempool:" FontWeight="Bold"/>
-                        <TextBlock x:Name="MempoolCountText" Margin="8,0,18,0"/>
-                        <TextBlock Text="Peers:" FontWeight="Bold"/>
-                        <TextBlock x:Name="PeerCountText" Margin="8,0,0,0"/>
+                    <StackPanel Grid.Column="1" Orientation="Vertical" Margin="18,0,0,0" VerticalAlignment="Center">
+                        <TextBlock Text="Private Key (hex)" FontWeight="Bold"/>
+                        <ComboBox x:Name="PrivateKeyComboBox"
+                                  Width="420"
+                                  Margin="0,6,0,0"
+                                  IsEditable="True"
+                                  SelectionChanged="PrivateKeyComboBox_SelectionChanged"/>
+
+                        <TextBlock Text="Wallet Address (PubKey32 hex)" FontWeight="Bold" Margin="0,10,0,0"/>
+                        <TextBox x:Name="SpendPublicKeyTextBox" Width="420" Margin="0,6,0,0" IsReadOnly="True"/>
                     </StackPanel>
-                </StackPanel>
 
-                <StackPanel Grid.Column="1" Orientation="Vertical" Margin="18,0,0,0" VerticalAlignment="Center">
-                    <TextBlock Text="Private Key (hex)" FontWeight="Bold"/>
-                    <ComboBox x:Name="PrivateKeyComboBox"
-                              Width="420"
-                              Margin="0,6,0,0"
-                              IsEditable="True"
-                              SelectionChanged="PrivateKeyComboBox_SelectionChanged"/>
-
-                    <TextBlock Text="Wallet Address (PubKey32 hex)" FontWeight="Bold" Margin="0,10,0,0"/>
-                    <TextBox x:Name="SpendPublicKeyTextBox" Width="420" Margin="0,6,0,0" IsReadOnly="True"/>
-                </StackPanel>
-
-                <StackPanel Grid.Column="2" Orientation="Horizontal" Margin="18,0,0,0" VerticalAlignment="Center">
-                    <Button x:Name="GeneratePrivateKeyButton" Content="Generate Key" Width="140" Margin="0,0,8,0"
-                            Click="GeneratePrivateKeyButton_Click"/>
-                    <Button x:Name="AcceptPrivateKeyButton" Content="Accept" Width="90" Margin="0,0,8,0"
-                            Click="AcceptPrivateKeyButton_Click" Opacity="0.5" IsEnabled="False"/>
-                    <Button x:Name="CopyKeyButton" Content="Copy" Width="70"/>
-                </StackPanel>
-            </Grid>
+                    <StackPanel Grid.Column="2" Orientation="Horizontal" Margin="18,0,0,0" VerticalAlignment="Center">
+                        <Button x:Name="GeneratePrivateKeyButton" Content="Generate Key" Width="140" Margin="0,0,8,0"
+                                Click="GeneratePrivateKeyButton_Click"/>
+                        <Button x:Name="AcceptPrivateKeyButton" Content="Accept" Width="90" Margin="0,0,8,0"
+                                Click="AcceptPrivateKeyButton_Click" Opacity="0.5" IsEnabled="False"/>
+                        <Button x:Name="CopyKeyButton" Content="Copy" Width="70"/>
+                    </StackPanel>
+                </Grid>
+            </ScrollViewer>
         </Border>
 
         <Grid Grid.Row="1" Margin="0,12,0,12">
@@ -66,90 +70,104 @@
                 <ColumnDefinition Width="*"/>
             </Grid.ColumnDefinitions>
 
-            <StackPanel Grid.Column="0" Orientation="Vertical">
+            <Border Grid.Column="0" BorderThickness="1" BorderBrush="#D0D7DE" Padding="6">
+                <ScrollViewer VerticalScrollBarVisibility="Auto"
+                              HorizontalScrollBarVisibility="Auto"
+                              CanContentScroll="False">
+                    <StackPanel Orientation="Vertical">
 
-                <GroupBox Header="Mining" Padding="10" Margin="0,0,0,12">
-                    <StackPanel>
-                        <StackPanel Orientation="Vertical" Margin="0,0,0,8">
-                            <TextBlock Text="Backend" FontWeight="Bold"/>
-                            <ComboBox x:Name="MiningBackendComboBox"
-                                      Width="220"
-                                      HorizontalAlignment="Left"
-                                      Margin="0,6,0,0"
-                                      SelectionChanged="MiningBackendComboBox_SelectionChanged"/>
-                        </StackPanel>
+                        <GroupBox Header="Mining" Padding="10" Margin="0,0,0,12">
+                            <StackPanel>
+                                <StackPanel Orientation="Vertical" Margin="0,0,0,8">
+                                    <TextBlock Text="Backend" FontWeight="Bold"/>
+                                    <ComboBox x:Name="MiningBackendComboBox"
+                                              Width="220"
+                                              HorizontalAlignment="Left"
+                                              Margin="0,6,0,0"
+                                              SelectionChanged="MiningBackendComboBox_SelectionChanged"/>
+                                </StackPanel>
 
-                        <StackPanel x:Name="MiningDevicePanel" Orientation="Vertical" Margin="0,0,0,8">
-                            <TextBlock Text="OpenCL Device" FontWeight="Bold"/>
-                            <ComboBox x:Name="MiningDeviceComboBox"
-                                      Width="420"
-                                      HorizontalAlignment="Left"
-                                      Margin="0,6,0,0"
-                                      SelectionChanged="MiningDeviceComboBox_SelectionChanged"/>
-                        </StackPanel>
+                                <StackPanel x:Name="MiningDevicePanel" Orientation="Vertical" Margin="0,0,0,8">
+                                    <TextBlock x:Name="MiningDeviceLabelText" Text="OpenCL Device" FontWeight="Bold"/>
+                                    <ComboBox x:Name="MiningDeviceComboBox"
+                                              Width="420"
+                                              HorizontalAlignment="Left"
+                                              Margin="0,6,0,0"
+                                              SelectionChanged="MiningDeviceComboBox_SelectionChanged"/>
+                                </StackPanel>
 
-                        <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
-                            <Button x:Name="StartMiningButton" Content="Start Mining" Width="140" Margin="0,0,8,0"
-                                    Click="StartMiningButton_Click"/>
-                        </StackPanel>
+                                <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                                    <Button x:Name="StartMiningButton" Content="Start Mining" Width="140" Margin="0,0,8,0"
+                                            Click="StartMiningButton_Click"/>
+                                </StackPanel>
 
-                        <StackPanel x:Name="MiningStatsPanel" Margin="0,4,0,0">
-                            <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
-                                <TextBlock Text="Block uptime:" Width="120"/>
-                                <TextBlock x:Name="BlockUptimeText"/>
+                                <StackPanel x:Name="MiningStatsPanel" Margin="0,4,0,0">
+                                    <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
+                                        <TextBlock Text="Network hashrate:" Width="210"/>
+                                        <TextBlock x:Name="NetworkHashrateText"/>
+                                    </StackPanel>
+                                    <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
+                                        <TextBlock Text="Block uptime:" Width="210"/>
+                                        <TextBlock x:Name="BlockUptimeText"/>
+                                    </StackPanel>
+                                    <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
+                                        <TextBlock Text="Hashrate:" Width="210"/>
+                                        <TextBlock x:Name="CurrentHashrateText"/>
+                                    </StackPanel>
+                                    <StackPanel Orientation="Horizontal">
+                                        <TextBlock Text="Nonce:" Width="210"/>
+                                        <TextBlock x:Name="NonceText"/>
+                                    </StackPanel>
+                                    <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                                        <TextBlock Text="Probability to find the next block:" Width="210"/>
+                                        <TextBlock x:Name="NextBlockProbabilityText"/>
+                                    </StackPanel>
+                                </StackPanel>
+
+                                <TextBlock Text="Mining creates blocks; rewards are defined by consensus."
+                                           Margin="0,8,0,0" TextWrapping="Wrap"/>
                             </StackPanel>
-                            <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
-                                <TextBlock Text="Hashrate:" Width="120"/>
-                                <TextBlock x:Name="CurrentHashrateText"/>
-                            </StackPanel>
-                            <StackPanel Orientation="Horizontal">
-                                <TextBlock Text="Nonce:" Width="120"/>
-                                <TextBlock x:Name="NonceText"/>
-                            </StackPanel>
-                        </StackPanel>
+                        </GroupBox>
 
-                        <TextBlock Text="Mining creates blocks; rewards are defined by consensus."
-                                   Margin="0,8,0,0" TextWrapping="Wrap"/>
+                        <GroupBox Header="Send Transaction (account-based)" Padding="10" Margin="0,0,0,12">
+                            <StackPanel>
+                                <TextBlock Text="To (PubKey32 hex):" FontWeight="Bold"/>
+                                <TextBox x:Name="RecipientAddressTextBox" Margin="0,6,0,8"/>
+
+                                <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                                    <StackPanel Width="190">
+                                        <TextBlock Text="Amount (units):" FontWeight="Bold"/>
+                                        <TextBox x:Name="AmountTextBox" Margin="0,6,0,0"
+                                                 TextChanged="AmountTextBox_TextChanged"/>
+                                    </StackPanel>
+                                    <StackPanel Width="190" Margin="12,0,0,0">
+                                        <TextBlock Text="Fee (units):" FontWeight="Bold"/>
+                                        <TextBox x:Name="FeeTextBox" Margin="0,6,0,0"/>
+                                    </StackPanel>
+                                </StackPanel>
+
+                                <Button x:Name="SendButton" Content="Sign + Add to Mempool" Height="32"
+                                        Click="SendButton_Click"/>
+
+                                <TextBlock x:Name="SendStatusText" Margin="0,8,0,0" TextWrapping="Wrap"/>
+                            </StackPanel>
+                        </GroupBox>
+
+                        <GroupBox Header="P2P" Padding="10">
+                            <StackPanel>
+                                <StackPanel Orientation="Horizontal">
+                                    <TextBox x:Name="PeerHostTextBox" Width="220"/>
+                                    <TextBox x:Name="PeerPortTextBox" Width="80" Margin="8,0,0,0"/>
+                                    <Button x:Name="ConnectPeerButton" Content="Connect" Width="90" Margin="8,0,0,0"
+                                            Click="ConnectPeerButton_Click"/>
+                                </StackPanel>
+                                <TextBlock Text="Connect will dial a peer (your existing P2P bootstrap stays unchanged)."
+                                           Margin="0,8,0,0" TextWrapping="Wrap"/>
+                            </StackPanel>
+                        </GroupBox>
                     </StackPanel>
-                </GroupBox>
-
-                <GroupBox Header="Send Transaction (account-based)" Padding="10" Margin="0,0,0,12">
-                    <StackPanel>
-                        <TextBlock Text="To (PubKey32 hex):" FontWeight="Bold"/>
-                        <TextBox x:Name="RecipientAddressTextBox" Margin="0,6,0,8"/>
-
-                        <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
-                            <StackPanel Width="190">
-                                <TextBlock Text="Amount (units):" FontWeight="Bold"/>
-                                <TextBox x:Name="AmountTextBox" Margin="0,6,0,0"
-                                         TextChanged="AmountTextBox_TextChanged"/>
-                            </StackPanel>
-                            <StackPanel Width="190" Margin="12,0,0,0">
-                                <TextBlock Text="Fee (units):" FontWeight="Bold"/>
-                                <TextBox x:Name="FeeTextBox" Margin="0,6,0,0"/>
-                            </StackPanel>
-                        </StackPanel>
-
-                        <Button x:Name="SendButton" Content="Sign + Add to Mempool" Height="32"
-                                Click="SendButton_Click"/>
-
-                        <TextBlock x:Name="SendStatusText" Margin="0,8,0,0" TextWrapping="Wrap"/>
-                    </StackPanel>
-                </GroupBox>
-
-                <GroupBox Header="P2P" Padding="10">
-                    <StackPanel>
-                        <StackPanel Orientation="Horizontal">
-                            <TextBox x:Name="PeerHostTextBox" Width="220"/>
-                            <TextBox x:Name="PeerPortTextBox" Width="80" Margin="8,0,0,0"/>
-                            <Button x:Name="ConnectPeerButton" Content="Connect" Width="90" Margin="8,0,0,0"
-                                    Click="ConnectPeerButton_Click"/>
-                        </StackPanel>
-                        <TextBlock Text="Connect will dial a peer (your existing P2P bootstrap stays unchanged)."
-                                   Margin="0,8,0,0" TextWrapping="Wrap"/>
-                    </StackPanel>
-                </GroupBox>
-            </StackPanel>
+                </ScrollViewer>
+            </Border>
 
             <TabControl x:Name="MainTabs" Grid.Column="1" Margin="12,0,0,0">
                 <TabItem Header="Blocks">

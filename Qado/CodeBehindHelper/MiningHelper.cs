@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Numerics;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Threading;
@@ -48,9 +49,11 @@ namespace Qado.CodeBehindHelper
             ILogSink logSink,
             Button startMiningButton,
             Panel miningStatsPanel,
+            TextBlock networkHashrateText,
             TextBlock blockUptimeText,
             TextBlock currentHashrateText,
             TextBlock nonceText,
+            TextBlock nextBlockProbabilityText,
             TextBlock balanceTextBlock,
             Action<Action> startUiTimer)
         {
@@ -104,16 +107,23 @@ namespace Qado.CodeBehindHelper
                 var uptime = startTicks == 0 ? 0 : (int)(DateTime.UtcNow - new DateTime(startTicks, DateTimeKind.Utc)).TotalSeconds;
 
                 var hashes = Interlocked.Read(ref _hashCount);
-                var hashrate = uptime > 0 ? (hashes / Math.Max(1, uptime)) : hashes;
+                long currentHashrateHps = uptime > 0 ? (hashes / Math.Max(1, uptime)) : hashes;
+                var megaHashesPerSecond = currentHashrateHps / 1_000_000;
+                BigInteger networkHashrateHps = EstimateNetworkHashrateHashesPerSecond();
+                BigInteger networkHashrateGigaHashesPerSecond = networkHashrateHps / 1_000_000_000;
 
-                blockUptimeText.Text = $"Block Uptime: {uptime}s";
-                currentHashrateText.Text = $"Current Hashrate: {hashrate} H/s";
-                nonceText.Text = $"Nonce: {GetCurrentNonceUnsafe()}";
+                networkHashrateText.Text = $"{networkHashrateGigaHashesPerSecond} GH/s";
+                blockUptimeText.Text = $"{uptime}s";
+                currentHashrateText.Text = $"{megaHashesPerSecond} MH/s";
+                nonceText.Text = $"{GetCurrentNonceUnsafe()}";
+                nextBlockProbabilityText.Text = FormatNextBlockProbabilityPercent(currentHashrateHps, networkHashrateHps);
             });
 
-            _ = backendKind == MiningBackendKind.OpenCl
-                ? Task.Run(() => OpenClMiningLoopAsync(privateKeyHex, openClDevice!, mempool, logSink, balanceTextBlock, newCts.Token))
-                : Task.Run(() => MiningLoopAsync(privateKeyHex, mempool, logSink, balanceTextBlock, newCts.Token));
+            _ = backendKind switch
+            {
+                MiningBackendKind.OpenCl => Task.Run(() => OpenClMiningLoopAsync(privateKeyHex, openClDevice!, mempool, logSink, balanceTextBlock, newCts.Token)),
+                _ => Task.Run(() => MiningLoopAsync(privateKeyHex, mempool, logSink, balanceTextBlock, newCts.Token))
+            };
         }
 
         public static void StopMining(
@@ -575,6 +585,73 @@ namespace Qado.CodeBehindHelper
         {
             lock (_gate)
                 return _currentNonceProvider();
+        }
+
+        private static BigInteger EstimateNetworkHashrateHashesPerSecond()
+        {
+            const int WindowBlocks = 60;
+
+            try
+            {
+                ulong tipHeight = BlockStore.GetLatestHeight();
+                if (tipHeight < (ulong)WindowBlocks)
+                    return BigInteger.Zero;
+
+                ulong startHeight = tipHeight - (ulong)WindowBlocks;
+                var previousBlock = BlockStore.GetBlockByHeight(startHeight);
+                if (previousBlock?.Header == null)
+                    return BigInteger.Zero;
+
+                BigInteger difficultySum = BigInteger.Zero;
+                long solveTimeSumSeconds = 0;
+                ulong previousTimestamp = previousBlock.Header.Timestamp;
+
+                for (ulong height = startHeight + 1; height <= tipHeight; height++)
+                {
+                    var block = BlockStore.GetBlockByHeight(height);
+                    if (block?.Header == null)
+                        return BigInteger.Zero;
+
+                    difficultySum += Difficulty.TargetToDifficulty(block.Header.Target);
+
+                    long solveTimeSeconds = unchecked((long)block.Header.Timestamp - (long)previousTimestamp);
+                    if (solveTimeSeconds <= 0)
+                        solveTimeSeconds = 1;
+
+                    solveTimeSumSeconds += solveTimeSeconds;
+                    previousTimestamp = block.Header.Timestamp;
+                }
+
+                if (solveTimeSumSeconds <= 0 || difficultySum <= BigInteger.Zero)
+                    return BigInteger.Zero;
+
+                BigInteger expectedHashes = difficultySum * (BigInteger.One << 28);
+                return expectedHashes / solveTimeSumSeconds;
+            }
+            catch
+            {
+                return BigInteger.Zero;
+            }
+        }
+
+        private static string FormatNextBlockProbabilityPercent(long currentHashrateHps, BigInteger networkHashrateHps)
+        {
+            if (currentHashrateHps <= 0 || networkHashrateHps <= BigInteger.Zero)
+                return "0%";
+
+            const int FractionScale = 1_000_000; // 6 decimal places
+            BigInteger scaledPercent = (new BigInteger(currentHashrateHps) * 100 * FractionScale) / networkHashrateHps;
+            BigInteger maxScaledPercent = new BigInteger(100) * FractionScale;
+            if (scaledPercent > maxScaledPercent)
+                scaledPercent = maxScaledPercent;
+
+            BigInteger whole = scaledPercent / FractionScale;
+            BigInteger fractional = scaledPercent % FractionScale;
+            if (fractional == BigInteger.Zero)
+                return $"{whole}%";
+
+            string fractionText = fractional.ToString().PadLeft(6, '0').TrimEnd('0');
+            return $"{whole}.{fractionText}%";
         }
 
         private static void UiInvoke(Action a)

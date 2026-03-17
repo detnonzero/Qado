@@ -16,7 +16,7 @@ namespace Qado.Mining
 {
     public sealed class OpenClMiner : IDisposable
     {
-        private const int HashBatchSize = 262_144;
+        private const int HashBatchSize = 256_000_000;
         private static readonly long MaintenanceIntervalTicks = Stopwatch.Frequency;
 
         private readonly OpenClMiningDevice _device;
@@ -27,6 +27,9 @@ namespace Qado.Mining
         private readonly Action? _onTemplateStarted;
         private readonly Action<long> _onHashesCompleted;
         private readonly ILogSink? _log;
+        private readonly string _tuningProfileName;
+        private readonly int[] _preferredLocalWorkSizes;
+        private readonly string _buildOptions;
 
         private readonly int[] _foundFlagHost = new int[1];
         private readonly ulong[] _foundNonceHost = new ulong[1];
@@ -35,19 +38,24 @@ namespace Qado.Mining
         private readonly uint[] _block0Words = new uint[16];
         private readonly uint[] _block1Words = new uint[16];
         private readonly uint[] _block2Words = new uint[16];
-        private readonly byte[] _targetBytes = new byte[32];
+        private readonly uint[] _precomputedCvWords = new uint[8];
+        private readonly uint[] _targetWords = new uint[8];
+        private readonly IntPtr[] _globalWorkSize = new IntPtr[1];
+        private readonly Event[] _singleEventWaitList = new Event[1];
 
         private Context _context;
         private CommandQueue _queue;
         private Program _program;
         private Kernel _kernel;
-        private IMem? _block0Buffer;
+        private IMem? _precomputedCvBuffer;
         private IMem? _block1Buffer;
         private IMem? _block2Buffer;
         private IMem? _targetBuffer;
         private IMem? _foundFlagBuffer;
         private IMem? _foundNonceBuffer;
         private IMem? _foundHashBuffer;
+        private IntPtr[]? _localWorkSize;
+        private int _configuredLocalWorkSize;
         private bool _initialized;
         private bool _disposed;
 
@@ -69,6 +77,11 @@ namespace Qado.Mining
             _onHashesCompleted = onHashesCompleted ?? throw new ArgumentNullException(nameof(onHashesCompleted));
             _log = log;
 
+            var profile = ResolveTuningProfile(device);
+            _tuningProfileName = profile.ProfileName;
+            _preferredLocalWorkSizes = profile.PreferredLocalWorkSizes;
+            _buildOptions = profile.BuildOptions;
+
             if (string.IsNullOrWhiteSpace(privateKeyHex))
                 throw new ArgumentException("privateKeyHex required", nameof(privateKeyHex));
 
@@ -83,6 +96,8 @@ namespace Qado.Mining
             _minerPublicKey = key.Export(KeyBlobFormat.RawPublicKey);
             if (_minerPublicKey.Length != 32)
                 throw new InvalidOperationException("Miner pubkey must be 32 bytes");
+
+            _globalWorkSize[0] = (IntPtr)HashBatchSize;
         }
 
         public ulong CurrentNonce { get; private set; }
@@ -104,7 +119,7 @@ namespace Qado.Mining
             try
             {
                 EnsureOpenClReady();
-                _log?.Info("Mining", $"OpenCL mining enabled on {_device.DisplayName}.");
+                _log?.Info("Mining", $"OpenCL mining enabled on {_device.DisplayName} (profile={_tuningProfileName}).");
 
                 while (true)
                 {
@@ -270,40 +285,57 @@ namespace Qado.Mining
             Array.Clear(_foundHashHost, 0, _foundHashHost.Length);
 
             ErrorCode error;
-            Event ev;
+            Event resetEvent = default;
+            Event kernelEvent = default;
+            Event flagReadEvent = default;
+            Event nonceReadEvent = default;
+            Event hashReadEvent = default;
 
-            error = Cl.EnqueueWriteBuffer(_queue, _foundFlagBuffer, Bool.True, IntPtr.Zero, (IntPtr)sizeof(int), _foundFlagHost, 0, null, out ev);
-            ThrowIfError(error, "reset found flag");
-            ReleaseEventNoThrow(ev);
+            try
+            {
+                error = Cl.EnqueueWriteBuffer(_queue, _foundFlagBuffer, Bool.True, IntPtr.Zero, (IntPtr)sizeof(int), _foundFlagHost, 0, null, out resetEvent);
+                ThrowIfError(error, "reset found flag");
 
-            error = Cl.SetKernelArg(_kernel, 4, nonceBase);
-            ThrowIfError(error, "set nonce base");
+                error = Cl.SetKernelArg(_kernel, 4, nonceBase);
+                ThrowIfError(error, "set nonce base");
 
-            error = Cl.EnqueueNDRangeKernel(_queue, _kernel, 1, null, new[] { (IntPtr)HashBatchSize }, null, 0, null, out ev);
-            ThrowIfError(error, "launch search kernel");
-            ReleaseEventNoThrow(ev);
+                error = Cl.EnqueueNDRangeKernel(_queue, _kernel, 1, null, _globalWorkSize, _localWorkSize, 0, null, out kernelEvent);
+                ThrowIfError(error, "launch search kernel");
 
-            error = Cl.Finish(_queue);
-            ThrowIfError(error, "finish search kernel");
+                _singleEventWaitList[0] = kernelEvent;
+                error = Cl.EnqueueReadBuffer(
+                    _queue,
+                    _foundFlagBuffer,
+                    Bool.True,
+                    IntPtr.Zero,
+                    (IntPtr)sizeof(int),
+                    _foundFlagHost,
+                    1,
+                    _singleEventWaitList,
+                    out flagReadEvent);
+                ThrowIfError(error, "read found flag");
 
-            error = Cl.EnqueueReadBuffer(_queue, _foundFlagBuffer, Bool.True, IntPtr.Zero, (IntPtr)sizeof(int), _foundFlagHost, 0, null, out ev);
-            ThrowIfError(error, "read found flag");
-            ReleaseEventNoThrow(ev);
+                if (_foundFlagHost[0] == 0)
+                    return false;
 
-            if (_foundFlagHost[0] == 0)
-                return false;
+                error = Cl.EnqueueReadBuffer(_queue, _foundNonceBuffer, Bool.True, IntPtr.Zero, (IntPtr)sizeof(ulong), _foundNonceHost, 0, null, out nonceReadEvent);
+                ThrowIfError(error, "read found nonce");
 
-            error = Cl.EnqueueReadBuffer(_queue, _foundNonceBuffer, Bool.True, IntPtr.Zero, (IntPtr)sizeof(ulong), _foundNonceHost, 0, null, out ev);
-            ThrowIfError(error, "read found nonce");
-            ReleaseEventNoThrow(ev);
+                error = Cl.EnqueueReadBuffer(_queue, _foundHashBuffer, Bool.True, IntPtr.Zero, (IntPtr)_foundHashHost.Length, _foundHashHost, 0, null, out hashReadEvent);
+                ThrowIfError(error, "read found hash");
 
-            error = Cl.EnqueueReadBuffer(_queue, _foundHashBuffer, Bool.True, IntPtr.Zero, (IntPtr)_foundHashHost.Length, _foundHashHost, 0, null, out ev);
-            ThrowIfError(error, "read found hash");
-            ReleaseEventNoThrow(ev);
-
-            foundNonce = _foundNonceHost[0];
-            foundHash = (byte[])_foundHashHost.Clone();
-            return true;
+                foundNonce = _foundNonceHost[0];
+                foundHash = (byte[])_foundHashHost.Clone();
+                return true;
+            }
+            finally
+            {
+                ReleaseEventNoThrow(hashReadEvent);
+                ReleaseEventNoThrow(nonceReadEvent);
+                ReleaseEventNoThrow(flagReadEvent);
+                ReleaseEventNoThrow(kernelEvent);
+                ReleaseEventNoThrow(resetEvent);
+            }
         }
 
         private void UploadTemplate(byte[] headerBytesZeroNonce, byte[] target)
@@ -316,13 +348,14 @@ namespace Qado.Mining
             WriteWordBlock(headerBytesZeroNonce, 0, _block0Words);
             WriteWordBlock(headerBytesZeroNonce, 64, _block1Words);
             WriteWordBlock(headerBytesZeroNonce, 128, _block2Words);
-            Buffer.BlockCopy(target, 0, _targetBytes, 0, 32);
+            PrecomputeChunk0Cv(_block0Words, _precomputedCvWords);
+            WriteTargetWords(target, _targetWords);
 
             ErrorCode error;
             Event ev;
 
-            error = Cl.EnqueueWriteBuffer(_queue, _block0Buffer, Bool.True, IntPtr.Zero, (IntPtr)(16 * sizeof(uint)), _block0Words, 0, null, out ev);
-            ThrowIfError(error, "upload block0 template");
+            error = Cl.EnqueueWriteBuffer(_queue, _precomputedCvBuffer, Bool.True, IntPtr.Zero, (IntPtr)(8 * sizeof(uint)), _precomputedCvWords, 0, null, out ev);
+            ThrowIfError(error, "upload precomputed cv");
             ReleaseEventNoThrow(ev);
 
             error = Cl.EnqueueWriteBuffer(_queue, _block1Buffer, Bool.True, IntPtr.Zero, (IntPtr)(16 * sizeof(uint)), _block1Words, 0, null, out ev);
@@ -333,12 +366,9 @@ namespace Qado.Mining
             ThrowIfError(error, "upload block2 template");
             ReleaseEventNoThrow(ev);
 
-            error = Cl.EnqueueWriteBuffer(_queue, _targetBuffer, Bool.True, IntPtr.Zero, (IntPtr)32, _targetBytes, 0, null, out ev);
-            ThrowIfError(error, "upload target");
+            error = Cl.EnqueueWriteBuffer(_queue, _targetBuffer, Bool.True, IntPtr.Zero, (IntPtr)(8 * sizeof(uint)), _targetWords, 0, null, out ev);
+            ThrowIfError(error, "upload target words");
             ReleaseEventNoThrow(ev);
-
-            error = Cl.Finish(_queue);
-            ThrowIfError(error, "finish template upload");
         }
 
         private void EnsureOpenClReady()
@@ -359,23 +389,23 @@ namespace Qado.Mining
             _program = Cl.CreateProgramWithSource(_context, 1, new[] { OpenClKernelSource.Source }, null, out error);
             ThrowIfError(error, "create OpenCL program");
 
-            error = Cl.BuildProgram(_program, 1, new[] { _device.DeviceHandle }, string.Empty, null, IntPtr.Zero);
+            error = Cl.BuildProgram(_program, 1, new[] { _device.DeviceHandle }, _buildOptions, null, IntPtr.Zero);
             if (error != ErrorCode.Success)
             {
                 string buildLog = SafeBuildLog();
-                throw new InvalidOperationException($"OpenCL build failed on {_device.DisplayName}: {error}. {buildLog}".Trim());
+                throw new InvalidOperationException($"OpenCL build failed on {_device.DisplayName}: {error}. options='{_buildOptions}'. {buildLog}".Trim());
             }
 
             _kernel = Cl.CreateKernel(_program, "search_nonce", out error);
             ThrowIfError(error, "create OpenCL kernel");
 
-            _block0Buffer = Cl.CreateBuffer(_context, MemFlags.ReadOnly, (IntPtr)(16 * sizeof(uint)), out error);
-            ThrowIfError(error, "create block0 buffer");
+            _precomputedCvBuffer = Cl.CreateBuffer(_context, MemFlags.ReadOnly, (IntPtr)(8 * sizeof(uint)), out error);
+            ThrowIfError(error, "create precomputed-cv buffer");
             _block1Buffer = Cl.CreateBuffer(_context, MemFlags.ReadOnly, (IntPtr)(16 * sizeof(uint)), out error);
             ThrowIfError(error, "create block1 buffer");
             _block2Buffer = Cl.CreateBuffer(_context, MemFlags.ReadOnly, (IntPtr)(16 * sizeof(uint)), out error);
             ThrowIfError(error, "create block2 buffer");
-            _targetBuffer = Cl.CreateBuffer(_context, MemFlags.ReadOnly, (IntPtr)32, out error);
+            _targetBuffer = Cl.CreateBuffer(_context, MemFlags.ReadOnly, (IntPtr)(8 * sizeof(uint)), out error);
             ThrowIfError(error, "create target buffer");
             _foundFlagBuffer = Cl.CreateBuffer(_context, MemFlags.ReadWrite | MemFlags.CopyHostPtr, (IntPtr)sizeof(int), _foundFlagHost, out error);
             ThrowIfError(error, "create found-flag buffer");
@@ -384,8 +414,8 @@ namespace Qado.Mining
             _foundHashBuffer = Cl.CreateBuffer(_context, MemFlags.ReadWrite | MemFlags.CopyHostPtr, (IntPtr)_foundHashHost.Length, _foundHashHost, out error);
             ThrowIfError(error, "create found-hash buffer");
 
-            error = Cl.SetKernelArg(_kernel, 0, _block0Buffer);
-            ThrowIfError(error, "bind block0 buffer");
+            error = Cl.SetKernelArg(_kernel, 0, _precomputedCvBuffer);
+            ThrowIfError(error, "bind precomputed-cv buffer");
             error = Cl.SetKernelArg(_kernel, 1, _block1Buffer);
             ThrowIfError(error, "bind block1 buffer");
             error = Cl.SetKernelArg(_kernel, 2, _block2Buffer);
@@ -399,7 +429,67 @@ namespace Qado.Mining
             error = Cl.SetKernelArg(_kernel, 7, _foundHashBuffer);
             ThrowIfError(error, "bind found-hash buffer");
 
+            ConfigureLaunchDimensions();
             _initialized = true;
+        }
+
+        private void ConfigureLaunchDimensions()
+        {
+            _configuredLocalWorkSize = 0;
+            _localWorkSize = null;
+
+            try
+            {
+                ErrorCode error;
+                long maxWorkGroupSize = 0;
+                var raw = Cl.GetKernelWorkGroupInfo(_kernel, _device.DeviceHandle, KernelWorkGroupInfo.WorkGroupSize, out error);
+                if (error == ErrorCode.Success)
+                    maxWorkGroupSize = raw.CastTo<IntPtr>().ToInt64();
+
+                for (int i = 0; i < _preferredLocalWorkSizes.Length; i++)
+                {
+                    int candidate = _preferredLocalWorkSizes[i];
+                    if (candidate > maxWorkGroupSize)
+                        continue;
+                    if ((HashBatchSize % candidate) != 0)
+                        continue;
+
+                    _configuredLocalWorkSize = candidate;
+                    _localWorkSize = new[] { (IntPtr)candidate };
+                    break;
+                }
+            }
+            catch
+            {
+                _configuredLocalWorkSize = 0;
+                _localWorkSize = null;
+            }
+
+            _log?.Info(
+                "Mining",
+                _configuredLocalWorkSize > 0
+                    ? $"OpenCL launch config: profile={_tuningProfileName}, global={HashBatchSize}, local={_configuredLocalWorkSize}."
+                    : $"OpenCL launch config: profile={_tuningProfileName}, global={HashBatchSize}, local=auto.");
+        }
+
+        private static (string ProfileName, int[] PreferredLocalWorkSizes, string BuildOptions) ResolveTuningProfile(OpenClMiningDevice device)
+        {
+            string vendor = (device.Vendor ?? string.Empty).Trim().ToLowerInvariant();
+            string platform = (device.PlatformName ?? string.Empty).Trim().ToLowerInvariant();
+            string combined = vendor + "|" + platform;
+
+            if (combined.Contains("nvidia", StringComparison.Ordinal))
+                return ("nvidia-default", new[] { 256, 128, 512, 64, 32 }, string.Empty);
+
+            if (combined.Contains("advanced micro devices", StringComparison.Ordinal) ||
+                combined.Contains("amd", StringComparison.Ordinal) ||
+                combined.Contains("ati", StringComparison.Ordinal))
+                return ("amd-default", new[] { 256, 512, 128, 64, 32 }, string.Empty);
+
+            if (combined.Contains("intel", StringComparison.Ordinal))
+                return ("intel-default", new[] { 128, 64, 256, 32 }, string.Empty);
+
+            return ("generic", new[] { 256, 128, 64, 32 }, string.Empty);
         }
 
         private string SafeBuildLog()
@@ -461,10 +551,10 @@ namespace Qado.Mining
 
             try
             {
-                if (_block0Buffer != null) Cl.ReleaseMemObject(_block0Buffer);
+                if (_precomputedCvBuffer != null) Cl.ReleaseMemObject(_precomputedCvBuffer);
             }
             catch { }
-            _block0Buffer = null;
+            _precomputedCvBuffer = null;
 
             try
             {
@@ -494,6 +584,8 @@ namespace Qado.Mining
             catch { }
             _context = default;
 
+            _configuredLocalWorkSize = 0;
+            _localWorkSize = null;
             _initialized = false;
         }
 
@@ -524,6 +616,109 @@ namespace Qado.Mining
             for (int i = 0; i < 16; i++)
                 dst[i] = BinaryPrimitives.ReadUInt32LittleEndian(block.AsSpan(i * 4, 4));
         }
+
+        private static void WriteTargetWords(byte[] target, uint[] dst)
+        {
+            for (int i = 0; i < 8; i++)
+                dst[i] = BinaryPrimitives.ReadUInt32BigEndian(target.AsSpan(i * 4, 4));
+        }
+
+        private static void PrecomputeChunk0Cv(uint[] block0Words, uint[] dstCv)
+        {
+            Span<uint> cv = stackalloc uint[8]
+            {
+                0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
+                0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u
+            };
+
+            var blockWords = new uint[16];
+            Array.Copy(block0Words, blockWords, 16);
+
+            Span<uint> outWords = stackalloc uint[16];
+            CompressWordsCpu(cv, blockWords, 0u, 0u, 64u, 1u, outWords);
+
+            for (int i = 0; i < 8; i++)
+                dstCv[i] = outWords[i];
+        }
+
+        private static void CompressWordsCpu(
+            ReadOnlySpan<uint> cv,
+            uint[] blockWords,
+            uint counterLow,
+            uint counterHigh,
+            uint blockLen,
+            uint flags,
+            Span<uint> outWords)
+        {
+            uint[] v = new uint[16];
+            for (int i = 0; i < 8; i++) v[i] = cv[i];
+            v[8] = 0x6A09E667u;
+            v[9] = 0xBB67AE85u;
+            v[10] = 0x3C6EF372u;
+            v[11] = 0xA54FF53Au;
+            v[12] = counterLow;
+            v[13] = counterHigh;
+            v[14] = blockLen;
+            v[15] = flags;
+
+            RoundFnCpu(v, blockWords);
+            PermuteCpu(blockWords);
+            RoundFnCpu(v, blockWords);
+            PermuteCpu(blockWords);
+            RoundFnCpu(v, blockWords);
+            PermuteCpu(blockWords);
+            RoundFnCpu(v, blockWords);
+            PermuteCpu(blockWords);
+            RoundFnCpu(v, blockWords);
+            PermuteCpu(blockWords);
+            RoundFnCpu(v, blockWords);
+            PermuteCpu(blockWords);
+            RoundFnCpu(v, blockWords);
+
+            for (int i = 0; i < 8; i++)
+            {
+                outWords[i] = v[i] ^ v[i + 8];
+                outWords[i + 8] = v[i + 8] ^ cv[i];
+            }
+        }
+
+        private static void RoundFnCpu(uint[] v, uint[] m)
+        {
+            GCpu(ref v[0], ref v[4], ref v[8], ref v[12], m[0], m[1]);
+            GCpu(ref v[1], ref v[5], ref v[9], ref v[13], m[2], m[3]);
+            GCpu(ref v[2], ref v[6], ref v[10], ref v[14], m[4], m[5]);
+            GCpu(ref v[3], ref v[7], ref v[11], ref v[15], m[6], m[7]);
+
+            GCpu(ref v[0], ref v[5], ref v[10], ref v[15], m[8], m[9]);
+            GCpu(ref v[1], ref v[6], ref v[11], ref v[12], m[10], m[11]);
+            GCpu(ref v[2], ref v[7], ref v[8], ref v[13], m[12], m[13]);
+            GCpu(ref v[3], ref v[4], ref v[9], ref v[14], m[14], m[15]);
+        }
+
+        private static void PermuteCpu(uint[] m)
+        {
+            uint[] t = new uint[16];
+            t[0] = m[2]; t[1] = m[6]; t[2] = m[3]; t[3] = m[10];
+            t[4] = m[7]; t[5] = m[0]; t[6] = m[4]; t[7] = m[13];
+            t[8] = m[1]; t[9] = m[11]; t[10] = m[12]; t[11] = m[5];
+            t[12] = m[9]; t[13] = m[14]; t[14] = m[15]; t[15] = m[8];
+            Array.Copy(t, m, 16);
+        }
+
+        private static void GCpu(ref uint a, ref uint b, ref uint c, ref uint d, uint mx, uint my)
+        {
+            a = a + b + mx;
+            d = RotateRight(d ^ a, 16);
+            c = c + d;
+            b = RotateRight(b ^ c, 12);
+            a = a + b + my;
+            d = RotateRight(d ^ a, 8);
+            c = c + d;
+            b = RotateRight(b ^ c, 7);
+        }
+
+        private static uint RotateRight(uint value, int shift)
+            => (value >> shift) | (value << (32 - shift));
 
         private static bool TrySumFees(List<Transaction> txs, out ulong totalFees)
         {

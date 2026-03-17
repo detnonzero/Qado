@@ -2,6 +2,24 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.2] - 2026-03-17
+
+### Changed
+- The integrated `OpenCL` miner was tuned substantially for higher throughput:
+  - larger batch-based GPU work scheduling
+  - leaner hot-path queue/read handling
+  - vendor-aware launch defaults for `OpenCL` devices
+- Mining statistics in the GUI were expanded:
+  - `Network hashrate` is now estimated from the last `60` canonical blocks
+  - `Probability to find the next block` is now shown as a percentage derived from local vs. estimated network hashrate
+- Mining/controls layout was hardened for smaller windows:
+  - the top header/key area now remains accessible via scrollable overflow
+  - the left-side control column (`Mining`, `Send Transaction`, `P2P`) now stays reachable inside its own scroll container
+
+### Fixed
+- `OpenCL` mining stats now reset correctly when a new block template starts after an external tip change.
+- Mining stat rows in the GUI were aligned and reformatted for clearer value display.
+
 ## [0.4.1] - 2026-03-16
 
 ### Changed
