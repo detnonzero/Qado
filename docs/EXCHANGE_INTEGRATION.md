@@ -44,6 +44,11 @@ Any client that can reach the API endpoint can use it.
 - `GET /v1/tx/{txid}/confirmations`
 - `POST /v1/tx/broadcast`
 
+### Mining
+
+- `POST /v1/mining/job`
+- `POST /v1/mining/submit`
+
 `txid` must be 64-char lowercase hex.
 
 ## Broadcast request body
@@ -54,6 +59,28 @@ Any client that can reach the API endpoint can use it.
 {
   "raw_tx_hex": "f0ab...",
   "idempotency_key": "optional-exchange-key-123"
+}
+```
+
+## Mining job request body
+
+`POST /v1/mining/job`
+
+```json
+{
+  "miner": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}
+```
+
+## Mining submit request body
+
+`POST /v1/mining/submit`
+
+```json
+{
+  "job_id": "0123456789abcdef0123456789abcdef",
+  "nonce": "123456789",
+  "timestamp": "1770000001"
 }
 ```
 
@@ -105,6 +132,36 @@ Any client that can reach the API endpoint can use it.
 }
 ```
 
+`POST /v1/mining/job`
+
+```json
+{
+  "job_id": "0123456789abcdef0123456789abcdef",
+  "height": "15235",
+  "prev_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "target": "0000000000000000000000000000000000000000000000000000000001234567",
+  "timestamp": "1770000000",
+  "merkle_root": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "coinbase_amount": "20000000000",
+  "tx_count": 12,
+  "header_hex_zero_nonce": "....",
+  "precomputed_cv": "....",
+  "block1_base": "....",
+  "block2": "....",
+  "target_words": ["00000000","00000000","00000000","00000000","00000000","00000000","00000001","23456789"]
+}
+```
+
+`POST /v1/mining/submit`
+
+```json
+{
+  "accepted": true,
+  "hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "height": "15235"
+}
+```
+
 ## Three cURL smoke tests
 
 ### 1) Health
@@ -127,9 +184,27 @@ curl -sS -X POST http://127.0.0.1:18080/v1/tx/broadcast \
   -d "{\"raw_tx_hex\":\"<SIGNED_RAW_TX_HEX>\",\"idempotency_key\":\"exch-test-001\"}"
 ```
 
+### 4) Mining job
+
+```bash
+curl -sS -X POST http://127.0.0.1:18080/v1/mining/job \
+  -H "Content-Type: application/json" \
+  -d "{\"miner\":\"<MINER_PUBKEY32_HEX>\"}"
+```
+
+### 5) Mining submit
+
+```bash
+curl -sS -X POST http://127.0.0.1:18080/v1/mining/submit \
+  -H "Content-Type: application/json" \
+  -d "{\"job_id\":\"<JOB_ID>\",\"nonce\":\"<NONCE>\",\"timestamp\":\"<TIMESTAMP>\"}"
+```
+
 ## Notes for exchanges
 
 - Use `confirmations` from `/v1/tx/{txid}/confirmations` for deposit credit logic.
 - Treat `status = orphaned` as not confirmed.
 - Amount fields are in atomic units (`decimals = 9` from `/v1/network`).
+- Mining jobs are short-lived in-memory templates tied to the current canonical tip.
+- `submit` only accepts node-generated templates; clients cannot modify coinbase, transaction selection, or merkle composition.
 - For full schema details, see `Qado/docs/exchange-api-v1.openapi.yaml`.

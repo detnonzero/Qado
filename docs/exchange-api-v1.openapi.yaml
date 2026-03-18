@@ -1,10 +1,10 @@
 openapi: 3.1.0
 info:
-  title: Qado Exchange Node API
+  title: Qado Node API
   version: 1.0.0
-  summary: Minimal REST/JSON API schema for exchange listing and wallet integration
+  summary: Minimal REST/JSON API schema for exchange, wallet, and mining integration
   description: |
-    Exchange-facing API for deposits, confirmations, and transaction broadcast.
+    Node-facing API for deposits, confirmations, transaction broadcast, and solo mining.
     All numeric chain values are encoded as decimal strings to avoid precision loss.
     The node API is served as plain HTTP on port 18080 by default.
     TLS termination is intentionally delegated to an external reverse proxy.
@@ -18,6 +18,7 @@ tags:
   - name: Chain
   - name: Address
   - name: Transaction
+  - name: Mining
 paths:
   /v1/health:
     get:
@@ -240,6 +241,94 @@ paths:
           $ref: "#/components/responses/RateLimited"
         "500":
           $ref: "#/components/responses/InternalError"
+  /v1/mining/job:
+    post:
+      tags: [Mining]
+      summary: Create a node-generated mining job template
+      description: |
+        Returns a short-lived solo-mining template tied to the current canonical tip.
+        The node remains responsible for target selection, transaction selection, coinbase creation,
+        merkle composition, final block reconstruction, and consensus validation.
+      operationId: createMiningJob
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MiningJobRequest"
+            examples:
+              default:
+                value:
+                  miner: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      responses:
+        "200":
+          description: Mining job created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MiningJobResponse"
+              examples:
+                default:
+                  value:
+                    job_id: "0123456789abcdef0123456789abcdef"
+                    height: "15235"
+                    prev_hash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    target: "0000000000000000000000000000000000000000000000000000000001234567"
+                    timestamp: "1770000000"
+                    merkle_root: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                    coinbase_amount: "20000000000"
+                    tx_count: 12
+                    header_hex_zero_nonce: "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+                    precomputed_cv: "1111111122222222333333334444444455555555666666667777777788888888"
+                    block1_base: "99999999aaaaaaaa00000000bbbbbbbbccccccccddddddddeeeeeeeeffffffff1111111122222222333333334444444455555555666666667777777788888888"
+                    block2: "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+                    target_words: ["00000000","00000000","00000000","00000000","00000000","00000000","00000001","23456789"]
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/mining/submit:
+    post:
+      tags: [Mining]
+      summary: Submit a found nonce for a node-generated mining job
+      description: |
+        Submits a candidate nonce and timestamp for a previously issued mining job.
+        The node reconstructs the final block from the stored job template, validates the proof of work,
+        checks canonical-tip freshness, and broadcasts only if the block is accepted.
+      operationId: submitMiningJob
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MiningSubmitRequest"
+            examples:
+              default:
+                value:
+                  job_id: "0123456789abcdef0123456789abcdef"
+                  nonce: "123456789"
+                  timestamp: "1770000001"
+      responses:
+        "200":
+          description: Accepted block or structured rejection reason
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MiningSubmitResponse"
+              examples:
+                accepted:
+                  value:
+                    accepted: true
+                    hash: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                    height: "15235"
+                stale:
+                  value:
+                    accepted: false
+                    reason: stale_job
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
 components:
   responses:
     BadRequest:
@@ -277,14 +366,33 @@ components:
       type: string
       pattern: "^[0-9]+$"
       example: "15234"
+    JobIdHex:
+      type: string
+      pattern: "^[a-f0-9]{32}$"
+      example: "0123456789abcdef0123456789abcdef"
     HashHex:
       type: string
       pattern: "^[a-f0-9]{64}$"
       example: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    Hex64Bytes:
+      type: string
+      pattern: "^[a-f0-9]{128}$"
+      example: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+    HeaderHashInputHex:
+      type: string
+      pattern: "^[a-f0-9]{290}$"
+      example: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00000000697cb680000000000000000000000000000000000000000000000000000000012345670000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    UInt32WordHex:
+      type: string
+      pattern: "^[a-f0-9]{8}$"
+      example: "23456789"
     AddressHex:
       type: string
       pattern: "^[a-f0-9]{64}$"
       example: "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+    MiningSubmitReason:
+      type: string
+      enum: [job_not_found, invalid_timestamp, stale_job, invalid_pow, submit_rejected, db_unavailable]
     TxStatus:
       type: string
       enum: [unknown, mempool, confirmed, orphaned]
@@ -453,6 +561,118 @@ components:
           $ref: "#/components/schemas/TxStatus"
         error:
           type: string
+    MiningJobRequest:
+      type: object
+      required: [miner]
+      properties:
+        miner:
+          allOf:
+            - $ref: "#/components/schemas/AddressHex"
+          description: 32-byte miner public key encoded as 64-char lowercase hex.
+    MiningJobResponse:
+      type: object
+      required:
+        - job_id
+        - height
+        - prev_hash
+        - target
+        - timestamp
+        - merkle_root
+        - coinbase_amount
+        - tx_count
+        - header_hex_zero_nonce
+        - precomputed_cv
+        - block1_base
+        - block2
+        - target_words
+      properties:
+        job_id:
+          $ref: "#/components/schemas/JobIdHex"
+        height:
+          $ref: "#/components/schemas/UIntString"
+        prev_hash:
+          $ref: "#/components/schemas/HashHex"
+        target:
+          $ref: "#/components/schemas/HashHex"
+        timestamp:
+          $ref: "#/components/schemas/UIntString"
+        merkle_root:
+          $ref: "#/components/schemas/HashHex"
+        coinbase_amount:
+          $ref: "#/components/schemas/UIntString"
+        tx_count:
+          type: integer
+          minimum: 0
+          example: 12
+        header_hex_zero_nonce:
+          allOf:
+            - $ref: "#/components/schemas/HeaderHashInputHex"
+          description: |
+            Full 145-byte BLAKE3 header input with nonce set to zero.
+            Timestamp starts at byte offset 65 and nonce starts at byte offset 105.
+        precomputed_cv:
+          allOf:
+            - $ref: "#/components/schemas/HashHex"
+          description: |
+            8 little-endian uint32 words encoded as hex.
+            Represents the BLAKE3 chaining value after chunk 0 (bytes 0..63).
+        block1_base:
+          allOf:
+            - $ref: "#/components/schemas/Hex64Bytes"
+          description: |
+            16 little-endian uint32 words encoded as hex.
+            Represents header bytes 64..127 with zero nonce.
+        block2:
+          allOf:
+            - $ref: "#/components/schemas/Hex64Bytes"
+          description: |
+            16 little-endian uint32 words encoded as hex.
+            Represents header bytes 128..144 plus zero-padding to 64 bytes.
+        target_words:
+          type: array
+          minItems: 8
+          maxItems: 8
+          items:
+            $ref: "#/components/schemas/UInt32WordHex"
+          description: 8 big-endian uint32 target words for optimized word-wise comparison.
+    MiningSubmitRequest:
+      type: object
+      required: [job_id, nonce]
+      properties:
+        job_id:
+          $ref: "#/components/schemas/JobIdHex"
+        nonce:
+          $ref: "#/components/schemas/UIntString"
+        timestamp:
+          allOf:
+            - $ref: "#/components/schemas/UIntString"
+          description: |
+            Optional Unix timestamp override in seconds.
+            If present, it must be greater than or equal to the original job timestamp.
+    MiningSubmitAcceptedResponse:
+      type: object
+      required: [accepted, hash, height]
+      properties:
+        accepted:
+          type: boolean
+          const: true
+        hash:
+          $ref: "#/components/schemas/HashHex"
+        height:
+          $ref: "#/components/schemas/UIntString"
+    MiningSubmitRejectedResponse:
+      type: object
+      required: [accepted, reason]
+      properties:
+        accepted:
+          type: boolean
+          const: false
+        reason:
+          $ref: "#/components/schemas/MiningSubmitReason"
+    MiningSubmitResponse:
+      oneOf:
+        - $ref: "#/components/schemas/MiningSubmitAcceptedResponse"
+        - $ref: "#/components/schemas/MiningSubmitRejectedResponse"
     ApiError:
       type: object
       required: [code, message]

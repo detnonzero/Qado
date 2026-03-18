@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.3] - 2026-03-18
+
+### Added
+- A dedicated node mining API for external solo miners:
+  - `POST /v1/mining/job` returns node-generated mining templates plus optimized hashing fields
+  - `POST /v1/mining/submit` accepts `job_id + nonce + timestamp` and reconstructs/validates the block on the node side
+- New miner integration documentation in `docs/MINER_INTEGRATION.md`:
+  - documents the mining flow, request/response bodies, PoW header layout, byte offsets, optimized GPU fields, job lifetime, and submit failure reasons
+
+### Notes
+- External miners no longer need to replicate Qado consensus internals such as target calculation, coinbase construction, merkle building, final block serialization, or direct P2P block submission.
+
+
 ## [0.4.2] - 2026-03-17
 
 ### Changed
