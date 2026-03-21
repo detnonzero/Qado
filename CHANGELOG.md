@@ -2,6 +2,32 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.5.0] - 2026-03-21
+
+### Added
+- Exchange API transaction lookup now accepts optional `block_ref` on:
+  - `GET /v1/tx/{txid}`
+  - `GET /v1/tx/{txid}/confirmations`
+  - this disambiguates one specific block occurrence when deterministic coinbase txids repeat across blocks
+
+### Changed
+- Exchange integration docs and the OpenAPI spec now clarify that deterministic coinbase `txid`s can repeat across blocks:
+  - `block_ref` is documented as the way to resolve one specific payout occurrence
+  - `GET /v1/address/{address}/incoming` plus `event_id` remains the recommended incremental polling path
+
+### Notes
+- SelfTest coverage now includes repeated deterministic coinbase lookups resolved through `block_ref`.
+
+### Fixed
+- Sync/recovery validation now preserves stable FIFO processing and no longer amplifies ancestor recovery into synthetic orphan cascades.
+- Already-buffered orphans no longer retrigger parent-pack requests, resync nudges, or repeated orphan-buffer log spam.
+
+## [0.4.4] - 2026-03-18
+- A new address incoming-events API for incremental pool/exchange deposit polling:
+  - `GET /v1/address/{address}/incoming` returns canonical incoming transfer events for one address
+  - supports stable polling via `cursor + next_cursor`
+  - supports `limit` and `min_confirmations`
+
 ## [0.4.3] - 2026-03-18
 
 ### Added

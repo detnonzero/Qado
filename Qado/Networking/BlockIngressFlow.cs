@@ -1,4 +1,5 @@
 using System;
+using System.Globalization;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Data.Sqlite;
@@ -262,7 +263,10 @@ namespace Qado.Networking
         {
             if (_tryStoreOrphan(payload, block, peer, peerKey, ingress, out var orphanReason))
             {
-                _log?.Info("P2P", $"{bufferedPrefix}: h={block.BlockHeight} {Hex16(block.BlockHash!)}");
+                if (IsAlreadyBufferedReason(orphanReason))
+                    return;
+
+                _log?.Info("P2P", $"{bufferedPrefix}: h={FormatHeightForLog(block.BlockHeight)} {Hex16(block.BlockHash!)}");
                 _requestParentFromPeer(peer, prevHash, parentRequestSource);
                 _ = _blockDownloadManager.QueueOutOfPlanFallback(prevHash, fallbackSource);
                 if (_shouldRequestMissingHeaderResync())
@@ -365,7 +369,10 @@ namespace Qado.Networking
 
                         if (_tryStoreOrphan(payload, block, peer, peerKey, ingress, out var orphanReason))
                         {
-                            _log?.Info("P2P", $"Out-of-plan orphan buffered: h={block.BlockHeight} {Hex16(block.BlockHash!)}");
+                            if (IsAlreadyBufferedReason(orphanReason))
+                                return;
+
+                            _log?.Info("P2P", $"Out-of-plan orphan buffered: h={FormatHeightForLog(block.BlockHeight)} {Hex16(block.BlockHash!)}");
                             _requestParentFromPeer(peer, prevHash, "out-of-plan-parent");
                             _ = _blockDownloadManager.QueueOutOfPlanFallback(prevHash, "out-of-plan-parent-fallback");
                             if (_shouldRequestMissingHeaderResync())
@@ -469,7 +476,10 @@ namespace Qado.Networking
 
                 if (_tryStoreOrphan(payload, block, peer, peerKey, ingress, out var orphanReason))
                 {
-                    _log?.Info("P2P", $"Orphan buffered: h={block.BlockHeight} {Hex16(block.BlockHash!)}");
+                    if (IsAlreadyBufferedReason(orphanReason))
+                        return;
+
+                    _log?.Info("P2P", $"Orphan buffered: h={FormatHeightForLog(block.BlockHeight)} {Hex16(block.BlockHash!)}");
                     _requestParentFromPeer(peer, prevHash, "orphan-parent");
                     _ = _blockDownloadManager.QueueOutOfPlanFallback(prevHash, "orphan-parent-fallback");
                     if (_shouldRequestMissingHeaderResync())
@@ -536,7 +546,10 @@ namespace Qado.Networking
                     {
                         if (_tryStoreOrphan(payload, block, peer, peerKey, ingress, out var orphanReason))
                         {
-                            _log?.Info("P2P", $"Sidechain deferred (parent missing): h={block.BlockHeight} {Hex16(block.BlockHash!)}");
+                            if (IsAlreadyBufferedReason(orphanReason))
+                                return;
+
+                            _log?.Info("P2P", $"Sidechain deferred (parent missing): h={FormatHeightForLog(block.BlockHeight)} {Hex16(block.BlockHash!)}");
                             _requestParentFromPeer(peer, prevHash, "sidechain-parent");
                             _ = _blockDownloadManager.QueueOutOfPlanFallback(prevHash, "sidechain-parent-fallback");
                             if (_shouldRequestMissingHeaderResync())
@@ -746,6 +759,12 @@ namespace Qado.Networking
 
             return reason.IndexOf("previous block missing", StringComparison.OrdinalIgnoreCase) >= 0;
         }
+
+        private static bool IsAlreadyBufferedReason(string? reason)
+            => string.Equals(reason, "already buffered", StringComparison.Ordinal);
+
+        private static string FormatHeightForLog(ulong height)
+            => height == 0UL ? "?" : height.ToString(CultureInfo.InvariantCulture);
 
         private static bool IsTipMovedReason(string? reason)
         {

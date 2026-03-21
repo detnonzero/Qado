@@ -3,9 +3,14 @@ using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Net.Sockets;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using NSec.Cryptography;
+using Qado.Api;
 using Qado.Blockchain;
 using Qado.Logging;
 using Qado.Mempool;
@@ -46,6 +51,7 @@ internal static class Program
         new TestCase("KeyStore_EncryptsAtRest", TestKeyStoreEncryptsAtRest),
         new TestCase("Merkle_DomainSeparation_Profile", TestMerkleDomainSeparationProfile),
         new TestCase("TxId_CommitsSignature", TestTxIdCommitsSignature),
+        new TestCase("ExchangeApi_TxLookup_BlockRefDisambiguatesDeterministicCoinbase", TestExchangeApiTxLookupBlockRefDisambiguatesDeterministicCoinbase),
         new TestCase("BlockSerializer_RejectsInvalidTarget", TestBlockSerializerRejectsInvalidTarget),
         new TestCase("BlockValidator_TipValidation_WorksInsideTransaction", TestBlockValidatorTipValidationWorksInsideTransaction),
         new TestCase("BlockValidator_AcceptsLegacyLongMaxNonceBoundary", TestBlockValidatorAcceptsLegacyLongMaxNonceBoundary),
@@ -66,6 +72,7 @@ internal static class Program
         new TestCase("BulkSyncRuntime_CommitsChunkIntoCanonicalChain", TestBulkSyncRuntimeCommitsChunkIntoCanonicalChain),
         new TestCase("BulkSyncRuntime_MoreAvailable_KeepsGateAndContinuesBatch", TestBulkSyncRuntimeMoreAvailableKeepsGateAndContinuesBatch),
         new TestCase("BlockIngressFlow_LiveOrphanRequestsParentAndPromotesAcceptedParent", TestBlockIngressFlowLiveOrphanRequestsParentAndPromotesAcceptedParent),
+        new TestCase("BlockIngressFlow_AlreadyBufferedOrphanDoesNotReRequestParent", TestBlockIngressFlowAlreadyBufferedOrphanDoesNotReRequestParent),
         new TestCase("ValidationWorker_PrioritizesLivePush", TestValidationWorkerPrioritizesLivePush),
         new TestCase("BlockDownloadManager_RequestsRecoveryViaAncestorPack", TestBlockDownloadManagerRequestsRecoveryViaAncestorPack),
         new TestCase("BlockSyncClient_TipStateStartsSyncWithoutLegacyGetTip", TestBlockSyncClientTipStateStartsSyncWithoutLegacyGetTip),
@@ -550,6 +557,90 @@ internal static class Program
         var rootA = MerkleUtil.ComputeMerkleRootFromTransactions(new List<Transaction> { tx });
         var rootB = MerkleUtil.ComputeMerkleRootFromTransactions(new List<Transaction> { txMut });
         Assert(!rootA.SequenceEqual(rootB), "merkle root must commit signature bytes via txid");
+    }
+
+    private static void TestExchangeApiTxLookupBlockRefDisambiguatesDeterministicCoinbase()
+    {
+        var mempool = new MempoolManager(
+            senderHex => StateStore.GetBalanceU64(senderHex),
+            senderHex => StateStore.GetNonceU64(senderHex),
+            log: null);
+
+        var genesis = BlockStore.GetBlockByHeight(0) ?? throw new InvalidOperationException("missing genesis block");
+        var genesisHash = genesis.BlockHash ?? throw new InvalidOperationException("missing genesis hash");
+        ulong genesisTimestamp = genesis.Header?.Timestamp ?? (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+        var miner = KeyGenerator.GenerateKeypairHex();
+
+        var block1 = BuildMinedBlock(
+            height: 1,
+            prevHash: genesisHash,
+            timestamp: genesisTimestamp + 60UL,
+            minerPubHex: miner.pubHex);
+        BlockPersistHelper.Persist(block1, mempool: mempool);
+
+        var block1Hash = block1.BlockHash ?? throw new InvalidOperationException("missing block1 hash");
+        var block2 = BuildMinedBlock(
+            height: 2,
+            prevHash: block1Hash,
+            timestamp: genesisTimestamp + 120UL,
+            minerPubHex: miner.pubHex);
+        BlockPersistHelper.Persist(block2, mempool: mempool);
+
+        Assert(BlockStore.GetLatestHeight() == 2UL, "expected canonical tip height 2");
+
+        var coinbase1 = block1.Transactions[0];
+        var coinbase2 = block2.Transactions[0];
+        var txid1 = coinbase1.ComputeTransactionHash();
+        var txid2 = coinbase2.ComputeTransactionHash();
+        Assert(txid1.SequenceEqual(txid2), "test setup must create the same deterministic coinbase txid twice");
+
+        string txidHex = Convert.ToHexString(txid1).ToLowerInvariant();
+        string block1HashHex = Convert.ToHexString(block1Hash).ToLowerInvariant();
+        string block2HashHex = Convert.ToHexString(block2.BlockHash ?? throw new InvalidOperationException("missing block2 hash")).ToLowerInvariant();
+
+        int port = GetFreeTcpPort();
+        using var host = new ExchangeApiHost(mempool, () => null, log: null);
+        using var client = new HttpClient
+        {
+            BaseAddress = new Uri($"http://127.0.0.1:{port}"),
+            Timeout = TimeSpan.FromSeconds(10)
+        };
+
+        host.StartAsync(port).GetAwaiter().GetResult();
+        try
+        {
+            using var defaultLookup = GetJson(client, $"/v1/tx/{txidHex}");
+            Assert(
+                defaultLookup.RootElement.GetProperty("block_height").GetString() == "2",
+                "txid-only lookup should continue returning the newest indexed canonical occurrence");
+            Assert(
+                defaultLookup.RootElement.GetProperty("block_hash").GetString() == block2HashHex,
+                "txid-only lookup resolved the wrong canonical occurrence");
+
+            using var heightScopedLookup = GetJson(client, $"/v1/tx/{txidHex}?block_ref=1");
+            Assert(
+                heightScopedLookup.RootElement.GetProperty("block_height").GetString() == "1",
+                "block_ref height should resolve the specific height-1 occurrence");
+            Assert(
+                heightScopedLookup.RootElement.GetProperty("block_hash").GetString() == block1HashHex,
+                "block_ref height resolved the wrong block hash");
+
+            using var hashScopedConfirmations = GetJson(client, $"/v1/tx/{txidHex}/confirmations?block_ref={block1HashHex}");
+            Assert(
+                hashScopedConfirmations.RootElement.GetProperty("block_height").GetString() == "1",
+                "block_ref hash should resolve confirmations for the requested block");
+            Assert(
+                hashScopedConfirmations.RootElement.GetProperty("confirmations").GetString() == "2",
+                "height-1 occurrence should have two confirmations at tip height 2");
+            Assert(
+                hashScopedConfirmations.RootElement.GetProperty("tip_height").GetString() == "2",
+                "confirmations response must report the current tip height");
+        }
+        finally
+        {
+            host.StopAsync().GetAwaiter().GetResult();
+        }
     }
 
     private static void TestBlockSerializerRejectsInvalidTarget()
@@ -1440,6 +1531,74 @@ internal static class Program
         Assert(BytesEqual(promotedParent, parent.BlockHash!), "accepted parent must trigger orphan promotion callback");
     }
 
+    private static void TestBlockIngressFlowAlreadyBufferedOrphanDoesNotReRequestParent()
+    {
+        var peer = CreateFakePeer("peer-ingress-orphan-duplicate");
+        var mempool = new MempoolManager(
+            senderHex => StateStore.GetBalanceU64(senderHex),
+            senderHex => StateStore.GetNonceU64(senderHex),
+            log: null);
+        var log = new ListLogSink();
+        int parentRequests = 0;
+        int syncRequests = 0;
+        string invalidReason = string.Empty;
+
+        var client = CreateNoopBlockSyncClient(peer, 0UL, new byte[32]);
+        var downloadManager = new BlockDownloadManager(
+            sessionSnapshot: () => new[] { peer },
+            sendFrameAsync: (targetPeer, type, payload, ct) => Task.CompletedTask,
+            haveBlock: _ => false,
+            enqueueValidator: _ => true,
+            revalidateStoredBlock: _ => { },
+            log: log);
+        var flow = new BlockIngressFlow(
+            blockDownloadManager: downloadManager,
+            blockSyncClient: client,
+            mempool: mempool,
+            getPeerKey: targetPeer => targetPeer.SessionKey,
+            allowInboundBlock: _ => true,
+            shouldRequestMissingHeaderResync: () => true,
+            requestSyncNow: _ => syncRequests++,
+            tryStoreOrphan: (byte[] payload, Block block, PeerSession targetPeer, string peerKey, BlockIngressKind ingress, out string reason) =>
+            {
+                reason = "already buffered";
+                return true;
+            },
+            requestParentFromPeer: (_, _, _) => parentRequests++,
+            markStoredBlockInvalid: (_, _, reason) => invalidReason = reason,
+            passesSidechainAdmission: (Block block, byte[]? canonicalTipHash, ulong prevHeight, int payloadBytes, out string reason) =>
+            {
+                reason = string.Empty;
+                return true;
+            },
+            logKnownBlockAlready: _ => { },
+            notifyUiAfterAcceptedBlock: () => { },
+            relayValidatedBlockAsync: (_, _, _) => Task.CompletedTask,
+            promoteOrphansForParentAsync: (_, _, _) => Task.CompletedTask,
+            log: log);
+
+        byte[] missingParentHash = HashFromU64(80_001UL);
+        var orphanMiner = KeyGenerator.GenerateKeypairHex();
+        var orphan = BuildLooseMinedBlock(
+            height: 2UL,
+            prevHash: missingParentHash,
+            timestamp: (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            minerPubHex: orphanMiner.pubHex);
+        Assert(
+            BlockValidator.ValidateNetworkOrphanBlockStateless(orphan, out var orphanReason),
+            $"loose duplicate-orphan helper built invalid block: {orphanReason}");
+
+        flow.HandleBlockAsync(SerializeBlock(orphan), peer, CancellationToken.None, BlockIngressKind.Recovery, enforceRateLimitOverride: false)
+            .GetAwaiter().GetResult();
+
+        Assert(parentRequests == 0, "already buffered orphan must not request the parent again");
+        Assert(syncRequests == 0, "already buffered orphan must not request another resync");
+        Assert(string.IsNullOrEmpty(invalidReason), $"duplicate orphan path should stay non-invalid, got: {invalidReason}");
+        Assert(!downloadManager.IsOutOfPlanFallbackHash(missingParentHash), "already buffered orphan must not re-arm out-of-plan fallback");
+        Assert(!log.Lines.Any(line => line.Contains("buffered", StringComparison.OrdinalIgnoreCase)),
+            $"duplicate orphan path must stay quiet, logs={string.Join(" || ", log.Lines)}");
+    }
+
     private static void TestValidationWorkerPrioritizesLivePush()
     {
         var peer = CreateFakePeer("validation-priority-peer");
@@ -2089,6 +2248,23 @@ internal static class Program
         for (int i = 0; i < a.Length; i++)
             if (a[i] != b[i]) return false;
         return true;
+    }
+
+    private static int GetFreeTcpPort()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        return ((IPEndPoint)listener.LocalEndpoint).Port;
+    }
+
+    private static JsonDocument GetJson(HttpClient client, string path)
+    {
+        using var response = client.GetAsync(path).GetAwaiter().GetResult();
+        string body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+        if (!response.IsSuccessStatusCode)
+            throw new InvalidOperationException($"GET {path} failed with {(int)response.StatusCode}: {body}");
+
+        return JsonDocument.Parse(body);
     }
 
     private static BlockSyncClient CreateNoopBlockSyncClient(PeerSession peer, UInt128 localTipChainwork, byte[] localTipHash)

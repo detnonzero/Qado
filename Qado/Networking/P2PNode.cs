@@ -224,8 +224,9 @@ namespace Qado.Networking
             _listener.Server.ExclusiveAddressUse = true;
             _listener.Start();
 
-            int workerCount = Math.Max(1, Environment.ProcessorCount / 2);
-            _validationWorker.Start(workerCount, ct);
+            // Validation is serialized by _validationSerializeGate, so one dispatcher
+            // preserves FIFO for sync/recovery payloads and avoids synthetic orphan cascades.
+            _validationWorker.Start(1, ct);
             _blockDownloadManager.Start(ct);
 
             _ = AcceptLoop(ct);

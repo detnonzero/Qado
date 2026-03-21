@@ -35,6 +35,7 @@ Any client that can reach the API endpoint can use it.
 ### Address
 
 - `GET /v1/address/{address}`
+- `GET /v1/address/{address}/incoming`
 
 `address` must be 64-char lowercase hex.
 
@@ -50,6 +51,9 @@ Any client that can reach the API endpoint can use it.
 - `POST /v1/mining/submit`
 
 `txid` must be 64-char lowercase hex.
+
+Optional query parameter on both transaction `GET` endpoints:
+- `block_ref=<height|hash>` to resolve one specific block occurrence of a transaction
 
 ## Broadcast request body
 
@@ -108,7 +112,7 @@ Any client that can reach the API endpoint can use it.
 }
 ```
 
-`GET /v1/tx/{txid}/confirmations`
+`GET /v1/tx/{txid}/confirmations?block_ref=15216`
 
 ```json
 {
@@ -118,6 +122,37 @@ Any client that can reach the API endpoint can use it.
   "block_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
   "block_height": "15216",
   "tip_height": "15234"
+}
+```
+
+For deterministic coinbase transactions, the same `txid` can legitimately appear in multiple blocks. Use `block_ref` or the address incoming-event context when you need one specific payout occurrence.
+
+`GET /v1/address/{address}/incoming?cursor=<CURSOR>&limit=200&min_confirmations=6`
+
+```json
+{
+  "address": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "tip_height": "15234",
+  "next_cursor": "15210:3:0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "items": [
+    {
+      "event_id": "15210:3:0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "txid": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "status": "confirmed",
+      "block_height": "15210",
+      "block_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "confirmations": "25",
+      "timestamp_utc": "2026-02-12T10:12:03.0000000Z",
+      "to_address": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "amount_atomic": "2500000000",
+      "from_address": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "from_addresses": [
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      ],
+      "tx_index": 3,
+      "transfer_index": 0
+    }
+  ]
 }
 ```
 
@@ -203,6 +238,10 @@ curl -sS -X POST http://127.0.0.1:18080/v1/mining/submit \
 ## Notes for exchanges
 
 - Use `confirmations` from `/v1/tx/{txid}/confirmations` for deposit credit logic.
+- For deterministic coinbase lookups, pass `block_ref` on `/v1/tx/{txid}` or `/v1/tx/{txid}/confirmations` to disambiguate a specific block occurrence.
+- Prefer `GET /v1/address/{address}/incoming` plus `event_id` for incremental deposit polling.
+- The incoming-events `cursor` is opaque; persist and replay `next_cursor` exactly as returned.
+- Incoming events are canonical-only and currently return `status = confirmed`.
 - Treat `status = orphaned` as not confirmed.
 - Amount fields are in atomic units (`decimals = 9` from `/v1/network`).
 - Mining jobs are short-lived in-memory templates tied to the current canonical tip.

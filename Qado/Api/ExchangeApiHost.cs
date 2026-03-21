@@ -192,29 +192,19 @@ namespace Qado.Api
 
             app.MapGet("/v1/block/{block_ref}", (string block_ref, HttpContext http) =>
             {
-                Block? block = null;
-                byte[]? blockHash = null;
-                ulong blockHeight = 0;
-
-                if (ulong.TryParse(block_ref, NumberStyles.None, CultureInfo.InvariantCulture, out var parsedHeight))
+                if (!TryResolveBlockReference(
+                    block_ref,
+                    out var block,
+                    out var blockHash,
+                    out var blockHeight,
+                    out var errorCode,
+                    out var errorMessage,
+                    out var errorStatusCode))
                 {
-                    blockHeight = parsedHeight;
-                    blockHash = BlockStore.GetCanonicalHashAtHeight(parsedHeight);
-                    block = BlockStore.GetBlockByHeight(parsedHeight);
+                    return errorStatusCode == StatusCodes.Status400BadRequest
+                        ? BadRequest(Error(errorCode, errorMessage, http))
+                        : NotFound(Error(errorCode, errorMessage, http));
                 }
-                else if (TryParseHex32(block_ref, out var parsedHash))
-                {
-                    blockHash = parsedHash;
-                    block = BlockStore.GetBlockByHash(parsedHash);
-                    blockHeight = block?.BlockHeight ?? 0;
-                }
-                else
-                {
-                    return BadRequest(Error("invalid_block_ref", "block_ref must be decimal height or 64-char lowercase hash.", http));
-                }
-
-                if (block is null || blockHash is not { Length: 32 })
-                    return NotFound(Error("block_not_found", "Block was not found.", http));
 
                 var txids = new List<string>(block.Transactions.Count);
                 for (int i = 0; i < block.Transactions.Count; i++)
@@ -254,13 +244,47 @@ namespace Qado.Api
                 });
             });
 
-            app.MapGet("/v1/tx/{txid}", (string txid, HttpContext http) =>
+            app.MapGet("/v1/address/{address}/incoming", (string address, string? cursor, int? limit, int? min_confirmations, HttpContext http) =>
+            {
+                if (!TryNormalizeHex32(address, out var addrHex))
+                    return BadRequest(Error("invalid_address", "address must be 64-char lowercase hex.", http));
+
+                int limitValue = limit ?? 200;
+                if (limitValue < 1 || limitValue > 1000)
+                    return BadRequest(Error("invalid_limit", "limit must be between 1 and 1000.", http));
+
+                int minConfirmationsValue = min_confirmations ?? 0;
+                if (minConfirmationsValue < 0)
+                    return BadRequest(Error("invalid_min_confirmations", "min_confirmations must be >= 0.", http));
+
+                if (!TryBuildIncomingAddressEventsResponse(
+                    addrHex,
+                    cursor,
+                    limitValue,
+                    minConfirmationsValue,
+                    out var response,
+                    out var errorCode,
+                    out var errorMessage))
+                {
+                    return BadRequest(Error(errorCode, errorMessage, http));
+                }
+
+                return Results.Json(response);
+            });
+
+            app.MapGet("/v1/tx/{txid}", (string txid, string? block_ref, HttpContext http) =>
             {
                 if (!TryParseHex32(txid, out var txidBytes))
                     return BadRequest(Error("invalid_txid", "txid must be 64-char lowercase hex.", http));
 
                 var tipHeight = BlockStore.GetLatestHeight();
-                if (TryGetIndexedTransaction(txidBytes, out var hit))
+                if (TryGetIndexedTransaction(
+                    txidBytes,
+                    block_ref,
+                    out var hit,
+                    out var errorCode,
+                    out var errorMessage,
+                    out var errorStatusCode))
                 {
                     var confirmations = hit.IsCanonical && tipHeight >= hit.BlockHeight
                         ? U64((tipHeight - hit.BlockHeight) + 1UL)
@@ -283,6 +307,13 @@ namespace Qado.Api
                     });
                 }
 
+                if (!string.IsNullOrWhiteSpace(block_ref))
+                {
+                    return errorStatusCode == StatusCodes.Status400BadRequest
+                        ? BadRequest(Error(errorCode, errorMessage, http))
+                        : NotFound(Error(errorCode, errorMessage, http));
+                }
+
                 if (TryGetMempoolTransaction(txidBytes, out var memTx))
                 {
                     return Results.Json(new
@@ -302,13 +333,19 @@ namespace Qado.Api
                 return NotFound(Error("tx_not_found", "Transaction was not found.", http));
             });
 
-            app.MapGet("/v1/tx/{txid}/confirmations", (string txid, HttpContext http) =>
+            app.MapGet("/v1/tx/{txid}/confirmations", (string txid, string? block_ref, HttpContext http) =>
             {
                 if (!TryParseHex32(txid, out var txidBytes))
                     return BadRequest(Error("invalid_txid", "txid must be 64-char lowercase hex.", http));
 
                 var tipHeight = BlockStore.GetLatestHeight();
-                if (TryGetIndexedTransaction(txidBytes, out var hit))
+                if (TryGetIndexedTransaction(
+                    txidBytes,
+                    block_ref,
+                    out var hit,
+                    out var errorCode,
+                    out var errorMessage,
+                    out var errorStatusCode))
                 {
                     var confirmations = hit.IsCanonical && tipHeight >= hit.BlockHeight
                         ? U64((tipHeight - hit.BlockHeight) + 1UL)
@@ -323,6 +360,13 @@ namespace Qado.Api
                         block_height = U64(hit.BlockHeight),
                         tip_height = U64(tipHeight)
                     });
+                }
+
+                if (!string.IsNullOrWhiteSpace(block_ref))
+                {
+                    return errorStatusCode == StatusCodes.Status400BadRequest
+                        ? BadRequest(Error(errorCode, errorMessage, http))
+                        : NotFound(Error(errorCode, errorMessage, http));
                 }
 
                 if (TryGetMempoolTransaction(txidBytes, out _))
@@ -942,6 +986,53 @@ namespace Qado.Api
         private static uint RotateRight(uint value, int shift)
             => (value >> shift) | (value << (32 - shift));
 
+        private static bool TryResolveBlockReference(
+            string blockRef,
+            out Block block,
+            out byte[] blockHash,
+            out ulong blockHeight,
+            out string errorCode,
+            out string errorMessage,
+            out int errorStatusCode)
+        {
+            block = null!;
+            blockHash = Array.Empty<byte>();
+            blockHeight = 0;
+            errorCode = "ok";
+            errorMessage = "ok";
+            errorStatusCode = StatusCodes.Status200OK;
+
+            if (ulong.TryParse(blockRef, NumberStyles.None, CultureInfo.InvariantCulture, out var parsedHeight))
+            {
+                blockHeight = parsedHeight;
+                blockHash = BlockStore.GetCanonicalHashAtHeight(parsedHeight) ?? Array.Empty<byte>();
+                block = BlockStore.GetBlockByHeight(parsedHeight)!;
+            }
+            else if (TryParseHex32(blockRef, out var parsedHash))
+            {
+                blockHash = parsedHash;
+                block = BlockStore.GetBlockByHash(parsedHash)!;
+                blockHeight = block?.BlockHeight ?? 0;
+            }
+            else
+            {
+                errorCode = "invalid_block_ref";
+                errorMessage = "block_ref must be decimal height or 64-char lowercase hash.";
+                errorStatusCode = StatusCodes.Status400BadRequest;
+                return false;
+            }
+
+            if (block is null || blockHash is not { Length: 32 })
+            {
+                errorCode = "block_not_found";
+                errorMessage = "Block was not found.";
+                errorStatusCode = StatusCodes.Status404NotFound;
+                return false;
+            }
+
+            return true;
+        }
+
         private bool TryGetIndexedTransaction(byte[] txid, out IndexedTxHit hit)
         {
             hit = default;
@@ -952,6 +1043,61 @@ namespace Qado.Api
             var (blockHash, blockHeight, _, _) = idx.Value;
             var block = BlockStore.GetBlockByHash(blockHash);
             if (block is null) return false;
+
+            return TryBuildIndexedTxHit(txid, block, blockHash, blockHeight, out hit);
+        }
+
+        // Deterministic coinbase transactions can repeat across multiple blocks, so
+        // block_ref lets clients resolve one specific occurrence instead of the indexed default.
+        private bool TryGetIndexedTransaction(
+            byte[] txid,
+            string? blockRef,
+            out IndexedTxHit hit,
+            out string errorCode,
+            out string errorMessage,
+            out int errorStatusCode)
+        {
+            hit = default;
+            errorCode = "tx_not_found";
+            errorMessage = "Transaction was not found.";
+            errorStatusCode = StatusCodes.Status404NotFound;
+
+            if (!string.IsNullOrWhiteSpace(blockRef))
+            {
+                if (!TryResolveBlockReference(
+                    blockRef,
+                    out var block,
+                    out var blockHash,
+                    out var blockHeight,
+                    out errorCode,
+                    out errorMessage,
+                    out errorStatusCode))
+                {
+                    return false;
+                }
+
+                if (!TryBuildIndexedTxHit(txid, block, blockHash, blockHeight, out hit))
+                {
+                    errorCode = "tx_not_in_block";
+                    errorMessage = "Transaction was not found in the requested block.";
+                    errorStatusCode = StatusCodes.Status404NotFound;
+                    return false;
+                }
+
+                return true;
+            }
+
+            return TryGetIndexedTransaction(txid, out hit);
+        }
+
+        private static bool TryBuildIndexedTxHit(
+            byte[] txid,
+            Block block,
+            byte[] blockHash,
+            ulong blockHeight,
+            out IndexedTxHit hit)
+        {
+            hit = default;
 
             Transaction? tx = null;
             for (int i = 0; i < block.Transactions.Count; i++)
@@ -1004,11 +1150,213 @@ namespace Qado.Api
             return count;
         }
 
+        private bool TryBuildIncomingAddressEventsResponse(
+            string addressHex,
+            string? rawCursor,
+            int limit,
+            int minConfirmations,
+            out IncomingAddressEventsResponse response,
+            out string errorCode,
+            out string errorMessage)
+        {
+            response = default!;
+            errorCode = "ok";
+            errorMessage = "ok";
+
+            if (!TryParseIncomingCursor(rawCursor, out var cursor))
+            {
+                errorCode = "invalid_cursor";
+                errorMessage = "cursor must be empty or formatted as height:tx_index:transfer_index[:block_hash].";
+                return false;
+            }
+
+            if (Db.Connection == null)
+            {
+                response = new IncomingAddressEventsResponse(
+                    address: addressHex,
+                    tip_height: "0",
+                    next_cursor: cursor?.ToCursorString() ?? "",
+                    items: Array.Empty<IncomingAddressEvent>());
+                return true;
+            }
+
+            lock (Db.Sync)
+            {
+                using var tx = Db.Connection.BeginTransaction();
+
+                ulong tipHeight = BlockStore.GetLatestHeight(tx);
+                var items = new List<IncomingAddressEvent>(Math.Min(limit, 256));
+                string nextCursor = cursor?.ToCursorString() ?? "";
+
+                if (TryGetIncomingMaxEligibleHeight(tipHeight, minConfirmations, out var maxEligibleHeight))
+                {
+                    ulong startHeight = cursor?.Height ?? 0UL;
+
+                    for (ulong height = startHeight; height <= maxEligibleHeight && items.Count < limit; height++)
+                    {
+                        var blockHash = BlockStore.GetCanonicalHashAtHeight(height, tx);
+                        if (blockHash is not { Length: 32 })
+                        {
+                            if (height == ulong.MaxValue) break;
+                            continue;
+                        }
+
+                        var block = BlockStore.GetBlockByHash(blockHash, tx);
+                        if (block?.Header is null || block.Transactions is null)
+                        {
+                            if (height == ulong.MaxValue) break;
+                            continue;
+                        }
+
+                        string blockHashHex = Hex(blockHash);
+                        ulong confirmations = tipHeight >= height
+                            ? (tipHeight - height) + 1UL
+                            : 0UL;
+
+                        for (int txIndex = 0; txIndex < block.Transactions.Count && items.Count < limit; txIndex++)
+                        {
+                            var transaction = block.Transactions[txIndex];
+                            if (transaction == null || transaction.Amount == 0UL)
+                                continue;
+
+                            string toAddress = Hex(transaction.Recipient);
+                            if (!string.Equals(toAddress, addressHex, StringComparison.Ordinal))
+                                continue;
+
+                            if (!IsIncomingEventAfterCursor(height, txIndex, 0, blockHashHex, cursor))
+                                continue;
+
+                            bool isCoinbase = TransactionValidator.IsCoinbase(transaction);
+                            string? fromAddress = isCoinbase ? null : Hex(transaction.Sender);
+                            string[] fromAddresses = fromAddress == null
+                                ? Array.Empty<string>()
+                                : new[] { fromAddress };
+
+                            string eventId = BuildIncomingEventId(height, txIndex, 0, blockHashHex);
+
+                            items.Add(new IncomingAddressEvent(
+                                event_id: eventId,
+                                txid: Hex(transaction.ComputeTransactionHash()),
+                                status: "confirmed",
+                                block_height: U64(height),
+                                block_hash: blockHashHex,
+                                confirmations: U64(confirmations),
+                                timestamp_utc: UnixToIso(block.Header.Timestamp),
+                                to_address: addressHex,
+                                amount_atomic: U64(transaction.Amount),
+                                from_address: fromAddress,
+                                from_addresses: fromAddresses,
+                                tx_index: txIndex,
+                                transfer_index: 0));
+
+                            nextCursor = eventId;
+                        }
+
+                        if (height == ulong.MaxValue) break;
+                    }
+                }
+
+                tx.Commit();
+
+                response = new IncomingAddressEventsResponse(
+                    address: addressHex,
+                    tip_height: U64(tipHeight),
+                    next_cursor: nextCursor,
+                    items: items.ToArray());
+                return true;
+            }
+        }
+
+        private static bool TryGetIncomingMaxEligibleHeight(ulong tipHeight, int minConfirmations, out ulong maxEligibleHeight)
+        {
+            if (minConfirmations <= 1)
+            {
+                maxEligibleHeight = tipHeight;
+                return true;
+            }
+
+            ulong requiredLag = (ulong)(minConfirmations - 1);
+            if (tipHeight < requiredLag)
+            {
+                maxEligibleHeight = 0UL;
+                return false;
+            }
+
+            maxEligibleHeight = tipHeight - requiredLag;
+            return true;
+        }
+
+        private static string BuildIncomingEventId(ulong height, int txIndex, int transferIndex, string blockHashHex)
+            => string.Create(
+                CultureInfo.InvariantCulture,
+                $"{height}:{txIndex}:{transferIndex}:{blockHashHex}");
+
+        private static bool IsIncomingEventAfterCursor(
+            ulong height,
+            int txIndex,
+            int transferIndex,
+            string blockHashHex,
+            IncomingCursor? cursor)
+        {
+            if (cursor is null)
+                return true;
+
+            if (height != cursor.Value.Height)
+                return height > cursor.Value.Height;
+
+            if (txIndex != cursor.Value.TxIndex)
+                return txIndex > cursor.Value.TxIndex;
+
+            if (transferIndex != cursor.Value.TransferIndex)
+                return transferIndex > cursor.Value.TransferIndex;
+
+            if (string.IsNullOrEmpty(cursor.Value.BlockHashHex))
+                return false;
+
+            return !string.Equals(blockHashHex, cursor.Value.BlockHashHex, StringComparison.Ordinal);
+        }
+
+        private static bool TryParseIncomingCursor(string? rawCursor, out IncomingCursor? cursor)
+        {
+            cursor = null;
+
+            if (string.IsNullOrWhiteSpace(rawCursor))
+                return true;
+
+            var parts = rawCursor.Trim().Split(':', StringSplitOptions.None);
+            if (parts.Length != 3 && parts.Length != 4)
+                return false;
+
+            if (!ulong.TryParse(parts[0], NumberStyles.None, CultureInfo.InvariantCulture, out var height))
+                return false;
+            if (!int.TryParse(parts[1], NumberStyles.None, CultureInfo.InvariantCulture, out var txIndex) || txIndex < 0)
+                return false;
+            if (!int.TryParse(parts[2], NumberStyles.None, CultureInfo.InvariantCulture, out var transferIndex) || transferIndex < 0)
+                return false;
+
+            string? blockHashHex = null;
+            if (parts.Length == 4)
+            {
+                if (!TryNormalizeHex32(parts[3], out var normalizedHash))
+                    return false;
+                blockHashHex = normalizedHash;
+            }
+
+            cursor = new IncomingCursor(height, txIndex, transferIndex, blockHashHex);
+            return true;
+        }
+
         private bool TryGetCachedBroadcast(string key, out BroadcastResponsePayload payload)
         {
             payload = default!;
             if (string.IsNullOrWhiteSpace(key)) return false;
-            return _broadcastCache.TryGetValue(key.Trim(), out payload);
+            if (_broadcastCache.TryGetValue(key.Trim(), out var cached))
+            {
+                payload = cached;
+                return true;
+            }
+
+            return false;
         }
 
         private void CacheBroadcast(string? key, BroadcastResponsePayload payload)
@@ -1108,6 +1456,39 @@ namespace Qado.Api
             ulong BlockHeight,
             ulong BlockTimestamp,
             bool IsCanonical);
+
+        private readonly record struct IncomingCursor(
+            ulong Height,
+            int TxIndex,
+            int TransferIndex,
+            string? BlockHashHex)
+        {
+            public string ToCursorString()
+                => string.IsNullOrEmpty(BlockHashHex)
+                    ? string.Create(CultureInfo.InvariantCulture, $"{Height}:{TxIndex}:{TransferIndex}")
+                    : string.Create(CultureInfo.InvariantCulture, $"{Height}:{TxIndex}:{TransferIndex}:{BlockHashHex}");
+        }
+
+        private sealed record IncomingAddressEvent(
+            string event_id,
+            string txid,
+            string status,
+            string block_height,
+            string block_hash,
+            string confirmations,
+            string timestamp_utc,
+            string to_address,
+            string amount_atomic,
+            string? from_address,
+            string[] from_addresses,
+            int tx_index,
+            int transfer_index);
+
+        private sealed record IncomingAddressEventsResponse(
+            string address,
+            string tip_height,
+            string next_cursor,
+            IncomingAddressEvent[] items);
 
         private sealed class BroadcastRequest
         {

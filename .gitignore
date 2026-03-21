@@ -366,6 +366,9 @@ FodyWeavers.xsd
 _tmp_build/
 .dotnet-home/
 .dotnet-cli/
+.dotnetcli/
+tmp/
+Qado.Avalonia/
 selftest*.log
 selftest*.out
 selftest*.err

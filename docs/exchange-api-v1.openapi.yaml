@@ -147,10 +147,83 @@ paths:
           $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalError"
+  /v1/address/{address}/incoming:
+    get:
+      tags: [Address]
+      summary: List canonical incoming transfer events for an address
+      description: |
+        Returns incoming canonical transfer events addressed to the requested account.
+        Events are ordered deterministically by `block_height`, `tx_index`, `transfer_index`.
+        The `cursor` is opaque and currently emitted as
+        `height:tx_index:transfer_index:block_hash`.
+      operationId: getAddressIncoming
+      parameters:
+        - name: address
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/AddressHex"
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Opaque polling cursor returned as `next_cursor`.
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 200
+        - name: min_confirmations
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        "200":
+          description: Incoming canonical events
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AddressIncomingResponse"
+              examples:
+                default:
+                  value:
+                    address: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                    tip_height: "15234"
+                    next_cursor: "15210:3:0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    items:
+                      - event_id: "15210:3:0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        txid: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                        status: confirmed
+                        block_height: "15210"
+                        block_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        confirmations: "25"
+                        timestamp_utc: "2026-02-12T10:12:03Z"
+                        to_address: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                        amount_atomic: "2500000000"
+                        from_address: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        from_addresses:
+                          - "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        tx_index: 3
+                        transfer_index: 0
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
   /v1/tx/{txid}:
     get:
       tags: [Transaction]
       summary: Get transaction by hash
+      description: |
+        Returns one transaction occurrence for the requested `txid`.
+        Optional `block_ref` disambiguates a specific block occurrence when deterministic
+        coinbase transactions repeat across multiple blocks.
       operationId: getTransaction
       parameters:
         - name: txid
@@ -158,6 +231,12 @@ paths:
           required: true
           schema:
             $ref: "#/components/schemas/HashHex"
+        - name: block_ref
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Decimal canonical height or 64-char lowercase block hash for one specific transaction occurrence.
       responses:
         "200":
           description: Transaction status and details
@@ -175,6 +254,10 @@ paths:
     get:
       tags: [Transaction]
       summary: Canonical confirmation status for a transaction
+      description: |
+        Returns confirmation status for one transaction occurrence.
+        Optional `block_ref` disambiguates a specific block occurrence when deterministic
+        coinbase transactions repeat across multiple blocks.
       operationId: getConfirmations
       parameters:
         - name: txid
@@ -182,6 +265,12 @@ paths:
           required: true
           schema:
             $ref: "#/components/schemas/HashHex"
+        - name: block_ref
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Decimal canonical height or 64-char lowercase block hash for one specific transaction occurrence.
       responses:
         "200":
           description: Confirmation status
@@ -492,6 +581,69 @@ components:
           minimum: 0
         latest_observed_height:
           $ref: "#/components/schemas/UIntString"
+    AddressIncomingEvent:
+      type: object
+      required:
+        - event_id
+        - txid
+        - status
+        - block_height
+        - block_hash
+        - confirmations
+        - timestamp_utc
+        - to_address
+        - amount_atomic
+        - from_addresses
+        - tx_index
+        - transfer_index
+      properties:
+        event_id:
+          type: string
+        txid:
+          $ref: "#/components/schemas/HashHex"
+        status:
+          $ref: "#/components/schemas/TxStatus"
+        block_height:
+          $ref: "#/components/schemas/UIntString"
+        block_hash:
+          $ref: "#/components/schemas/HashHex"
+        confirmations:
+          $ref: "#/components/schemas/UIntString"
+        timestamp_utc:
+          type: string
+          format: date-time
+        to_address:
+          $ref: "#/components/schemas/AddressHex"
+        amount_atomic:
+          $ref: "#/components/schemas/UIntString"
+        from_address:
+          anyOf:
+            - $ref: "#/components/schemas/AddressHex"
+            - type: "null"
+        from_addresses:
+          type: array
+          items:
+            $ref: "#/components/schemas/AddressHex"
+        tx_index:
+          type: integer
+          minimum: 0
+        transfer_index:
+          type: integer
+          minimum: 0
+    AddressIncomingResponse:
+      type: object
+      required: [address, tip_height, next_cursor, items]
+      properties:
+        address:
+          $ref: "#/components/schemas/AddressHex"
+        tip_height:
+          $ref: "#/components/schemas/UIntString"
+        next_cursor:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/AddressIncomingEvent"
     TxResponse:
       type: object
       required: [txid, status, from, to, amount_atomic, fee_atomic, nonce]
