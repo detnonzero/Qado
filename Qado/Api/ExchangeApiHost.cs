@@ -244,7 +244,7 @@ namespace Qado.Api
                 });
             });
 
-            app.MapGet("/v1/address/{address}/incoming", (string address, string? cursor, int? limit, int? min_confirmations, HttpContext http) =>
+            app.MapGet("/v1/address/{address}/incoming", (string address, string? cursor, int? limit, int? min_confirmations, string? order, HttpContext http) =>
             {
                 if (!TryNormalizeHex32(address, out var addrHex))
                     return BadRequest(Error("invalid_address", "address must be 64-char lowercase hex.", http));
@@ -257,11 +257,16 @@ namespace Qado.Api
                 if (minConfirmationsValue < 0)
                     return BadRequest(Error("invalid_min_confirmations", "min_confirmations must be >= 0.", http));
 
+                bool descending = string.Equals(order, "desc", StringComparison.OrdinalIgnoreCase);
+                if (order != null && !descending && !string.Equals(order, "asc", StringComparison.OrdinalIgnoreCase))
+                    return BadRequest(Error("invalid_order", "order must be 'asc' or 'desc'.", http));
+
                 if (!TryBuildIncomingAddressEventsResponse(
                     addrHex,
                     cursor,
                     limitValue,
                     minConfirmationsValue,
+                    descending,
                     out var response,
                     out var errorCode,
                     out var errorMessage))
@@ -1155,6 +1160,7 @@ namespace Qado.Api
             string? rawCursor,
             int limit,
             int minConfirmations,
+            bool descending,
             out IncomingAddressEventsResponse response,
             out string errorCode,
             out string errorMessage)
@@ -1190,69 +1196,137 @@ namespace Qado.Api
 
                 if (TryGetIncomingMaxEligibleHeight(tipHeight, minConfirmations, out var maxEligibleHeight))
                 {
-                    ulong startHeight = cursor?.Height ?? 0UL;
-
-                    for (ulong height = startHeight; height <= maxEligibleHeight && items.Count < limit; height++)
+                    if (descending)
                     {
-                        var blockHash = BlockStore.GetCanonicalHashAtHeight(height, tx);
-                        if (blockHash is not { Length: 32 })
+                        ulong startHeight = cursor?.Height ?? maxEligibleHeight;
+                        if (startHeight > maxEligibleHeight)
+                            startHeight = maxEligibleHeight;
+
+                        for (ulong height = startHeight; ; height--)
                         {
+                            if (items.Count >= limit) break;
+
+                            var blockHash = BlockStore.GetCanonicalHashAtHeight(height, tx);
+                            if (blockHash is { Length: 32 })
+                            {
+                                var block = BlockStore.GetBlockByHash(blockHash, tx);
+                                if (block?.Header is not null && block.Transactions is not null)
+                                {
+                                    string blockHashHex = Hex(blockHash);
+                                    ulong confirmations = tipHeight >= height
+                                        ? (tipHeight - height) + 1UL
+                                        : 0UL;
+
+                                    for (int txIndex = block.Transactions.Count - 1; txIndex >= 0 && items.Count < limit; txIndex--)
+                                    {
+                                        var transaction = block.Transactions[txIndex];
+                                        if (transaction == null || transaction.Amount == 0UL)
+                                            continue;
+
+                                        string toAddress = Hex(transaction.Recipient);
+                                        if (!string.Equals(toAddress, addressHex, StringComparison.Ordinal))
+                                            continue;
+
+                                        if (!IsIncomingEventBeforeCursor(height, txIndex, 0, blockHashHex, cursor))
+                                            continue;
+
+                                        bool isCoinbase = TransactionValidator.IsCoinbase(transaction);
+                                        string? fromAddress = isCoinbase ? null : Hex(transaction.Sender);
+                                        string[] fromAddresses = fromAddress == null
+                                            ? Array.Empty<string>()
+                                            : new[] { fromAddress };
+
+                                        string eventId = BuildIncomingEventId(height, txIndex, 0, blockHashHex);
+
+                                        items.Add(new IncomingAddressEvent(
+                                            event_id: eventId,
+                                            txid: Hex(transaction.ComputeTransactionHash()),
+                                            status: "confirmed",
+                                            block_height: U64(height),
+                                            block_hash: blockHashHex,
+                                            confirmations: U64(confirmations),
+                                            timestamp_utc: UnixToIso(block.Header.Timestamp),
+                                            to_address: addressHex,
+                                            amount_atomic: U64(transaction.Amount),
+                                            from_address: fromAddress,
+                                            from_addresses: fromAddresses,
+                                            tx_index: txIndex,
+                                            transfer_index: 0));
+
+                                        nextCursor = eventId;
+                                    }
+                                }
+                            }
+
+                            if (height == 0UL) break;
+                        }
+                    }
+                    else
+                    {
+                        ulong startHeight = cursor?.Height ?? 0UL;
+
+                        for (ulong height = startHeight; height <= maxEligibleHeight && items.Count < limit; height++)
+                        {
+                            var blockHash = BlockStore.GetCanonicalHashAtHeight(height, tx);
+                            if (blockHash is not { Length: 32 })
+                            {
+                                if (height == ulong.MaxValue) break;
+                                continue;
+                            }
+
+                            var block = BlockStore.GetBlockByHash(blockHash, tx);
+                            if (block?.Header is null || block.Transactions is null)
+                            {
+                                if (height == ulong.MaxValue) break;
+                                continue;
+                            }
+
+                            string blockHashHex = Hex(blockHash);
+                            ulong confirmations = tipHeight >= height
+                                ? (tipHeight - height) + 1UL
+                                : 0UL;
+
+                            for (int txIndex = 0; txIndex < block.Transactions.Count && items.Count < limit; txIndex++)
+                            {
+                                var transaction = block.Transactions[txIndex];
+                                if (transaction == null || transaction.Amount == 0UL)
+                                    continue;
+
+                                string toAddress = Hex(transaction.Recipient);
+                                if (!string.Equals(toAddress, addressHex, StringComparison.Ordinal))
+                                    continue;
+
+                                if (!IsIncomingEventAfterCursor(height, txIndex, 0, blockHashHex, cursor))
+                                    continue;
+
+                                bool isCoinbase = TransactionValidator.IsCoinbase(transaction);
+                                string? fromAddress = isCoinbase ? null : Hex(transaction.Sender);
+                                string[] fromAddresses = fromAddress == null
+                                    ? Array.Empty<string>()
+                                    : new[] { fromAddress };
+
+                                string eventId = BuildIncomingEventId(height, txIndex, 0, blockHashHex);
+
+                                items.Add(new IncomingAddressEvent(
+                                    event_id: eventId,
+                                    txid: Hex(transaction.ComputeTransactionHash()),
+                                    status: "confirmed",
+                                    block_height: U64(height),
+                                    block_hash: blockHashHex,
+                                    confirmations: U64(confirmations),
+                                    timestamp_utc: UnixToIso(block.Header.Timestamp),
+                                    to_address: addressHex,
+                                    amount_atomic: U64(transaction.Amount),
+                                    from_address: fromAddress,
+                                    from_addresses: fromAddresses,
+                                    tx_index: txIndex,
+                                    transfer_index: 0));
+
+                                nextCursor = eventId;
+                            }
+
                             if (height == ulong.MaxValue) break;
-                            continue;
                         }
-
-                        var block = BlockStore.GetBlockByHash(blockHash, tx);
-                        if (block?.Header is null || block.Transactions is null)
-                        {
-                            if (height == ulong.MaxValue) break;
-                            continue;
-                        }
-
-                        string blockHashHex = Hex(blockHash);
-                        ulong confirmations = tipHeight >= height
-                            ? (tipHeight - height) + 1UL
-                            : 0UL;
-
-                        for (int txIndex = 0; txIndex < block.Transactions.Count && items.Count < limit; txIndex++)
-                        {
-                            var transaction = block.Transactions[txIndex];
-                            if (transaction == null || transaction.Amount == 0UL)
-                                continue;
-
-                            string toAddress = Hex(transaction.Recipient);
-                            if (!string.Equals(toAddress, addressHex, StringComparison.Ordinal))
-                                continue;
-
-                            if (!IsIncomingEventAfterCursor(height, txIndex, 0, blockHashHex, cursor))
-                                continue;
-
-                            bool isCoinbase = TransactionValidator.IsCoinbase(transaction);
-                            string? fromAddress = isCoinbase ? null : Hex(transaction.Sender);
-                            string[] fromAddresses = fromAddress == null
-                                ? Array.Empty<string>()
-                                : new[] { fromAddress };
-
-                            string eventId = BuildIncomingEventId(height, txIndex, 0, blockHashHex);
-
-                            items.Add(new IncomingAddressEvent(
-                                event_id: eventId,
-                                txid: Hex(transaction.ComputeTransactionHash()),
-                                status: "confirmed",
-                                block_height: U64(height),
-                                block_hash: blockHashHex,
-                                confirmations: U64(confirmations),
-                                timestamp_utc: UnixToIso(block.Header.Timestamp),
-                                to_address: addressHex,
-                                amount_atomic: U64(transaction.Amount),
-                                from_address: fromAddress,
-                                from_addresses: fromAddresses,
-                                tx_index: txIndex,
-                                transfer_index: 0));
-
-                            nextCursor = eventId;
-                        }
-
-                        if (height == ulong.MaxValue) break;
                     }
                 }
 
@@ -1290,6 +1364,31 @@ namespace Qado.Api
             => string.Create(
                 CultureInfo.InvariantCulture,
                 $"{height}:{txIndex}:{transferIndex}:{blockHashHex}");
+
+        private static bool IsIncomingEventBeforeCursor(
+            ulong height,
+            int txIndex,
+            int transferIndex,
+            string blockHashHex,
+            IncomingCursor? cursor)
+        {
+            if (cursor is null)
+                return true;
+
+            if (height != cursor.Value.Height)
+                return height < cursor.Value.Height;
+
+            if (txIndex != cursor.Value.TxIndex)
+                return txIndex < cursor.Value.TxIndex;
+
+            if (transferIndex != cursor.Value.TransferIndex)
+                return transferIndex < cursor.Value.TransferIndex;
+
+            if (string.IsNullOrEmpty(cursor.Value.BlockHashHex))
+                return false;
+
+            return !string.Equals(blockHashHex, cursor.Value.BlockHashHex, StringComparison.Ordinal);
+        }
 
         private static bool IsIncomingEventAfterCursor(
             ulong height,

@@ -154,6 +154,7 @@ paths:
       description: |
         Returns incoming canonical transfer events addressed to the requested account.
         Events are ordered deterministically by `block_height`, `tx_index`, `transfer_index`.
+        Use `order=desc` to return newest events first.
         The `cursor` is opaque and currently emitted as
         `height:tx_index:transfer_index:block_hash`.
       operationId: getAddressIncoming
@@ -184,6 +185,14 @@ paths:
             type: integer
             minimum: 0
             default: 0
+        - name: order
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: asc
+          description: Sort order by block height. "asc" returns oldest first (default), "desc" returns newest first.
       responses:
         "200":
           description: Incoming canonical events
