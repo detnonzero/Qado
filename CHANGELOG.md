@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.5.1] - 2026-03-23
+
+### Changed
+- Exchange API `GET /v1/address/{address}/incoming` now accepts optional `order=asc|desc`; default remains `asc`, and `desc` returns newest events first.
+
 ## [0.5.0] - 2026-03-21
 
 ### Added
