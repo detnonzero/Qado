@@ -2,6 +2,33 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.5.2] - 2026-03-25
+
+### Added
+- Startup integrity auditing and guided recovery:
+  - canonical chain continuity, canonical payload presence, payload hash consistency, and canonical prev-hash linkage are now checked before normal startup
+  - fatal canonical corruption now offers a guided `Backup + Chain-Resync` path instead of continuing with a damaged local chain
+  - wallet keys are preserved during startup recovery resyncs
+
+### Changed
+- SQLite durability is now configured more conservatively for live nodes:
+  - `journal_mode=WAL` remains in place
+  - `synchronous` changed from `NORMAL` to `FULL`
+- Repairable derived-state drift at startup is now rebuilt automatically from the canonical chain:
+  - `accounts`
+  - `tx_index`
+  - `state_undo`
+- Mining job caching now supports multiple concurrent outstanding jobs per miner address with bounded per-miner and global caps.
+
+### Fixed
+- Aborted bulk-sync reorg batches no longer leave the local node stranded on a shortened canonical chain:
+  - partially applied replacement chunks are rolled back on abort
+  - the previously canonical branch is restored before sync resumes
+- Known descendants of stateless-invalid blocks are now marked with `bad_ancestor` instead of leaving only the root block marked bad.
+
+### Notes
+- SelfTest coverage was expanded for startup audit/recovery, aborted reorg restore, and concurrent mining-job handling.
+
 ## [0.5.1] - 2026-03-23
 
 ### Changed

@@ -28,9 +28,10 @@ namespace Qado.Api
         private readonly ConcurrentDictionary<string, BroadcastResponsePayload> _broadcastCache = new(StringComparer.Ordinal);
         private readonly object _miningJobSync = new();
         private readonly Dictionary<string, MiningJobSnapshot> _miningJobsById = new(StringComparer.Ordinal);
-        private readonly Dictionary<string, string> _latestMiningJobByMiner = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, LinkedList<string>> _miningJobIdsByMiner = new(StringComparer.Ordinal);
 
         private const int MaxMiningJobs = 64;
+        private const int MaxMiningJobsPerMiner = 16;
         private static readonly TimeSpan MiningJobTtl = TimeSpan.FromMinutes(2);
 
         private WebApplication? _app;
@@ -628,11 +629,23 @@ namespace Qado.Api
             {
                 CleanupMiningJobsNoLock();
 
-                if (_latestMiningJobByMiner.TryGetValue(job.MinerHex, out var oldJobId))
-                    _miningJobsById.Remove(oldJobId);
-
                 _miningJobsById[job.JobId] = job;
-                _latestMiningJobByMiner[job.MinerHex] = job.JobId;
+
+                if (!_miningJobIdsByMiner.TryGetValue(job.MinerHex, out var minerJobIds))
+                {
+                    minerJobIds = new LinkedList<string>();
+                    _miningJobIdsByMiner[job.MinerHex] = minerJobIds;
+                }
+
+                minerJobIds.AddLast(job.JobId);
+                while (minerJobIds.Count > MaxMiningJobsPerMiner)
+                {
+                    string oldestJobId = minerJobIds.First!.Value;
+                    RemoveMiningJobNoLock(oldestJobId);
+
+                    if (!_miningJobIdsByMiner.TryGetValue(job.MinerHex, out minerJobIds))
+                        break;
+                }
 
                 TrimMiningJobsNoLock();
             }
@@ -659,15 +672,7 @@ namespace Qado.Api
         {
             lock (_miningJobSync)
             {
-                if (!_miningJobsById.TryGetValue(jobId, out var job))
-                    return;
-
-                _miningJobsById.Remove(jobId);
-                if (_latestMiningJobByMiner.TryGetValue(job.MinerHex, out var latestId) &&
-                    string.Equals(latestId, jobId, StringComparison.Ordinal))
-                {
-                    _latestMiningJobByMiner.Remove(job.MinerHex);
-                }
+                RemoveMiningJobNoLock(jobId);
             }
         }
 
@@ -816,10 +821,19 @@ namespace Qado.Api
                 return;
 
             _miningJobsById.Remove(jobId);
-            if (_latestMiningJobByMiner.TryGetValue(job.MinerHex, out var latestId) &&
-                string.Equals(latestId, jobId, StringComparison.Ordinal))
+
+            if (_miningJobIdsByMiner.TryGetValue(job.MinerHex, out var minerJobIds))
             {
-                _latestMiningJobByMiner.Remove(job.MinerHex);
+                for (var node = minerJobIds.First; node != null;)
+                {
+                    var next = node.Next;
+                    if (string.Equals(node.Value, jobId, StringComparison.Ordinal))
+                        minerJobIds.Remove(node);
+                    node = next;
+                }
+
+                if (minerJobIds.Count == 0)
+                    _miningJobIdsByMiner.Remove(job.MinerHex);
             }
         }
 

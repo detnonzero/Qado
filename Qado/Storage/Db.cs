@@ -31,7 +31,7 @@ namespace Qado.Storage
             {
                 cmd.CommandText = @"
 PRAGMA journal_mode=WAL;
-PRAGMA synchronous=NORMAL;
+PRAGMA synchronous=FULL;
 PRAGMA foreign_keys=ON;
 PRAGMA busy_timeout=5000;
 PRAGMA page_size=8192;
@@ -50,6 +50,7 @@ PRAGMA cache_size=-524288;
             {
                 try { Connection?.Close(); } catch { }
                 try { Connection?.Dispose(); } catch { }
+                try { SqliteConnection.ClearAllPools(); } catch { }
                 Connection = null!;
             }
         }

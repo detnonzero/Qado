@@ -25,8 +25,10 @@ namespace Qado.Storage
                     throw new InvalidOperationException("canon does not match requested tipHash; aborting rebuild.");
 
                 Exec(tx, "DELETE FROM accounts;");
+                Exec(tx, "DELETE FROM tx_index;");
+                Exec(tx, "DELETE FROM state_undo;");
 
-                for (ulong h = 0; h <= tipHeight; h++)
+                for (ulong h = 1; h <= tipHeight; h++)
                 {
                     var hash = GetCanonHashAtHeight(h, tx);
                     if (hash is not { Length: 32 })
@@ -39,13 +41,13 @@ namespace Qado.Storage
                     blk.BlockHeight = h;
                     blk.BlockHash = (byte[])hash.Clone();
 
-                    StateApplier.ApplyBlock(blk, tx);
+                    StateApplier.ApplyBlockWithUndo(blk, tx);
                 }
 
                 tx.Commit();
             }
 
-            log?.Info("State", $"State rebuild to tip {Convert.ToHexString(tipHash).ToLowerInvariant()} done.");
+            log?.Info("State", $"Derived chain state rebuild to tip {Convert.ToHexString(tipHash).ToLowerInvariant()} done.");
         }
 
         private static byte[]? GetCanonHashAtHeight(ulong height, SqliteTransaction tx)

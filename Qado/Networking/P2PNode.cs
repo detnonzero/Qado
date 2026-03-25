@@ -1304,10 +1304,20 @@ namespace Qado.Networking
 
             try
             {
-                // Young networks see many transient/out-of-order branches: avoid descendant poisoning.
-                int affected = BlockIndexStore.MarkBadSelf(blockHash, (int)reason);
-                if (affected > 0)
-                    _log?.Warn("Sync", $"Marked bad block (self-only): root={Hex16(blockHash)} reason={(int)reason} ({context})");
+                int affected;
+                if (reason == BadChainReason.BlockStatelessInvalid)
+                {
+                    affected = BlockIndexStore.MarkBadAndDescendants(blockHash, (int)reason);
+                    if (affected > 0)
+                        _log?.Warn("Sync", $"Marked bad block with known descendants: root={Hex16(blockHash)} affected={affected} reason={(int)reason} ({context})");
+                }
+                else
+                {
+                    // Keep state-invalid marking local until we can prove the failure is not a local/runtime artifact.
+                    affected = BlockIndexStore.MarkBadSelf(blockHash, (int)reason);
+                    if (affected > 0)
+                        _log?.Warn("Sync", $"Marked bad block (self-only): root={Hex16(blockHash)} reason={(int)reason} ({context})");
+                }
 
                 _blockSyncClient.RequestResync(context);
             }

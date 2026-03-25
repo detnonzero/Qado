@@ -6,6 +6,7 @@ using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.Sockets;
+using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -42,6 +43,12 @@ internal static class Program
     private static readonly IReadOnlyList<TestCase> Tests = new[]
     {
         new TestCase("Genesis_Stored", TestGenesisStored),
+        new TestCase("StartupIntegrityAudit_ValidCanonicalChain_Passes", TestStartupIntegrityAuditValidCanonicalChainPasses),
+        new TestCase("StartupIntegrityAudit_CanonGap_BlocksStartup", TestStartupIntegrityAuditCanonGapBlocksStartup),
+        new TestCase("StartupIntegrityAudit_MissingCanonicalPayload_BlocksStartup", TestStartupIntegrityAuditMissingCanonicalPayloadBlocksStartup),
+        new TestCase("StartupIntegrityAudit_CanonPrevMismatch_BlocksStartup", TestStartupIntegrityAuditCanonPrevMismatchBlocksStartup),
+        new TestCase("StartupIntegrityAudit_MissingCanonicalUndo_RebuildsDerivedState", TestStartupIntegrityAuditMissingCanonicalUndoRebuildsDerivedState),
+        new TestCase("StartupRecovery_BackupAndChainResync_PreservesKeysAndResetsChain", TestStartupRecoveryBackupAndChainResyncPreservesKeysAndResetsChain),
         new TestCase("BlockPayloads_StoredInSqlite", TestBlockPayloadsStoredInSqlite),
         new TestCase("StateApplier_RejectsNonceGap", TestStateApplierRejectsNonceGap),
         new TestCase("StateApplier_AcceptsSequentialNonce", TestStateApplierAcceptsSequentialNonce),
@@ -52,6 +59,7 @@ internal static class Program
         new TestCase("Merkle_DomainSeparation_Profile", TestMerkleDomainSeparationProfile),
         new TestCase("TxId_CommitsSignature", TestTxIdCommitsSignature),
         new TestCase("ExchangeApi_TxLookup_BlockRefDisambiguatesDeterministicCoinbase", TestExchangeApiTxLookupBlockRefDisambiguatesDeterministicCoinbase),
+        new TestCase("ExchangeApi_MiningJobs_SameMinerCanHoldMultipleOutstandingJobs", TestExchangeApiMiningJobsSameMinerCanHoldMultipleOutstandingJobs),
         new TestCase("BlockSerializer_RejectsInvalidTarget", TestBlockSerializerRejectsInvalidTarget),
         new TestCase("BlockValidator_TipValidation_WorksInsideTransaction", TestBlockValidatorTipValidationWorksInsideTransaction),
         new TestCase("BlockValidator_AcceptsLegacyLongMaxNonceBoundary", TestBlockValidatorAcceptsLegacyLongMaxNonceBoundary),
@@ -71,6 +79,7 @@ internal static class Program
         new TestCase("SmallNetCoordinator_ProducesAggressiveRecoveryActions", TestSmallNetCoordinatorProducesAggressiveRecoveryActions),
         new TestCase("BulkSyncRuntime_CommitsChunkIntoCanonicalChain", TestBulkSyncRuntimeCommitsChunkIntoCanonicalChain),
         new TestCase("BulkSyncRuntime_MoreAvailable_KeepsGateAndContinuesBatch", TestBulkSyncRuntimeMoreAvailableKeepsGateAndContinuesBatch),
+        new TestCase("BulkSyncRuntime_AbortAfterReorgChunk_RestoresPriorCanonicalChain", TestBulkSyncRuntimeAbortAfterReorgChunkRestoresPriorCanonicalChain),
         new TestCase("BlockIngressFlow_LiveOrphanRequestsParentAndPromotesAcceptedParent", TestBlockIngressFlowLiveOrphanRequestsParentAndPromotesAcceptedParent),
         new TestCase("BlockIngressFlow_AlreadyBufferedOrphanDoesNotReRequestParent", TestBlockIngressFlowAlreadyBufferedOrphanDoesNotReRequestParent),
         new TestCase("ValidationWorker_PrioritizesLivePush", TestValidationWorkerPrioritizesLivePush),
@@ -182,6 +191,280 @@ internal static class Program
         Assert(b0!.BlockHeight == 0, "genesis height must be 0");
         Assert(b0.Transactions.Count >= 1, "genesis must contain coinbase");
         Assert(TransactionValidator.IsCoinbase(b0.Transactions[0]), "genesis tx[0] must be coinbase");
+    }
+
+    private static void TestStartupIntegrityAuditValidCanonicalChainPasses()
+    {
+        var genesis = BlockStore.GetBlockByHeight(0) ?? throw new InvalidOperationException("missing genesis block");
+        var genesisHash = genesis.BlockHash ?? throw new InvalidOperationException("missing genesis hash");
+        var miner = KeyGenerator.GenerateKeypairHex();
+
+        var block1 = BuildMinedBlock(
+            height: 1UL,
+            prevHash: genesisHash,
+            timestamp: genesis.Header!.Timestamp + 61UL,
+            minerPubHex: miner.pubHex);
+        BlockPersistHelper.Persist(block1);
+
+        var block2 = BuildMinedBlock(
+            height: 2UL,
+            prevHash: block1.BlockHash!,
+            timestamp: block1.Header!.Timestamp + 61UL,
+            minerPubHex: miner.pubHex);
+        BlockPersistHelper.Persist(block2);
+
+        var audit = StartupIntegrityAudit.Run();
+        Assert(audit.Disposition == StartupAuditDisposition.Continue, $"valid canonical chain should pass startup audit, got {audit.Disposition}");
+        Assert(audit.TipHeight == 2UL, $"startup audit tip height mismatch: got {audit.TipHeight}");
+        Assert(audit.TipHashHex == Convert.ToHexString(block2.BlockHash!).ToLowerInvariant(), "startup audit tip hash mismatch");
+        Assert(audit.Issues.Count == 0, "valid canonical chain must not produce startup audit findings");
+    }
+
+    private static void TestStartupIntegrityAuditCanonGapBlocksStartup()
+    {
+        var genesis = BlockStore.GetBlockByHeight(0) ?? throw new InvalidOperationException("missing genesis block");
+        var genesisHash = genesis.BlockHash ?? throw new InvalidOperationException("missing genesis hash");
+        var miner = KeyGenerator.GenerateKeypairHex();
+
+        var block1 = BuildMinedBlock(
+            height: 1UL,
+            prevHash: genesisHash,
+            timestamp: genesis.Header!.Timestamp + 61UL,
+            minerPubHex: miner.pubHex);
+        BlockPersistHelper.Persist(block1);
+
+        var block2 = BuildMinedBlock(
+            height: 2UL,
+            prevHash: block1.BlockHash!,
+            timestamp: block1.Header!.Timestamp + 61UL,
+            minerPubHex: miner.pubHex);
+        BlockPersistHelper.Persist(block2);
+
+        lock (Db.Sync)
+        {
+            using var cmd = Db.Connection.CreateCommand();
+            cmd.CommandText = "DELETE FROM canon WHERE height=$h;";
+            cmd.Parameters.AddWithValue("$h", 1L);
+            cmd.ExecuteNonQuery();
+        }
+
+        var audit = StartupIntegrityAudit.Run();
+        Assert(audit.Disposition == StartupAuditDisposition.HardStopCanonCorruption, "canon gap must hard-stop startup");
+        Assert(audit.Issues.Count == 1, $"canon gap should produce exactly one startup finding, got {audit.Issues.Count}");
+        Assert(audit.Issues[0].Code == StartupAuditIssueCode.CanonGap, $"unexpected startup audit issue code: {audit.Issues[0].Code}");
+        Assert(audit.Issues[0].Height == 1UL, $"canon gap finding must point to height 1, got {audit.Issues[0].Height}");
+
+        bool threw = false;
+        try
+        {
+            StartupIntegrityAudit.ThrowIfBlocking(audit);
+        }
+        catch (InvalidOperationException ex)
+        {
+            threw = true;
+            Assert(ex.Message.Contains("chain resync", StringComparison.OrdinalIgnoreCase),
+                "hard-stop startup audit message should guide the user toward resync");
+        }
+
+        Assert(threw, "canon gap must throw when startup audit blocking result is enforced");
+    }
+
+    private static void TestStartupIntegrityAuditMissingCanonicalPayloadBlocksStartup()
+    {
+        var genesis = BlockStore.GetBlockByHeight(0) ?? throw new InvalidOperationException("missing genesis block");
+        var genesisHash = genesis.BlockHash ?? throw new InvalidOperationException("missing genesis hash");
+        var miner = KeyGenerator.GenerateKeypairHex();
+
+        var block1 = BuildMinedBlock(
+            height: 1UL,
+            prevHash: genesisHash,
+            timestamp: genesis.Header!.Timestamp + 61UL,
+            minerPubHex: miner.pubHex);
+        BlockPersistHelper.Persist(block1);
+
+        lock (Db.Sync)
+        {
+            using var cmd = Db.Connection.CreateCommand();
+            cmd.CommandText = "DELETE FROM block_payloads WHERE hash=$h;";
+            cmd.Parameters.AddWithValue("$h", block1.BlockHash!);
+            cmd.ExecuteNonQuery();
+        }
+
+        var audit = StartupIntegrityAudit.Run();
+        Assert(audit.Disposition == StartupAuditDisposition.HardStopCanonCorruption, "missing canonical payload must hard-stop startup");
+        Assert(audit.Issues.Count == 1, $"missing canonical payload should produce exactly one startup finding, got {audit.Issues.Count}");
+        Assert(audit.Issues[0].Code == StartupAuditIssueCode.MissingCanonicalPayload,
+            $"unexpected startup audit issue code: {audit.Issues[0].Code}");
+        Assert(audit.Issues[0].Height == 1UL, $"missing payload finding must point to height 1, got {audit.Issues[0].Height}");
+    }
+
+    private static void TestStartupIntegrityAuditCanonPrevMismatchBlocksStartup()
+    {
+        var genesis = BlockStore.GetBlockByHeight(0) ?? throw new InvalidOperationException("missing genesis block");
+        var genesisHash = genesis.BlockHash ?? throw new InvalidOperationException("missing genesis hash");
+        var miner = KeyGenerator.GenerateKeypairHex();
+
+        var block1 = BuildMinedBlock(
+            height: 1UL,
+            prevHash: genesisHash,
+            timestamp: genesis.Header!.Timestamp + 61UL,
+            minerPubHex: miner.pubHex);
+        BlockPersistHelper.Persist(block1);
+
+        var block2 = BuildMinedBlock(
+            height: 2UL,
+            prevHash: block1.BlockHash!,
+            timestamp: block1.Header!.Timestamp + 61UL,
+            minerPubHex: miner.pubHex);
+        BlockPersistHelper.Persist(block2);
+
+        var badCanonBlock = BuildLooseMinedBlock(
+            height: 2UL,
+            prevHash: genesisHash,
+            timestamp: block2.Header!.Timestamp + 61UL,
+            minerPubHex: miner.pubHex);
+
+        lock (Db.Sync)
+        {
+            using var tx = Db.Connection.BeginTransaction();
+            BlockStore.SaveBlock(badCanonBlock, tx, BlockIndexStore.StatusHaveBlockPayload);
+            BlockStore.SetCanonicalHashAtHeight(2UL, badCanonBlock.BlockHash!, tx);
+            tx.Commit();
+        }
+
+        var audit = StartupIntegrityAudit.Run();
+        Assert(audit.Disposition == StartupAuditDisposition.HardStopCanonCorruption, "canonical prev mismatch must hard-stop startup");
+        Assert(audit.Issues.Count == 1, $"canonical prev mismatch should produce exactly one startup finding, got {audit.Issues.Count}");
+        Assert(audit.Issues[0].Code == StartupAuditIssueCode.CanonPrevMismatch,
+            $"unexpected startup audit issue code: {audit.Issues[0].Code}");
+        Assert(audit.Issues[0].Height == 2UL, $"canonical prev mismatch finding must point to height 2, got {audit.Issues[0].Height}");
+    }
+
+    private static void TestStartupIntegrityAuditMissingCanonicalUndoRebuildsDerivedState()
+    {
+        var genesis = BlockStore.GetBlockByHeight(0) ?? throw new InvalidOperationException("missing genesis block");
+        var genesisHash = genesis.BlockHash ?? throw new InvalidOperationException("missing genesis hash");
+        var miner1 = KeyGenerator.GenerateKeypairHex();
+        var miner2 = KeyGenerator.GenerateKeypairHex();
+
+        var block1 = BuildMinedBlock(
+            height: 1UL,
+            prevHash: genesisHash,
+            timestamp: genesis.Header!.Timestamp + 61UL,
+            minerPubHex: miner1.pubHex);
+        BlockPersistHelper.Persist(block1);
+
+        var block2 = BuildMinedBlock(
+            height: 2UL,
+            prevHash: block1.BlockHash!,
+            timestamp: block1.Header!.Timestamp + 61UL,
+            minerPubHex: miner2.pubHex);
+        BlockPersistHelper.Persist(block2);
+
+        byte[] block1TxId = block1.Transactions[0].ComputeTransactionHash();
+
+        lock (Db.Sync)
+        {
+            using var tx = Db.Connection.BeginTransaction();
+
+            using (var delUndo = tx.Connection!.CreateCommand())
+            {
+                delUndo.Transaction = tx;
+                delUndo.CommandText = "DELETE FROM state_undo WHERE block_hash=$h;";
+                delUndo.Parameters.AddWithValue("$h", block1.BlockHash!);
+                delUndo.ExecuteNonQuery();
+            }
+
+            using (var delAccounts = tx.Connection!.CreateCommand())
+            {
+                delAccounts.Transaction = tx;
+                delAccounts.CommandText = "DELETE FROM accounts;";
+                delAccounts.ExecuteNonQuery();
+            }
+
+            using (var delTxIndex = tx.Connection!.CreateCommand())
+            {
+                delTxIndex.Transaction = tx;
+                delTxIndex.CommandText = "DELETE FROM tx_index;";
+                delTxIndex.ExecuteNonQuery();
+            }
+
+            tx.Commit();
+        }
+
+        var audit = StartupIntegrityAudit.Run();
+        Assert(audit.Disposition == StartupAuditDisposition.RepairableDerivedState,
+            $"missing canonical undo should be repairable, got {audit.Disposition}");
+        Assert(audit.Issues.Count == 1, $"repairable startup audit should report one issue, got {audit.Issues.Count}");
+        Assert(audit.Issues[0].Code == StartupAuditIssueCode.MissingCanonicalUndo,
+            $"unexpected repairable startup audit issue code: {audit.Issues[0].Code}");
+        Assert(audit.Issues[0].Height == 1UL,
+            $"missing canonical undo should be reported at height 1, got {audit.Issues[0].Height}");
+
+        var repaired = StartupIntegrityAudit.RepairDerivedStateIfNeeded(audit);
+        Assert(repaired.Disposition == StartupAuditDisposition.Continue,
+            $"derived-state repair should clear the startup audit, got {repaired.Disposition}");
+        Assert(repaired.Issues.Count == 0, "derived-state repair should leave no startup audit findings");
+
+        Assert(StateStore.GetBalanceU64(miner1.pubHex) == RewardCalculator.GetBlockSubsidy(1UL),
+            "derived-state repair must restore the height-1 miner balance");
+        Assert(StateStore.GetBalanceU64(miner2.pubHex) == RewardCalculator.GetBlockSubsidy(2UL),
+            "derived-state repair must restore the height-2 miner balance");
+
+        lock (Db.Sync)
+        {
+            using var cmd = Db.Connection.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(1) FROM state_undo WHERE block_hash=$h;";
+            cmd.Parameters.AddWithValue("$h", block1.BlockHash!);
+            long undoRows = Convert.ToInt64(cmd.ExecuteScalar() ?? 0L);
+            Assert(undoRows == 1L, "derived-state repair must recreate state_undo for canonical blocks");
+        }
+
+        var indexed = TxIndexStore.Get(block1TxId) ?? throw new InvalidOperationException("derived-state repair must recreate tx_index rows");
+        Assert(indexed.height == 1UL, $"recreated tx_index row should resolve to height 1, got {indexed.height}");
+        Assert(BytesEqual(indexed.blockHash, block1.BlockHash!), "recreated tx_index row resolved to the wrong block");
+    }
+
+    private static void TestStartupRecoveryBackupAndChainResyncPreservesKeysAndResetsChain()
+    {
+        var genesis = BlockStore.GetBlockByHeight(0) ?? throw new InvalidOperationException("missing genesis block");
+        var genesisHash = genesis.BlockHash ?? throw new InvalidOperationException("missing genesis hash");
+        var miner = KeyGenerator.GenerateKeypairHex();
+        var wallet = KeyGenerator.GenerateKeypairHex();
+
+        KeyStore.AddKey(wallet.privHex, wallet.pubHex);
+
+        var block1 = BuildMinedBlock(
+            height: 1UL,
+            prevHash: genesisHash,
+            timestamp: genesis.Header!.Timestamp + 61UL,
+            minerPubHex: miner.pubHex);
+        BlockPersistHelper.Persist(block1);
+
+        var block2 = BuildMinedBlock(
+            height: 2UL,
+            prevHash: block1.BlockHash!,
+            timestamp: block1.Header!.Timestamp + 61UL,
+            minerPubHex: miner.pubHex);
+        BlockPersistHelper.Persist(block2);
+
+        Assert(BlockStore.GetLatestHeight() == 2UL, "test setup must extend canonical chain before backup+resync");
+
+        string dbPath = Path.Combine(_tempRoot, "qado.db");
+        var result = StartupRecovery.PerformBackupAndChainResync(_tempRoot, dbPath);
+
+        Assert(Directory.Exists(result.BackupDirectoryPath), "startup recovery must create a backup directory");
+        Assert(File.Exists(Path.Combine(result.BackupDirectoryPath, "qado.db")), "startup recovery must move the old database into the backup directory");
+        Assert(result.PreservedKeyCount == 1, $"startup recovery preserved key count mismatch: got {result.PreservedKeyCount}");
+
+        Assert(BlockStore.GetLatestHeight() == 0UL, "startup recovery must reset the local chain back to genesis");
+        var audit = StartupIntegrityAudit.Run();
+        Assert(audit.Disposition == StartupAuditDisposition.Continue, $"fresh chain after startup recovery should pass audit, got {audit.Disposition}");
+
+        var keys = KeyStore.GetAllKeys();
+        Assert(keys.Count == 1, $"startup recovery should preserve exactly one wallet key, got {keys.Count}");
+        Assert(string.Equals(keys[0].PubHex, wallet.pubHex, StringComparison.Ordinal), "startup recovery preserved the wrong wallet public key");
+        Assert(string.Equals(keys[0].PrivHex, wallet.privHex, StringComparison.Ordinal), "startup recovery preserved the wrong wallet private key");
     }
 
     private static void TestBlockPayloadsStoredInSqlite()
@@ -636,6 +919,67 @@ internal static class Program
             Assert(
                 hashScopedConfirmations.RootElement.GetProperty("tip_height").GetString() == "2",
                 "confirmations response must report the current tip height");
+        }
+        finally
+        {
+            host.StopAsync().GetAwaiter().GetResult();
+        }
+    }
+
+    private static void TestExchangeApiMiningJobsSameMinerCanHoldMultipleOutstandingJobs()
+    {
+        var mempool = new MempoolManager(
+            senderHex => StateStore.GetBalanceU64(senderHex),
+            senderHex => StateStore.GetNonceU64(senderHex),
+            log: null);
+
+        var miner = KeyGenerator.GenerateKeypairHex();
+
+        int port = GetFreeTcpPort();
+        using var host = new ExchangeApiHost(mempool, () => null, log: null);
+        using var client = new HttpClient
+        {
+            BaseAddress = new Uri($"http://127.0.0.1:{port}"),
+            Timeout = TimeSpan.FromSeconds(10)
+        };
+
+        host.StartAsync(port).GetAwaiter().GetResult();
+        try
+        {
+            using var job1 = PostJson(client, "/v1/mining/job", new { miner = miner.pubHex });
+            using var job2 = PostJson(client, "/v1/mining/job", new { miner = miner.pubHex });
+
+            string jobId1 = job1.RootElement.GetProperty("job_id").GetString()
+                ?? throw new InvalidOperationException("first mining job id missing");
+            string jobId2 = job2.RootElement.GetProperty("job_id").GetString()
+                ?? throw new InvalidOperationException("second mining job id missing");
+            Assert(!string.Equals(jobId1, jobId2, StringComparison.Ordinal), "mining job ids must be unique per request");
+
+            ulong timestamp1 = ulong.Parse(job1.RootElement.GetProperty("timestamp").GetString() ?? "0");
+            ulong timestamp2 = ulong.Parse(job2.RootElement.GetProperty("timestamp").GetString() ?? "0");
+            Assert(timestamp1 > 0UL && timestamp2 > 0UL, "mining jobs must expose a positive timestamp");
+
+            using var submit1 = PostJson(client, "/v1/mining/submit", new
+            {
+                job_id = jobId1,
+                nonce = "0",
+                timestamp = (timestamp1 - 1UL).ToString()
+            });
+            Assert(!submit1.RootElement.GetProperty("accepted").GetBoolean(), "first stale-timestamp submit must not be accepted");
+            Assert(
+                submit1.RootElement.GetProperty("reason").GetString() == "invalid_timestamp",
+                "first job should still be found after requesting a second job for the same miner");
+
+            using var submit2 = PostJson(client, "/v1/mining/submit", new
+            {
+                job_id = jobId2,
+                nonce = "0",
+                timestamp = (timestamp2 - 1UL).ToString()
+            });
+            Assert(!submit2.RootElement.GetProperty("accepted").GetBoolean(), "second stale-timestamp submit must not be accepted");
+            Assert(
+                submit2.RootElement.GetProperty("reason").GetString() == "invalid_timestamp",
+                "second job should remain independently addressable by job id");
         }
         finally
         {
@@ -1436,6 +1780,106 @@ internal static class Program
 
         bool gateReleased = gate.Wait(0);
         Assert(gateReleased, "validation gate must be released after final tip-reached completion");
+        if (gateReleased)
+            gate.Release();
+    }
+
+    private static void TestBulkSyncRuntimeAbortAfterReorgChunkRestoresPriorCanonicalChain()
+    {
+        var mempool = new MempoolManager(
+            senderHex => StateStore.GetBalanceU64(senderHex),
+            senderHex => StateStore.GetNonceU64(senderHex),
+            log: null);
+        using var gate = new SemaphoreSlim(1, 1);
+        int notified = 0;
+        var log = new ListLogSink();
+        var runtime = new BulkSyncRuntime(gate, mempool, () => notified++, log);
+        var peer = CreateFakePeer("bulk-sync-abort-peer");
+
+        var genesis = BlockStore.GetBlockByHeight(0) ?? throw new InvalidOperationException("missing genesis block");
+        var genesisHash = genesis.BlockHash ?? throw new InvalidOperationException("missing genesis hash");
+
+        var minerA = KeyGenerator.GenerateKeypairHex();
+        var minerB = KeyGenerator.GenerateKeypairHex();
+
+        var blockA1 = BuildMinedBlock(
+            height: 1UL,
+            prevHash: genesisHash,
+            timestamp: genesis.Header!.Timestamp + 61UL,
+            minerPubHex: minerA.pubHex);
+        BlockPersistHelper.Persist(blockA1);
+
+        var blockA2 = BuildMinedBlock(
+            height: 2UL,
+            prevHash: blockA1.BlockHash!,
+            timestamp: blockA1.Header!.Timestamp + 61UL,
+            minerPubHex: minerA.pubHex);
+        BlockPersistHelper.Persist(blockA2);
+
+        Assert(BlockStore.GetLatestHeight() == 2UL, "test setup must extend canonical chain to height 2");
+
+        UInt128 localChainwork = BlockIndexStore.GetChainwork(blockA2.BlockHash!);
+        UInt128 advertisedTipChainwork = localChainwork == 0 ? 1UL : localChainwork + 1UL;
+
+        var blockB1 = BuildMinedBlock(
+            height: 1UL,
+            prevHash: genesisHash,
+            timestamp: genesis.Header.Timestamp + 122UL,
+            minerPubHex: minerB.pubHex);
+
+        var prepare = runtime.PrepareBatchAsync(genesisHash, 1UL, advertisedTipChainwork, peer, CancellationToken.None)
+            .GetAwaiter().GetResult();
+        Assert(prepare.Success, $"abort-restore batch prepare failed: {prepare.Error}");
+
+        var commit = runtime.CommitChunkAsync(new[] { SerializeBlock(blockB1) }, 1UL, genesisHash, peer, CancellationToken.None)
+            .GetAwaiter().GetResult();
+        Assert(commit.Success, $"abort-restore chunk commit failed: {commit.Error}");
+        Assert(BytesEqual(commit.LastBlockHash, blockB1.BlockHash!), "abort-restore batch returned wrong last block hash");
+
+        Assert(BlockStore.GetLatestHeight() == 1UL, "partial reorg chunk must temporarily shorten canonical tip");
+        Assert(BytesEqual(
+                BlockStore.GetCanonicalHashAtHeight(1UL) ?? throw new InvalidOperationException("missing temporary canonical hash at height 1"),
+                blockB1.BlockHash!),
+            "partial reorg chunk must temporarily install the new branch block");
+
+        runtime.AbortBatchAsync(peer, "selftest abort after partial reorg", CancellationToken.None)
+            .GetAwaiter().GetResult();
+
+        var canonicalHash1 = BlockStore.GetCanonicalHashAtHeight(1UL) ?? throw new InvalidOperationException("missing canonical hash at height 1 after abort restore");
+        var canonicalHash2 = BlockStore.GetCanonicalHashAtHeight(2UL) ?? throw new InvalidOperationException("missing canonical hash at height 2 after abort restore");
+        Assert(BytesEqual(canonicalHash1, blockA1.BlockHash!), "abort restore must reinstall original canonical block at height 1");
+        Assert(BytesEqual(canonicalHash2, blockA2.BlockHash!), "abort restore must reinstall original canonical block at height 2");
+        Assert(BlockStore.GetLatestHeight() == 2UL, "abort restore must recover the original canonical tip height");
+
+        Assert(StateStore.GetBalanceU64(minerA.pubHex) ==
+               RewardCalculator.GetBlockSubsidy(1UL) + RewardCalculator.GetBlockSubsidy(2UL),
+            "abort restore must recover balances from the original canonical chain");
+        Assert(StateStore.GetBalanceU64(minerB.pubHex) == 0UL,
+            "abort restore must roll back balances from the partially applied branch");
+
+        Assert(BlockIndexStore.TryGetStatus(blockB1.BlockHash!, out var branchStatus), "alternative branch block status missing after abort restore");
+        Assert(branchStatus == BlockIndexStore.StatusHaveBlockPayload,
+            "partially applied branch block must remain stored as non-canonical payload after abort restore");
+        Assert(BlockIndexStore.TryGetStatus(blockA1.BlockHash!, out var a1Status), "original h=1 block status missing after abort restore");
+        Assert(BlockIndexStore.TryGetStatus(blockA2.BlockHash!, out var a2Status), "original h=2 block status missing after abort restore");
+        Assert(a1Status == BlockIndexStore.StatusCanonicalStateValidated, "original h=1 block must be canonical again after abort restore");
+        Assert(a2Status == BlockIndexStore.StatusCanonicalStateValidated, "original h=2 block must be canonical again after abort restore");
+
+        lock (Db.Sync)
+        {
+            using var cmd = Db.Connection.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(1) FROM state_undo WHERE block_hash=$h;";
+            cmd.Parameters.AddWithValue("$h", blockB1.BlockHash!);
+            long undoRows = Convert.ToInt64(cmd.ExecuteScalar() ?? 0L);
+            Assert(undoRows == 0L, "partially applied branch block undo rows must be removed after abort restore");
+        }
+
+        Assert(notified == 1, $"abort restore should notify exactly once, got {notified}");
+        Assert(log.Lines.Any(line => line.Contains("abort restored prior canonical chain", StringComparison.OrdinalIgnoreCase)),
+            "abort restore should emit a sync restore log line");
+
+        bool gateReleased = gate.Wait(0);
+        Assert(gateReleased, "abort restore must release the validation gate");
         if (gateReleased)
             gate.Release();
     }
@@ -2263,6 +2707,18 @@ internal static class Program
         string body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
         if (!response.IsSuccessStatusCode)
             throw new InvalidOperationException($"GET {path} failed with {(int)response.StatusCode}: {body}");
+
+        return JsonDocument.Parse(body);
+    }
+
+    private static JsonDocument PostJson(HttpClient client, string path, object payload)
+    {
+        string json = JsonSerializer.Serialize(payload);
+        using var content = new StringContent(json, Encoding.UTF8, "application/json");
+        using var response = client.PostAsync(path, content).GetAwaiter().GetResult();
+        string body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+        if (!response.IsSuccessStatusCode)
+            throw new InvalidOperationException($"POST {path} failed with {(int)response.StatusCode}: {body}");
 
         return JsonDocument.Parse(body);
     }

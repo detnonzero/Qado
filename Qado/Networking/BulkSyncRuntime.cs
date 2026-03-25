@@ -423,7 +423,11 @@ namespace Qado.Networking
                 if (batch == null)
                     return;
 
-                if (batch.DidRollback)
+                bool restoredAbortedReorg = false;
+                if (batch.DidRollback && context.StartsWith("abort:", StringComparison.Ordinal))
+                    restoredAbortedReorg = TryRestoreAbortedReorg(batch, context);
+
+                if (batch.DidRollback && !restoredAbortedReorg)
                 {
                     try
                     {
@@ -437,7 +441,7 @@ namespace Qado.Networking
                         _log?.Warn("Sync", $"Block sync mempool reconcile failed ({context}): {ex.Message}");
                     }
                 }
-                else
+                else if (!batch.DidRollback)
                 {
                     for (int i = 0; i < batch.AppliedBlocksAsc.Count; i++)
                     {
@@ -452,6 +456,59 @@ namespace Qado.Networking
             {
                 if (batch != null)
                     _validationSerializeGate.Release();
+            }
+        }
+
+        private bool TryRestoreAbortedReorg(BlockSyncBatchContext batch, string context)
+        {
+            if (batch.RolledBackCanonicalBlocksDesc.Count == 0)
+                return false;
+
+            try
+            {
+                lock (Db.Sync)
+                {
+                    using var tx = Db.Connection!.BeginTransaction();
+
+                    for (int i = batch.AppliedBlocksAsc.Count - 1; i >= 0; i--)
+                    {
+                        var applied = batch.AppliedBlocksAsc[i];
+                        if (applied?.BlockHash is not { Length: 32 })
+                            throw new InvalidOperationException("applied sync block missing hash during abort restore");
+
+                        StateUndoStore.RollbackBlock(applied.BlockHash, tx);
+                        BlockIndexStore.SetStatus(applied.BlockHash, BlockIndexStore.StatusHaveBlockPayload, tx);
+                    }
+
+                    ulong restoreFromHeight = batch.RolledBackCanonicalBlocksDesc[^1].BlockHeight;
+                    if (batch.AppliedBlocksAsc.Count > 0 && batch.AppliedBlocksAsc[0].BlockHeight < restoreFromHeight)
+                        restoreFromHeight = batch.AppliedBlocksAsc[0].BlockHeight;
+
+                    BlockStore.DeleteCanonicalFromHeight(restoreFromHeight, tx);
+
+                    for (int i = batch.RolledBackCanonicalBlocksDesc.Count - 1; i >= 0; i--)
+                    {
+                        var oldBlock = batch.RolledBackCanonicalBlocksDesc[i];
+                        if (oldBlock?.BlockHash is not { Length: 32 })
+                            throw new InvalidOperationException("rolled-back canonical block missing hash during abort restore");
+
+                        StateApplier.ApplyBlockWithUndo(oldBlock, tx);
+                        BlockStore.SetCanonicalHashAtHeight(oldBlock.BlockHeight, oldBlock.BlockHash, tx);
+                        BlockIndexStore.SetStatus(oldBlock.BlockHash, BlockIndexStore.StatusCanonicalStateValidated, tx);
+                    }
+
+                    tx.Commit();
+                }
+
+                _log?.Info(
+                    "Sync",
+                    $"Block sync abort restored prior canonical chain ({context}): reapplied={batch.RolledBackCanonicalBlocksDesc.Count}, reverted={batch.AppliedBlocksAsc.Count}");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _log?.Warn("Sync", $"Block sync abort restore failed ({context}): {ex.Message}");
+                return false;
             }
         }
 
