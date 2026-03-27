@@ -242,12 +242,11 @@ namespace Qado
                 LoadAddressBook();
                 ReloadPeers();
                 ScheduleNodeStatusRefresh();
-                StartUiTimer(ScheduleNodeStatusRefresh);
                 _nodeStatusPollTimer?.Dispose();
                 _nodeStatusPollTimer = new Timer(_ =>
                 {
                     if (_isClosing) return;
-                    RefreshNodeStatusHeader();
+                    ScheduleNodeStatusRefresh();
                 }, null, TimeSpan.Zero, TimeSpan.FromSeconds(1));
 
                 Info("Startup", "Qado UI initialized.");

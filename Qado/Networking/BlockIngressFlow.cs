@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using System.Threading;
 using System.Threading.Tasks;
@@ -13,6 +14,12 @@ namespace Qado.Networking
 {
     public sealed class BlockIngressFlow
     {
+        private static readonly TimeSpan TooFarBehindAdmissionLogWindow = TimeSpan.FromSeconds(15);
+        private static readonly TimeSpan TooFarBehindLiveRejectTtl = TimeSpan.FromSeconds(90);
+        private static readonly TimeSpan MissingParentResyncTtl = TimeSpan.FromSeconds(60);
+        private const int MaxTooFarBehindLiveRejectEntries = 20_000;
+        private const int MaxMissingParentResyncEntries = 20_000;
+
         public delegate bool TryStoreOrphanDelegate(
             byte[] payload,
             Block block,
@@ -44,6 +51,14 @@ namespace Qado.Networking
         private readonly Func<Block, PeerSession, CancellationToken, Task> _relayValidatedBlockAsync;
         private readonly Func<byte[], PeerSession, CancellationToken, Task> _promoteOrphansForParentAsync;
         private readonly ILogSink? _log;
+        private readonly object _admissionLogGate = new();
+        private readonly object _tooFarBehindLiveRejectGate = new();
+        private readonly Dictionary<string, DateTime> _tooFarBehindLiveRejectUntilUtc = new(StringComparer.Ordinal);
+        private readonly object _missingParentResyncGate = new();
+        private readonly Dictionary<string, DateTime> _missingParentResyncUntilUtc = new(StringComparer.Ordinal);
+        private DateTime _lastTooFarBehindAdmissionLogUtc = DateTime.MinValue;
+        private int _tooFarBehindAdmissionSuppressed;
+        private string _lastTooFarBehindAdmissionReason = string.Empty;
 
         public BlockIngressFlow(
             BlockDownloadManager blockDownloadManager,
@@ -165,7 +180,10 @@ namespace Qado.Networking
             {
             }
 
-            if (!_blockSyncClient.IsActive && !headerKnown && _shouldRequestMissingHeaderResync())
+            if (!_blockSyncClient.IsActive &&
+                !headerKnown &&
+                _shouldRequestMissingHeaderResync() &&
+                ShouldRequestMissingParentResync(prevHash))
                 _requestSyncNow("block-out-of-plan-missing-block");
 
             ulong candidateHeight = block.BlockHeight;
@@ -274,7 +292,8 @@ namespace Qado.Networking
             }
             else
             {
-                _log?.Warn("P2P", $"{droppedPrefix}: {orphanReason}");
+                if (!IsBenignOrphanDropReason(orphanReason))
+                    _log?.Warn("P2P", $"{droppedPrefix}: {orphanReason}");
                 _blockDownloadManager.MarkBlockValidated(block.BlockHash!, valid: false);
             }
         }
@@ -315,6 +334,14 @@ namespace Qado.Networking
             bool enforceRateLimit = enforceRateLimitOverride ??
                                     arrivalKind != BlockArrivalKind.Requested;
 
+            if (ingress == BlockIngressKind.LivePush &&
+                arrivalKind != BlockArrivalKind.Requested &&
+                ShouldDropCachedTooFarBehindLiveBranch(block.BlockHash!, prevHash))
+            {
+                _blockDownloadManager.MarkBlockValidated(block.BlockHash!, valid: false);
+                return;
+            }
+
             bool replayedInternally = enforceRateLimitOverride.HasValue;
             if (ingress != BlockIngressKind.LivePush &&
                 !replayedInternally &&
@@ -341,7 +368,10 @@ namespace Qado.Networking
                 {
                 }
 
-                if (!_blockSyncClient.IsActive && !headerKnown && _shouldRequestMissingHeaderResync())
+                if (!_blockSyncClient.IsActive &&
+                    !headerKnown &&
+                    _shouldRequestMissingHeaderResync() &&
+                    ShouldRequestMissingParentResync(prevHash))
                     _requestSyncNow("block-out-of-plan-missing-block");
 
                 ulong candidateHeight = block.BlockHeight;
@@ -380,7 +410,8 @@ namespace Qado.Networking
                         }
                         else
                         {
-                            _log?.Warn("P2P", $"Out-of-plan orphan dropped: {orphanReason}");
+                            if (!IsBenignOrphanDropReason(orphanReason))
+                                _log?.Warn("P2P", $"Out-of-plan orphan dropped: {orphanReason}");
                             _blockDownloadManager.MarkBlockValidated(block.BlockHash!, valid: false);
                         }
 
@@ -487,7 +518,8 @@ namespace Qado.Networking
                 }
                 else
                 {
-                    _log?.Warn("P2P", $"Orphan dropped: {orphanReason}");
+                    if (!IsBenignOrphanDropReason(orphanReason))
+                        _log?.Warn("P2P", $"Orphan dropped: {orphanReason}");
                     _blockDownloadManager.MarkBlockValidated(block.BlockHash!, valid: false);
                 }
 
@@ -557,7 +589,8 @@ namespace Qado.Networking
                         }
                         else
                         {
-                            _log?.Warn("P2P", $"Sidechain defer dropped: {orphanReason}");
+                            if (!IsBenignOrphanDropReason(orphanReason))
+                                _log?.Warn("P2P", $"Sidechain defer dropped: {orphanReason}");
                             _blockDownloadManager.MarkBlockValidated(block.BlockHash!, valid: false);
                         }
 
@@ -590,7 +623,14 @@ namespace Qado.Networking
                         payloadBytes: payload.Length,
                         out var admissionReason))
                 {
-                    _log?.Warn("P2P", $"Sidechain block rejected by admission gate: {admissionReason}");
+                    if (ingress == BlockIngressKind.LivePush &&
+                        arrivalKind != BlockArrivalKind.Requested &&
+                        IsTooFarBehindAdmissionReason(admissionReason))
+                    {
+                        RememberTooFarBehindLiveReject(block.BlockHash!);
+                    }
+
+                    LogSidechainAdmissionReject(admissionReason);
                     _blockDownloadManager.MarkBlockValidated(block.BlockHash!, valid: false);
                     return;
                 }
@@ -732,6 +772,156 @@ namespace Qado.Networking
             return true;
         }
 
+        private void LogSidechainAdmissionReject(string admissionReason)
+        {
+            if (!IsTooFarBehindAdmissionReason(admissionReason))
+            {
+                _log?.Warn("P2P", $"Sidechain block rejected by admission gate: {admissionReason}");
+                return;
+            }
+
+            lock (_admissionLogGate)
+            {
+                var now = DateTime.UtcNow;
+                _lastTooFarBehindAdmissionReason = admissionReason;
+
+                if ((now - _lastTooFarBehindAdmissionLogUtc) >= TooFarBehindAdmissionLogWindow)
+                {
+                    if (_tooFarBehindAdmissionSuppressed > 0)
+                    {
+                        _log?.Warn(
+                            "P2P",
+                            $"Sidechain block rejected by admission gate: {_lastTooFarBehindAdmissionReason} (+{_tooFarBehindAdmissionSuppressed} similar rejects suppressed)");
+                    }
+                    else
+                    {
+                        _log?.Warn("P2P", $"Sidechain block rejected by admission gate: {_lastTooFarBehindAdmissionReason}");
+                    }
+
+                    _lastTooFarBehindAdmissionLogUtc = now;
+                    _tooFarBehindAdmissionSuppressed = 0;
+                }
+                else
+                {
+                    _tooFarBehindAdmissionSuppressed++;
+                }
+            }
+        }
+
+        private static bool IsTooFarBehindAdmissionReason(string admissionReason)
+            => !string.IsNullOrWhiteSpace(admissionReason) &&
+               admissionReason.StartsWith("candidate chainwork too far behind", StringComparison.Ordinal);
+
+        private bool ShouldDropCachedTooFarBehindLiveBranch(byte[] blockHash, byte[] prevHash)
+        {
+            lock (_tooFarBehindLiveRejectGate)
+            {
+                var now = DateTime.UtcNow;
+                PruneTooFarBehindLiveRejects_NoLock(now);
+                return IsTooFarBehindLiveRejectCached_NoLock(blockHash, now) ||
+                       IsTooFarBehindLiveRejectCached_NoLock(prevHash, now);
+            }
+        }
+
+        private void RememberTooFarBehindLiveReject(byte[] blockHash)
+        {
+            if (blockHash is not { Length: 32 })
+                return;
+
+            lock (_tooFarBehindLiveRejectGate)
+            {
+                var now = DateTime.UtcNow;
+                PruneTooFarBehindLiveRejects_NoLock(now);
+                if (_tooFarBehindLiveRejectUntilUtc.Count >= MaxTooFarBehindLiveRejectEntries)
+                    _tooFarBehindLiveRejectUntilUtc.Clear();
+
+                _tooFarBehindLiveRejectUntilUtc[Convert.ToHexString(blockHash)] = now + TooFarBehindLiveRejectTtl;
+            }
+        }
+
+        private bool IsTooFarBehindLiveRejectCached_NoLock(byte[] hash, DateTime nowUtc)
+        {
+            if (hash is not { Length: 32 })
+                return false;
+
+            if (!_tooFarBehindLiveRejectUntilUtc.TryGetValue(Convert.ToHexString(hash), out var untilUtc))
+                return false;
+
+            if (untilUtc <= nowUtc)
+            {
+                _tooFarBehindLiveRejectUntilUtc.Remove(Convert.ToHexString(hash));
+                return false;
+            }
+
+            return true;
+        }
+
+        private void PruneTooFarBehindLiveRejects_NoLock(DateTime nowUtc)
+        {
+            if (_tooFarBehindLiveRejectUntilUtc.Count == 0)
+                return;
+
+            List<string>? expired = null;
+            foreach (var kv in _tooFarBehindLiveRejectUntilUtc)
+            {
+                if (kv.Value > nowUtc)
+                    continue;
+
+                expired ??= new List<string>();
+                expired.Add(kv.Key);
+            }
+
+            if (expired == null)
+                return;
+
+            for (int i = 0; i < expired.Count; i++)
+                _tooFarBehindLiveRejectUntilUtc.Remove(expired[i]);
+        }
+
+        private bool ShouldRequestMissingParentResync(byte[] prevHash)
+        {
+            if (prevHash is not { Length: 32 })
+                return true;
+
+            lock (_missingParentResyncGate)
+            {
+                var now = DateTime.UtcNow;
+                PruneMissingParentResyncs_NoLock(now);
+                string key = Convert.ToHexString(prevHash);
+
+                if (_missingParentResyncUntilUtc.TryGetValue(key, out var untilUtc) && untilUtc > now)
+                    return false;
+
+                if (_missingParentResyncUntilUtc.Count >= MaxMissingParentResyncEntries)
+                    _missingParentResyncUntilUtc.Clear();
+
+                _missingParentResyncUntilUtc[key] = now + MissingParentResyncTtl;
+                return true;
+            }
+        }
+
+        private void PruneMissingParentResyncs_NoLock(DateTime nowUtc)
+        {
+            if (_missingParentResyncUntilUtc.Count == 0)
+                return;
+
+            List<string>? expired = null;
+            foreach (var kv in _missingParentResyncUntilUtc)
+            {
+                if (kv.Value > nowUtc)
+                    continue;
+
+                expired ??= new List<string>();
+                expired.Add(kv.Key);
+            }
+
+            if (expired == null)
+                return;
+
+            for (int i = 0; i < expired.Count; i++)
+                _missingParentResyncUntilUtc.Remove(expired[i]);
+        }
+
         private static bool BytesEqual32(byte[] left, byte[] right)
         {
             if (left.Length != 32 || right.Length != 32)
@@ -762,6 +952,10 @@ namespace Qado.Networking
 
         private static bool IsAlreadyBufferedReason(string? reason)
             => string.Equals(reason, "already buffered", StringComparison.Ordinal);
+
+        private static bool IsBenignOrphanDropReason(string? reason)
+            => IsAlreadyBufferedReason(reason) ||
+               string.Equals(reason, "peer orphan cooldown active", StringComparison.Ordinal);
 
         private static string FormatHeightForLog(ulong height)
             => height == 0UL ? "?" : height.ToString(CultureInfo.InvariantCulture);

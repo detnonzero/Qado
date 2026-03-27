@@ -21,8 +21,8 @@ namespace Qado.Networking
 
     public sealed class BlockSyncClient : IDisposable
     {
-        public static readonly TimeSpan BatchResponseTimeout = TimeSpan.FromSeconds(20);
-        private static readonly TimeSpan PeerCooldown = TimeSpan.FromSeconds(15);
+        public static readonly TimeSpan BatchResponseTimeout = TimeSpan.FromSeconds(10);
+        private static readonly TimeSpan PeerCooldown = TimeSpan.FromSeconds(60);
 
         private readonly object _gate = new();
         private readonly Func<IReadOnlyCollection<PeerSession>> _sessionSnapshot;
@@ -109,7 +109,7 @@ namespace Qado.Networking
 
             lock (_gate)
             {
-                shouldAbort = _batchPrepared;
+                shouldAbort = _state != BlockSyncState.Idle;
                 activePeerKey = _activePeerKey;
                 _state = BlockSyncState.Idle;
                 _activePeerKey = null;
@@ -455,7 +455,7 @@ namespace Qado.Networking
             bool shouldAbort;
             lock (_gate)
             {
-                shouldAbort = _batchPrepared;
+                shouldAbort = _state != BlockSyncState.Idle;
             }
 
             if (shouldAbort)

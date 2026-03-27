@@ -87,6 +87,7 @@ internal static class Program
         new TestCase("BlockSyncClient_TipStateStartsSyncWithoutLegacyGetTip", TestBlockSyncClientTipStateStartsSyncWithoutLegacyGetTip),
         new TestCase("BlockSyncClient_PrefersHigherChainworkOverHeight", TestBlockSyncClientPrefersHigherChainworkOverHeight),
         new TestCase("BlockSyncClient_MoreAvailable_ContinuesFromCurrentLocalTip", TestBlockSyncClientMoreAvailableContinuesFromCurrentLocalTip),
+        new TestCase("BlockSyncClient_DisconnectDuringPrepare_DoesNotLeaveStaleBulkSyncBatch", TestBlockSyncClientDisconnectDuringPrepareDoesNotLeaveStaleBulkSyncBatch),
         new TestCase("BlockSyncClient_Disconnect_ResumesFromLastCommitted", TestBlockSyncClientDisconnectResumesFromLastCommitted),
         new TestCase("BlockSyncClient_InvalidBlock_PenalizesAndFallsBack", TestBlockSyncClientInvalidBlockPenalizesAndFallsBack)
     };
@@ -2279,6 +2280,106 @@ internal static class Program
             "resume request payload did not parse");
         Assert(BytesEqual(fromHash, localTip), "resume request did not use last committed hash");
         Assert(maxBlocks == BlockSyncProtocol.BatchMaxBlocks, "resume request max_blocks mismatch");
+    }
+
+    private static void TestBlockSyncClientDisconnectDuringPrepareDoesNotLeaveStaleBulkSyncBatch()
+    {
+        var mempool = new MempoolManager(
+            senderHex => StateStore.GetBalanceU64(senderHex),
+            senderHex => StateStore.GetNonceU64(senderHex),
+            log: null);
+        using var gate = new SemaphoreSlim(1, 1);
+        var runtime = new BulkSyncRuntime(gate, mempool, () => { }, log: null);
+
+        var peer1 = CreateFakePeer("peer-race-1");
+        var peer2 = CreateFakePeer("peer-race-2");
+        var sessions = new List<PeerSession> { peer1, peer2 };
+        var sent = new List<(string peer, MsgType type)>();
+
+        var genesis = BlockStore.GetBlockByHeight(0) ?? throw new InvalidOperationException("missing genesis block");
+        var genesisHash = genesis.BlockHash ?? throw new InvalidOperationException("missing genesis hash");
+        UInt128 localTipChainwork = BlockIndexStore.GetChainwork(genesisHash);
+        UInt128 peer1TipChainwork = localTipChainwork == 0 ? 2UL : localTipChainwork + 2UL;
+        UInt128 peer2TipChainwork = peer1TipChainwork + 1UL;
+        byte[] remoteTipHash = HashFromU64(999UL);
+
+        BlockSyncClient? client = null;
+        bool injectedDisconnect = false;
+
+        client = new BlockSyncClient(
+            sessionSnapshot: () => sessions.ToArray(),
+            sendFrameAsync: (peer, type, payload, ct) =>
+            {
+                sent.Add((peer.SessionKey, type));
+                return Task.CompletedTask;
+            },
+            getLocalTipChainwork: () =>
+            {
+                lock (Db.Sync)
+                {
+                    var tipHash = BlockStore.GetCanonicalHashAtHeight(BlockStore.GetLatestHeight()) ?? Array.Empty<byte>();
+                    return tipHash is { Length: 32 } ? BlockIndexStore.GetChainwork(tipHash) : 0;
+                }
+            },
+            getLocalTipHash: () =>
+            {
+                lock (Db.Sync)
+                    return BlockStore.GetCanonicalHashAtHeight(BlockStore.GetLatestHeight()) ?? Array.Empty<byte>();
+            },
+            prepareBatchAsync: async (startHash, startHeight, advertisedTipChainwork, peer, ct) =>
+            {
+                var prepare = await runtime.PrepareBatchAsync(startHash, startHeight, advertisedTipChainwork, peer, ct).ConfigureAwait(false);
+                if (prepare.Success && !injectedDisconnect && string.Equals(peer.SessionKey, peer1.SessionKey, StringComparison.Ordinal))
+                {
+                    injectedDisconnect = true;
+                    await client!.OnPeerDisconnectedAsync(peer1, CancellationToken.None).ConfigureAwait(false);
+                }
+
+                return prepare;
+            },
+            commitChunkAsync: runtime.CommitChunkAsync,
+            completeBatchAsync: runtime.CompleteBatchAsync,
+            abortBatchAsync: runtime.AbortBatchAsync,
+            log: null);
+
+        client.OnTipStateAsync(peer1, new SmallNetTipStateFrame(1UL, remoteTipHash, peer1TipChainwork, null, new[] { genesisHash, remoteTipHash }), CancellationToken.None)
+            .GetAwaiter().GetResult();
+        Assert(sent.Count == 1 && sent[0].peer == peer1.SessionKey && sent[0].type == MsgType.GetBlocksByLocator,
+            "initial sync request must target the first peer via locator");
+
+        client.OnBlocksBatchStartAsync(
+                peer1,
+                new SmallNetBlocksBatchStartFrame(Guid.NewGuid(), genesisHash, 0UL, 1, remoteTipHash, peer1TipChainwork),
+                CancellationToken.None)
+            .GetAwaiter().GetResult();
+
+        sent.Clear();
+        client.OnTipStateAsync(peer2, new SmallNetTipStateFrame(1UL, remoteTipHash, peer2TipChainwork, null, new[] { genesisHash, remoteTipHash }), CancellationToken.None)
+            .GetAwaiter().GetResult();
+        Assert(sent.Count == 1 && sent[0].peer == peer2.SessionKey && sent[0].type == MsgType.GetBlocksByLocator,
+            "after disconnect the client must retry sync against the second peer");
+
+        var peer2Prepare = runtime.PrepareBatchAsync(genesisHash, 1UL, peer2TipChainwork, peer2, CancellationToken.None)
+            .GetAwaiter().GetResult();
+
+        if (peer2Prepare.Success)
+        {
+            runtime.AbortBatchAsync(peer2, "selftest cleanup", CancellationToken.None)
+                .GetAwaiter().GetResult();
+        }
+        else
+        {
+            runtime.AbortBatchAsync(null, "selftest cleanup stale batch", CancellationToken.None)
+                .GetAwaiter().GetResult();
+        }
+
+        Assert(peer2Prepare.Success,
+            $"disconnect during batch prepare left a stale bulk-sync batch behind: {peer2Prepare.Error}");
+
+        bool gateReleased = gate.Wait(0);
+        Assert(gateReleased, "bulk-sync validation gate must be released after cleanup");
+        if (gateReleased)
+            gate.Release();
     }
 
     private static void TestBlockSyncClientMoreAvailableContinuesFromCurrentLocalTip()

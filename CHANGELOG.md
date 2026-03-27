@@ -2,6 +2,36 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.5.3] - 2026-03-27
+
+### Fixed
+- A block-sync disconnect race no longer leaves a stale active bulk-sync batch behind:
+  - disconnects during the batch-prepare window are now aborted/cleaned up correctly
+  - affected nodes can resume normal sync instead of getting stuck behind `another batch is already active`
+- Nodes under heavy stale-sidechain/orphan pressure now avoid several unnecessary hot-path loops:
+  - repeated unsolicited live blocks on clearly underpowered side branches are cached briefly and dropped earlier instead of being reprocessed expensively each time
+  - repeated missing-parent live blocks no longer keep retriggering global `block-out-of-plan-missing-block` resync resets for the same parent hash
+  - peers that repeatedly hit the live-orphan per-peer cap now enter a short local orphan cooldown instead of continuously reflooding the same hot path
+  - nodes that learn about new canonical blocks through normal inbound sync/validation now broadcast fresh `TipState` updates faster instead of waiting only for slower periodic refreshes
+
+### Changed
+- P2P/sync logging was made less noisy under stale-sidechain and recovery pressure:
+  - repeated `candidate chainwork too far behind` admission-gate rejects are now rate-limited and summarized
+  - repeated `Validation queue full` drops are now rate-limited and summarized
+  - benign orphan parent-pack send failures caused by canceled/disposed peer streams are now downgraded and summarized instead of spamming warnings
+- Additional runtime throttling was added to reduce unnecessary CPU/network churn without changing consensus behavior:
+  - inbound public claims are now probed via the bounded reconnect/probe path instead of firing immediate standalone probes per claim
+  - duplicate idle node-status polling in the GUI was removed
+  - per-peer orphan buffering now keeps newer live candidates by evicting that peer's oldest orphan entry when its local window is full
+  - the per-peer orphan window was reduced from `128` to `64`
+  - peers that repeatedly overflow their live-orphan window now get a short local backoff (`15s`, then `30s`, max `60s`) for further unsolicited live orphans
+  - periodic `TipState` refreshes now run every `5s` instead of every `20s`
+  - canonical-chain changes now also trigger an immediate `TipState` broadcast with a short `2s` cooldown
+  - block-sync batch timeouts were reduced from `20s` to `10s`, while post-timeout sync-peer cooldowns were increased from `15s` to `60s` to move past stalled peers faster and avoid immediately retrying them
+
+### Notes
+- This release is a targeted hotfix/stability update for nodes that could fall behind after mid-batch peer disconnects.
+
 ## [0.5.2] - 2026-03-25
 
 ### Added

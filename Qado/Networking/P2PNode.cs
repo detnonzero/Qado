@@ -45,17 +45,25 @@ namespace Qado.Networking
         private const long MaxSideCandidateBytes = 256L * 1024L * 1024L;
         private static readonly UInt128 SideAdmissionWorkSlack = 131_072;
         private const int MaxOrphansTotal = 2000;
-        private const int MaxOrphansPerPeer = 128;
+        private const int MaxOrphansPerPeer = 64;
         private static readonly TimeSpan OrphanTtl = TimeSpan.FromMinutes(10);
         private const int MaxOrphanPromotionsPerPass = 256;
+        private const int OrphanPeerCooldownTriggerCount = 3;
+        private const int MaxOrphanPeerCooldownEntries = 4096;
+        private static readonly TimeSpan OrphanPeerStrikeWindow = TimeSpan.FromSeconds(30);
+        private static readonly TimeSpan OrphanPeerInitialCooldown = TimeSpan.FromSeconds(15);
+        private static readonly TimeSpan OrphanPeerMaxCooldown = TimeSpan.FromSeconds(60);
         private static readonly TimeSpan KnownBlockLogCooldown = TimeSpan.FromSeconds(12);
         private const int MaxKnownBlockLogEntries = 4096;
+        private static readonly TimeSpan ValidationQueueFullLogWindow = TimeSpan.FromSeconds(10);
+        private static readonly TimeSpan ParentPackBenignFailureLogWindow = TimeSpan.FromSeconds(15);
         private static readonly TimeSpan MissingHeaderResyncCooldown = TimeSpan.FromSeconds(12);
         private static readonly TimeSpan BlockRelayCooldown = TimeSpan.FromMinutes(2);
         private const int MaxBlockRelayEntries = 8192;
         private static readonly LruSet ParentRequestSeen = new(capacity: 200_000, ttl: TimeSpan.FromMinutes(5));
         private static readonly TimeSpan PeerExchangeInterval = TimeSpan.FromMinutes(15);
-        private static readonly TimeSpan InventoryRefreshInterval = TimeSpan.FromSeconds(20);
+        private static readonly TimeSpan InventoryRefreshInterval = TimeSpan.FromSeconds(5);
+        private static readonly TimeSpan ImmediateTipStateBroadcastCooldown = TimeSpan.FromSeconds(2);
         private static readonly TimeSpan LatencyProbeInterval = TimeSpan.FromSeconds(60);
         private static readonly TimeSpan LatencyProbeTimeout = TimeSpan.FromSeconds(10);
         private static readonly TimeSpan ConnectedPeerSeenRefreshInterval = TimeSpan.FromHours(1);
@@ -89,12 +97,26 @@ namespace Qado.Networking
         private readonly Dictionary<string, OrphanEntry> _orphansByHash = new(StringComparer.Ordinal);
         private readonly Dictionary<string, List<OrphanEntry>> _orphansByPrev = new(StringComparer.Ordinal);
         private readonly Dictionary<string, int> _orphansByPeer = new(StringComparer.Ordinal);
+        private readonly object _peerOrphanCooldownGate = new();
+        private readonly Dictionary<string, PeerOrphanCooldownState> _peerOrphanCooldowns = new(StringComparer.Ordinal);
         private readonly object _knownBlockLogGate = new();
         private readonly Dictionary<string, DateTime> _knownBlockLogByHash = new(StringComparer.Ordinal);
+        private readonly object _validationQueueLogGate = new();
+        private DateTime _lastLiveQueueFullLogUtc = DateTime.MinValue;
+        private int _liveQueueFullSuppressed;
+        private DateTime _lastAncestorPackQueueFullLogUtc = DateTime.MinValue;
+        private int _ancestorPackQueueFullSuppressed;
+        private readonly object _parentPackFailureLogGate = new();
+        private DateTime _lastBenignParentPackFailureLogUtc = DateTime.MinValue;
+        private int _benignParentPackFailureSuppressed;
+        private string _lastBenignParentPackFailureMessage = string.Empty;
         private readonly object _missingHeaderResyncGate = new();
         private DateTime _nextMissingHeaderResyncAllowedUtc = DateTime.MinValue;
         private readonly object _blockRelayGate = new();
         private readonly Dictionary<string, DateTime> _blockRelayByHash = new(StringComparer.Ordinal);
+        private readonly object _tipStateBroadcastGate = new();
+        private DateTime _nextImmediateTipStateBroadcastAllowedUtc = DateTime.MinValue;
+        private int _immediateTipStateBroadcastInFlight;
         private readonly ConcurrentDictionary<string, byte> _dialInFlight = new(StringComparer.Ordinal);
         private readonly SemaphoreSlim _validationSerializeGate = new(1, 1);
         private readonly BlockDownloadManager _blockDownloadManager;
@@ -119,6 +141,15 @@ namespace Qado.Networking
             public string SessionKey = "";
             public BlockIngressKind Ingress = BlockIngressKind.LivePush;
             public DateTime ReceivedUtc = DateTime.UtcNow;
+        }
+
+        private sealed class PeerOrphanCooldownState
+        {
+            public DateTime WindowStartUtc = DateTime.UtcNow;
+            public int StrikeCount;
+            public DateTime CooldownUntilUtc = DateTime.MinValue;
+            public TimeSpan CooldownDuration = TimeSpan.Zero;
+            public DateTime LastTouchedUtc = DateTime.UtcNow;
         }
 
         private enum ConnectOutcome
@@ -508,6 +539,14 @@ namespace Qado.Networking
                     {
                     }
 
+                    try
+                    {
+                        await ProbePublicClaimsAsync(ct).ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                    }
+
                     RefreshConnectedPeerLastSeenNoThrow();
 
                     var baseDelay = HasAnyHandshakePeerConnected()
@@ -887,7 +926,7 @@ namespace Qado.Networking
 
                 case MsgType.Block:
                     if (!_blockDownloadManager.EnqueueBlockPayload(s, payload, BlockIngressKind.LivePush))
-                        _log?.Warn("Sync", "Validation queue full. Dropping inbound live block payload.");
+                        LogValidationQueueFull(isAncestorPack: false);
                     return;
 
                 case MsgType.GetAncestorPack:
@@ -1060,12 +1099,11 @@ namespace Qado.Networking
                 }
                 else
                 {
-                    // Inbound session is only a claim; verify exactly once via immediate outbound probe.
+                    // Inbound session is only a claim; queue it for the bounded periodic probe path.
                     _log?.Info(
                         "P2P",
                         $"inbound public claim registered: remoteEndpoint={EndpointLogFormatter.FormatEndpoint(s.RemoteEndpoint)}, detectedIp={EndpointLogFormatter.FormatHost(ip)}, advertisedPort={port}");
                     NotePeerPublicClaim(ip, port);
-                    _ = TryProbePublicClaimImmediatelyAsync(ip, port);
                 }
             }
 
@@ -1245,7 +1283,7 @@ namespace Qado.Networking
 
                 if (!_blockDownloadManager.EnqueueBlockPayload(s, blockPayload, BlockIngressKind.Recovery, enforceRateLimitOverride: false))
                 {
-                    _log?.Warn("Sync", "Validation queue full. Dropping ancestor-pack block payload.");
+                    LogValidationQueueFull(isAncestorPack: true);
                     return;
                 }
             }
@@ -1282,6 +1320,8 @@ namespace Qado.Networking
 
         private void NotifyUiAfterCanonicalChange()
         {
+            TriggerImmediateTipStateBroadcast();
+
             try
             {
                 Application.Current?.Dispatcher.BeginInvoke(new Action(() =>
@@ -1295,6 +1335,44 @@ namespace Qado.Networking
                 }));
             }
             catch { }
+        }
+
+        private void TriggerImmediateTipStateBroadcast()
+        {
+            if (Volatile.Read(ref _stopped) != 0)
+                return;
+            if (Volatile.Read(ref _immediateTipStateBroadcastInFlight) != 0)
+                return;
+
+            var nowUtc = DateTime.UtcNow;
+            lock (_tipStateBroadcastGate)
+            {
+                if (nowUtc < _nextImmediateTipStateBroadcastAllowedUtc)
+                    return;
+                if (Volatile.Read(ref _immediateTipStateBroadcastInFlight) != 0)
+                    return;
+
+                _nextImmediateTipStateBroadcastAllowedUtc = nowUtc + ImmediateTipStateBroadcastCooldown;
+            }
+
+            if (Interlocked.Exchange(ref _immediateTipStateBroadcastInFlight, 1) != 0)
+                return;
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    var payload = _smallNetPeerFlow.BuildLocalTipStatePayload();
+                    await BroadcastAsync(MsgType.TipState, payload, ct: default).ConfigureAwait(false);
+                }
+                catch
+                {
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _immediateTipStateBroadcastInFlight, 0);
+                }
+            });
         }
 
         private void MarkStoredBlockInvalidNoThrow(byte[] blockHash, BadChainReason reason, string context)
@@ -1347,13 +1425,91 @@ namespace Qado.Networking
                     }
                     catch (Exception ex)
                     {
-                        _log?.Warn("Sync", $"{source}: parent-pack request failed for {Hex16(parentHash)} via {EndpointLogFormatter.FormatEndpoint(peer.RemoteEndpoint)}: {ex.Message}");
+                        LogParentPackRequestFailure(source, parentHash, peer, ex);
                     }
                 }, CancellationToken.None);
             }
             catch
             {
             }
+        }
+
+        private void LogValidationQueueFull(bool isAncestorPack)
+        {
+            lock (_validationQueueLogGate)
+            {
+                var now = DateTime.UtcNow;
+                ref var lastLogUtc = ref isAncestorPack ? ref _lastAncestorPackQueueFullLogUtc : ref _lastLiveQueueFullLogUtc;
+                ref var suppressed = ref isAncestorPack ? ref _ancestorPackQueueFullSuppressed : ref _liveQueueFullSuppressed;
+                string message = isAncestorPack
+                    ? "Validation queue full. Dropping ancestor-pack block payload."
+                    : "Validation queue full. Dropping inbound live block payload.";
+
+                if ((now - lastLogUtc) >= ValidationQueueFullLogWindow)
+                {
+                    if (suppressed > 0)
+                        _log?.Warn("Sync", $"{message} (+{suppressed} similar drops suppressed)");
+                    else
+                        _log?.Warn("Sync", message);
+
+                    lastLogUtc = now;
+                    suppressed = 0;
+                }
+                else
+                {
+                    suppressed++;
+                }
+            }
+        }
+
+        private void LogParentPackRequestFailure(string source, byte[] parentHash, PeerSession peer, Exception ex)
+        {
+            string endpoint = EndpointLogFormatter.FormatEndpoint(peer.RemoteEndpoint);
+            string message = $"{source}: parent-pack request failed for {Hex16(parentHash)} via {endpoint}: {ex.Message}";
+
+            if (!IsBenignParentPackFailure(ex))
+            {
+                _log?.Warn("Sync", message);
+                return;
+            }
+
+            lock (_parentPackFailureLogGate)
+            {
+                var now = DateTime.UtcNow;
+                _lastBenignParentPackFailureMessage = message;
+
+                if ((now - _lastBenignParentPackFailureLogUtc) >= ParentPackBenignFailureLogWindow)
+                {
+                    if (_benignParentPackFailureSuppressed > 0)
+                    {
+                        _log?.Info(
+                            "Sync",
+                            $"{_lastBenignParentPackFailureMessage} (+{_benignParentPackFailureSuppressed} similar benign send failures suppressed)");
+                    }
+                    else
+                    {
+                        _log?.Info("Sync", _lastBenignParentPackFailureMessage);
+                    }
+
+                    _lastBenignParentPackFailureLogUtc = now;
+                    _benignParentPackFailureSuppressed = 0;
+                }
+                else
+                {
+                    _benignParentPackFailureSuppressed++;
+                }
+            }
+        }
+
+        private static bool IsBenignParentPackFailure(Exception ex)
+        {
+            if (ex is OperationCanceledException || ex is ObjectDisposedException)
+                return true;
+
+            string message = ex.Message ?? string.Empty;
+            return message.Contains("disposed object", StringComparison.OrdinalIgnoreCase) ||
+                   message.Contains("task was canceled", StringComparison.OrdinalIgnoreCase) ||
+                   message.Contains("operation was canceled", StringComparison.OrdinalIgnoreCase);
         }
 
         private async Task<int> BroadcastAsync(MsgType t, byte[] payload, string? exceptEndpoint = null, CancellationToken ct = default)
@@ -2349,6 +2505,13 @@ namespace Qado.Networking
             }
 
             var now = DateTime.UtcNow;
+            if (ingress == BlockIngressKind.LivePush &&
+                ShouldIgnorePeerLiveOrphans(peerKey, now))
+            {
+                reason = "peer orphan cooldown active";
+                return false;
+            }
+
             var orphan = new OrphanEntry
             {
                 Payload = (byte[])payload.Clone(),
@@ -2376,8 +2539,25 @@ namespace Qado.Networking
                 int peerCount = _orphansByPeer.TryGetValue(orphan.PeerKey, out var n) ? n : 0;
                 if (peerCount >= MaxOrphansPerPeer)
                 {
-                    reason = "per-peer orphan limit reached";
-                    return false;
+                    if (ingress == BlockIngressKind.LivePush &&
+                        NotePeerLiveOrphanLimitHit(orphan.PeerKey, now))
+                    {
+                        reason = "peer orphan cooldown active";
+                        return false;
+                    }
+
+                    if (!EvictOldestOrphanForPeerNoLock(orphan.PeerKey))
+                    {
+                        reason = "per-peer orphan limit reached";
+                        return false;
+                    }
+
+                    peerCount = _orphansByPeer.TryGetValue(orphan.PeerKey, out n) ? n : 0;
+                    if (peerCount >= MaxOrphansPerPeer)
+                    {
+                        reason = "per-peer orphan limit reached";
+                        return false;
+                    }
                 }
 
                 while (_orphansByHash.Count >= MaxOrphansTotal)
@@ -2400,6 +2580,77 @@ namespace Qado.Networking
             }
 
             return true;
+        }
+
+        private bool ShouldIgnorePeerLiveOrphans(string peerKey, DateTime nowUtc)
+        {
+            if (string.IsNullOrWhiteSpace(peerKey))
+                return false;
+
+            lock (_peerOrphanCooldownGate)
+            {
+                PrunePeerOrphanCooldownsNoLock(nowUtc);
+
+                if (!_peerOrphanCooldowns.TryGetValue(peerKey, out var state))
+                    return false;
+
+                state.LastTouchedUtc = nowUtc;
+                if (nowUtc < state.CooldownUntilUtc)
+                    return true;
+
+                if ((nowUtc - state.WindowStartUtc) > OrphanPeerStrikeWindow)
+                {
+                    state.WindowStartUtc = nowUtc;
+                    state.StrikeCount = 0;
+                    state.CooldownDuration = TimeSpan.Zero;
+                }
+
+                return false;
+            }
+        }
+
+        private bool NotePeerLiveOrphanLimitHit(string peerKey, DateTime nowUtc)
+        {
+            if (string.IsNullOrWhiteSpace(peerKey))
+                return false;
+
+            lock (_peerOrphanCooldownGate)
+            {
+                PrunePeerOrphanCooldownsNoLock(nowUtc);
+
+                if (!_peerOrphanCooldowns.TryGetValue(peerKey, out var state))
+                {
+                    state = new PeerOrphanCooldownState
+                    {
+                        WindowStartUtc = nowUtc,
+                        LastTouchedUtc = nowUtc
+                    };
+                    _peerOrphanCooldowns[peerKey] = state;
+                }
+
+                state.LastTouchedUtc = nowUtc;
+                if ((nowUtc - state.WindowStartUtc) > OrphanPeerStrikeWindow)
+                {
+                    state.WindowStartUtc = nowUtc;
+                    state.StrikeCount = 0;
+                    if (state.CooldownUntilUtc <= nowUtc)
+                        state.CooldownDuration = TimeSpan.Zero;
+                }
+
+                state.StrikeCount++;
+                if (state.StrikeCount < OrphanPeerCooldownTriggerCount)
+                    return false;
+
+                var nextCooldown = state.CooldownDuration <= TimeSpan.Zero
+                    ? OrphanPeerInitialCooldown
+                    : TimeSpan.FromSeconds(Math.Min(state.CooldownDuration.TotalSeconds * 2.0, OrphanPeerMaxCooldown.TotalSeconds));
+
+                state.CooldownDuration = nextCooldown;
+                state.CooldownUntilUtc = nowUtc + nextCooldown;
+                state.WindowStartUtc = nowUtc;
+                state.StrikeCount = 0;
+                return true;
+            }
         }
 
         private async Task PromoteOrphansForParentAsync(byte[] parentHash, PeerSession s, CancellationToken ct)
@@ -2497,6 +2748,44 @@ namespace Qado.Networking
                 RemoveOrphanByHashNoLock(stale[i]);
         }
 
+        private void PrunePeerOrphanCooldownsNoLock(DateTime nowUtc)
+        {
+            if (_peerOrphanCooldowns.Count == 0)
+                return;
+
+            var stale = new List<string>();
+            foreach (var kv in _peerOrphanCooldowns)
+            {
+                var state = kv.Value;
+                bool cooldownExpired = state.CooldownUntilUtc <= nowUtc;
+                bool quietLongEnough = (nowUtc - state.LastTouchedUtc) > OrphanPeerStrikeWindow;
+                if (cooldownExpired && quietLongEnough)
+                    stale.Add(kv.Key);
+            }
+
+            for (int i = 0; i < stale.Count; i++)
+                _peerOrphanCooldowns.Remove(stale[i]);
+
+            while (_peerOrphanCooldowns.Count > MaxOrphanPeerCooldownEntries)
+            {
+                string? oldestKey = null;
+                DateTime oldest = DateTime.MaxValue;
+                foreach (var kv in _peerOrphanCooldowns)
+                {
+                    if (kv.Value.LastTouchedUtc < oldest)
+                    {
+                        oldest = kv.Value.LastTouchedUtc;
+                        oldestKey = kv.Key;
+                    }
+                }
+
+                if (oldestKey == null)
+                    break;
+
+                _peerOrphanCooldowns.Remove(oldestKey);
+            }
+        }
+
         private bool EvictOldestOrphanNoLock()
         {
             if (_orphansByHash.Count == 0) return false;
@@ -2505,6 +2794,29 @@ namespace Qado.Networking
             DateTime oldest = DateTime.MaxValue;
             foreach (var kv in _orphansByHash)
             {
+                if (kv.Value.ReceivedUtc < oldest)
+                {
+                    oldest = kv.Value.ReceivedUtc;
+                    oldestKey = kv.Key;
+                }
+            }
+
+            if (oldestKey == null) return false;
+            return RemoveOrphanByHashNoLock(oldestKey);
+        }
+
+        private bool EvictOldestOrphanForPeerNoLock(string peerKey)
+        {
+            if (string.IsNullOrWhiteSpace(peerKey) || _orphansByHash.Count == 0)
+                return false;
+
+            string? oldestKey = null;
+            DateTime oldest = DateTime.MaxValue;
+            foreach (var kv in _orphansByHash)
+            {
+                if (!string.Equals(kv.Value.PeerKey, peerKey, StringComparison.Ordinal))
+                    continue;
+
                 if (kv.Value.ReceivedUtc < oldest)
                 {
                     oldest = kv.Value.ReceivedUtc;
