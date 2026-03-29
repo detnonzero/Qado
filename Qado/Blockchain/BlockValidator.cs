@@ -98,6 +98,23 @@ namespace Qado.Blockchain
                 tx: tx,
                 out reason);
 
+        public static bool ValidateNetworkSideBlockStateless(
+            Block block,
+            Func<ulong, Block?> getChainBlockByHeight,
+            out string reason,
+            SqliteTransaction? tx = null)
+            => ValidateCommon(
+                block,
+                strictTxChecks: true,
+                requirePrevKnown: true,
+                enforceTipExtending: false,
+                validateStateAgainstCanonical: false,
+                skipHeightSensitiveChecksWithoutParent: false,
+                tx: tx,
+                out reason,
+                canonicalTipOverride: null,
+                getCanonicalBlockByHeightOverride: getChainBlockByHeight);
+
 
         private static bool ValidateCommon(
             Block block,

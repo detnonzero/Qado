@@ -11,17 +11,21 @@ namespace Qado.Networking
     }
 
     public readonly record struct BlockChunkFrame(ulong FirstHeight, IReadOnlyList<byte[]> Blocks);
+    public readonly record struct BlockBatchFrame(ulong FirstHeight, IReadOnlyList<byte[]> Blocks);
 
     public static class BlockSyncProtocol
     {
-        public const int BatchMaxBlocks = 4096;
-        public const int ChunkBlocks = 64;
+        public const int BatchMaxBlocks = 128;
+        public const int ExtendedSyncWindowBlocks = 512;
+        public const int LegacyChunkBlocks = 64;
         public const int MaxLocatorHashes = 64;
         public const int MaxSerializedBlockBytes = 64 * 1024;
+        public static readonly int MaxBlockBatchPayloadBytes =
+            8 + 4 + (BatchMaxBlocks * (4 + MaxSerializedBlockBytes));
         public static readonly int MaxBlockChunkPayloadBytes =
-            8 + 4 + (ChunkBlocks * (4 + MaxSerializedBlockBytes));
+            8 + 4 + (LegacyChunkBlocks * (4 + MaxSerializedBlockBytes));
         public static readonly int MaxFramePayloadBytes = Math.Max(
-            MaxBlockChunkPayloadBytes,
+            Math.Max(MaxBlockBatchPayloadBytes, MaxBlockChunkPayloadBytes),
             4 + (MaxLocatorHashes * 32) + 4);
 
         public static byte[] BuildGetBlocksByLocator(IReadOnlyList<byte[]> locatorHashes, int maxBlocks = BatchMaxBlocks)
@@ -113,7 +117,7 @@ namespace Qado.Networking
         public static byte[] BuildBlockChunk(ulong firstHeight, IReadOnlyList<byte[]> blocks)
         {
             blocks ??= Array.Empty<byte[]>();
-            if (blocks.Count == 0 || blocks.Count > ChunkBlocks)
+            if (blocks.Count == 0 || blocks.Count > LegacyChunkBlocks)
                 throw new ArgumentOutOfRangeException(nameof(blocks));
 
             int totalSize = 8 + 4;
@@ -155,7 +159,7 @@ namespace Qado.Networking
 
             ulong firstHeight = BinaryPrimitives.ReadUInt64LittleEndian(payload.AsSpan(0, 8));
             uint count = BinaryPrimitives.ReadUInt32LittleEndian(payload.AsSpan(8, 4));
-            if (count == 0 || count > ChunkBlocks)
+            if (count == 0 || count > LegacyChunkBlocks)
                 return false;
 
             var blocks = new List<byte[]>((int)count);
@@ -183,16 +187,89 @@ namespace Qado.Networking
             return true;
         }
 
+        public static byte[] BuildBlockBatch(ulong firstHeight, IReadOnlyList<byte[]> blocks)
+        {
+            blocks ??= Array.Empty<byte[]>();
+            if (blocks.Count == 0 || blocks.Count > BatchMaxBlocks)
+                throw new ArgumentOutOfRangeException(nameof(blocks));
+
+            int totalSize = 8 + 4;
+            for (int i = 0; i < blocks.Count; i++)
+            {
+                var block = blocks[i];
+                if (block == null || block.Length == 0 || block.Length > MaxSerializedBlockBytes)
+                    throw new ArgumentException("invalid block blob length", nameof(blocks));
+
+                checked
+                {
+                    totalSize += 4;
+                    totalSize += block.Length;
+                }
+            }
+
+            var payload = new byte[totalSize];
+            BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(0, 8), firstHeight);
+            BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(8, 4), (uint)blocks.Count);
+
+            int offset = 12;
+            for (int i = 0; i < blocks.Count; i++)
+            {
+                var block = blocks[i];
+                BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(offset, 4), (uint)block.Length);
+                offset += 4;
+                block.CopyTo(payload, offset);
+                offset += block.Length;
+            }
+
+            return payload;
+        }
+
+        public static bool TryParseBlockBatch(byte[] payload, out BlockBatchFrame frame)
+        {
+            frame = default;
+            if (payload == null || payload.Length < 12)
+                return false;
+
+            ulong firstHeight = BinaryPrimitives.ReadUInt64LittleEndian(payload.AsSpan(0, 8));
+            uint count = BinaryPrimitives.ReadUInt32LittleEndian(payload.AsSpan(8, 4));
+            if (count == 0 || count > BatchMaxBlocks)
+                return false;
+
+            var blocks = new List<byte[]>((int)count);
+            int offset = 12;
+            for (int i = 0; i < count; i++)
+            {
+                if (offset + 4 > payload.Length)
+                    return false;
+
+                uint len = BinaryPrimitives.ReadUInt32LittleEndian(payload.AsSpan(offset, 4));
+                offset += 4;
+                if (len == 0 || len > MaxSerializedBlockBytes)
+                    return false;
+                if (offset + len > payload.Length)
+                    return false;
+
+                blocks.Add(payload.AsSpan(offset, (int)len).ToArray());
+                offset += (int)len;
+            }
+
+            if (offset != payload.Length)
+                return false;
+
+            frame = new BlockBatchFrame(firstHeight, blocks);
+            return true;
+        }
+
         public static List<byte[]> BuildChunkPayloads(IReadOnlyList<byte[]> blocks, ulong startHeight = 0)
         {
             blocks ??= Array.Empty<byte[]>();
-            var payloads = new List<byte[]>((blocks.Count + ChunkBlocks - 1) / ChunkBlocks);
+            var payloads = new List<byte[]>((blocks.Count + LegacyChunkBlocks - 1) / LegacyChunkBlocks);
             int offset = 0;
             ulong height = startHeight;
 
             while (offset < blocks.Count)
             {
-                int take = Math.Min(ChunkBlocks, blocks.Count - offset);
+                int take = Math.Min(LegacyChunkBlocks, blocks.Count - offset);
                 var slice = new byte[take][];
                 for (int i = 0; i < take; i++)
                     slice[i] = blocks[offset + i];
@@ -209,7 +286,7 @@ namespace Qado.Networking
         {
             if (maxBlocks <= 0)
                 return BatchMaxBlocks;
-            return Math.Min(maxBlocks, BatchMaxBlocks);
+            return Math.Min(maxBlocks, ExtendedSyncWindowBlocks);
         }
     }
 }

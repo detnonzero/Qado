@@ -16,6 +16,7 @@ namespace Qado.Storage
 
     public enum StartupAuditIssueCode
     {
+        CryptoRuntimeSelfTestFailed,
         MissingGenesisCanon,
         GenesisMismatch,
         CanonGap,
@@ -42,6 +43,13 @@ namespace Qado.Storage
 
     public static class StartupIntegrityAudit
     {
+        private const string KnownMainnetSignatureProbeTxHex =
+            "0200000001f721b74f3946370d78baabd330b5619638464af1d3ee97fd7d3fea216e37ff2e" +
+            "12a1be846a42cd13337b7564d2824fdf245a5f1c8f171a1269b98c3131e94b790000000000" +
+            "000000000000003b9aca0000000000000000000000000005f5e10000000000000000010040" +
+            "331be203329581e2fc7cc4b67a26c7be4153cd2a18eebfa7dd4c443930cd7f6977558864370" +
+            "b362253700422982c06040753cbea042f261d38401ccc9914a808";
+
         public static StartupAuditResult Run()
         {
             if (Db.Connection == null)
@@ -51,6 +59,16 @@ namespace Qado.Storage
             ulong tipHeight = 0;
             string? tipHashHex = null;
             bool repairableDerivedState = false;
+
+            if (!TryValidateKnownMainnetSignatureProbe(out var cryptoReason))
+            {
+                return CreateBlockingResult(
+                    issues,
+                    tipHeight,
+                    tipHashHex,
+                    StartupAuditIssueCode.CryptoRuntimeSelfTestFailed,
+                    cryptoReason);
+            }
 
             lock (Db.Sync)
             {
@@ -292,7 +310,16 @@ namespace Qado.Storage
             {
                 case StartupAuditDisposition.HardStopCanonCorruption:
                     message.AppendLine();
-                    message.Append("QADO did not modify your database. Back up the data directory and perform a chain resync before restarting.");
+                    if (result.Issues.Count > 0 && result.Issues[0].Code == StartupAuditIssueCode.CryptoRuntimeSelfTestFailed)
+                    {
+                        message.Append(
+                            "Redeploy the full publish folder, including the runtimes directory, and avoid mixing files from older builds. " +
+                            "Verify that runtimes\\win-x64\\native\\libsodium.dll is present next to the deployed app.");
+                    }
+                    else
+                    {
+                        message.Append("QADO did not modify your database. Back up the data directory and perform a chain resync before restarting.");
+                    }
                     break;
                 case StartupAuditDisposition.RepairableDerivedState:
                     message.AppendLine();
@@ -394,5 +421,30 @@ namespace Qado.Storage
 
         private static string Hex(byte[] bytes)
             => Convert.ToHexString(bytes).ToLowerInvariant();
+
+        private static bool TryValidateKnownMainnetSignatureProbe(out string reason)
+        {
+            try
+            {
+                var tx = TxBinarySerializer.Read(Convert.FromHexString(KnownMainnetSignatureProbeTxHex));
+                if (TransactionValidator.ValidateBasic(tx, out var validationReason))
+                {
+                    reason = "OK";
+                    return true;
+                }
+
+                reason =
+                    "cryptographic runtime self-test failed: a known mainnet transaction signature did not validate " +
+                    $"({validationReason}). This usually means the deployment is incomplete or mixes files from different builds.";
+                return false;
+            }
+            catch (Exception ex)
+            {
+                reason =
+                    "cryptographic runtime self-test failed before sync startup: " +
+                    $"{ex.GetType().Name}: {ex.Message}. Redeploy the full publish folder, including runtimes.";
+                return false;
+            }
+        }
     }
 }

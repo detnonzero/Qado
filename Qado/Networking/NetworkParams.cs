@@ -10,6 +10,11 @@ namespace Qado.Networking
             public const int P2PPort = 33333;
             public const int ApiPort = 18080;
             public const string GenesisHost = "212.227.21.183";
+            public static readonly string[] BootstrapHosts =
+            {
+                GenesisHost,
+                "2a01:4f8:231:44e1::15"
+            };
             public const string GenesisMinerHex = "e4449f3cce0e9b0db225e11cae2f97594725bee62255f2131310f9625fd26382";
             public const ulong GenesisTimestamp = 1773428400UL;
             public const ulong GenesisNonce = 0UL;
@@ -26,6 +31,10 @@ namespace Qado.Networking
             public const int P2PPort = 34333;
             public const int ApiPort = 19080;
             public const string GenesisHost = "212.227.21.183";
+            public static readonly string[] BootstrapHosts =
+            {
+                GenesisHost
+            };
             public const string GenesisMinerHex = Mainnet.GenesisMinerHex;
             public const ulong GenesisTimestamp = Mainnet.GenesisTimestamp;
             public const ulong GenesisNonce = Mainnet.GenesisNonce;
@@ -44,6 +53,7 @@ namespace Qado.Networking
         public const int P2PPort = UseTestnet ? Testnet.P2PPort : Mainnet.P2PPort;
         public const int ApiPort = UseTestnet ? Testnet.ApiPort : Mainnet.ApiPort;
         public const string GenesisHost = UseTestnet ? Testnet.GenesisHost : Mainnet.GenesisHost;
+        public static readonly string[] BootstrapHosts = UseTestnet ? Testnet.BootstrapHosts : Mainnet.BootstrapHosts;
         public const string GenesisMinerHex = UseTestnet ? Testnet.GenesisMinerHex : Mainnet.GenesisMinerHex;
         public const ulong GenesisTimestamp = UseTestnet ? Testnet.GenesisTimestamp : Mainnet.GenesisTimestamp;
         public const ulong GenesisNonce = UseTestnet ? Testnet.GenesisNonce : Mainnet.GenesisNonce;

@@ -36,9 +36,9 @@ namespace Qado.Blockchain
                 if (!NonceRules.IsUsableTransactionNonce(tx.TxNonce)) { reason = "Nonce out of range"; return false; }
                 if (tx.Signature is null || tx.Signature.Length != SigSize) { reason = "Invalid or missing signature"; return false; }
 
-                if (!VerifySignature(tx))
+                if (!TryVerifySignature(tx, out var verifyReason))
                 {
-                    reason = "Invalid signature";
+                    reason = verifyReason;
                     return false;
                 }
 
@@ -132,16 +132,22 @@ namespace Qado.Blockchain
             return tx.Signature is null || tx.Signature.Length == 0;
         }
 
-        private static bool VerifySignature(Transaction tx)
+        private static bool TryVerifySignature(Transaction tx, out string reason)
         {
+            reason = "Invalid signature";
             try
             {
                 var algorithm = SignatureAlgorithm.Ed25519;
                 var publicKey = PublicKey.Import(algorithm, tx.Sender, KeyBlobFormat.RawPublicKey);
-                return algorithm.Verify(publicKey, tx.ToHashBytes(), tx.Signature);
+                if (!algorithm.Verify(publicKey, tx.ToHashBytes(), tx.Signature))
+                    return false;
+
+                reason = "OK";
+                return true;
             }
-            catch
+            catch (Exception ex)
             {
+                reason = $"Signature verification exception: {ex.GetType().Name}: {ex.Message}";
                 return false;
             }
         }

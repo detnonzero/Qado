@@ -6,6 +6,8 @@ namespace Qado.Networking
 
         public const string GenesisHost = NetworkParams.GenesisHost;
 
+        public static readonly string[] BootstrapHosts = NetworkParams.BootstrapHosts;
+
         public const byte NetworkId = NetworkParams.NetworkId;
     }
 }

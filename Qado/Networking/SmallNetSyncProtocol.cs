@@ -30,7 +30,9 @@ namespace Qado.Networking
         ulong ForkHeight,
         int TotalBlocks,
         byte[] TipHash,
-        UInt128 TipChainwork);
+        UInt128 TipChainwork,
+        byte[]? PreviewLastHash = null,
+        ulong PreviewLastHeight = 0);
 
     public readonly record struct SmallNetBlocksBatchEndFrame(
         Guid BatchId,
@@ -41,8 +43,9 @@ namespace Qado.Networking
     public static class SmallNetSyncProtocol
     {
         public const byte CurrentProtocolVersion = 2;
-        public const int BatchMaxBlocks = 4096;
-        public const int ChunkBlocks = 64;
+        public const int BatchMaxBlocks = BlockSyncProtocol.BatchMaxBlocks;
+        public const int ExtendedSyncWindowBlocks = BlockSyncProtocol.ExtendedSyncWindowBlocks;
+        public const int LegacyChunkBlocks = BlockSyncProtocol.LegacyChunkBlocks;
         public const int MaxAncestorPackBlocks = 16;
         public const int MaxRecentCanonicalHashes = 16;
         public const int StateDigestBytes = 32;
@@ -292,37 +295,75 @@ namespace Qado.Networking
                 throw new ArgumentException("fork hash must be 32 bytes", nameof(frame));
             if (frame.TipHash is not { Length: HashBytes })
                 throw new ArgumentException("tip hash must be 32 bytes", nameof(frame));
-            if (frame.TotalBlocks < 0 || frame.TotalBlocks > BatchMaxBlocks)
+            if (frame.TotalBlocks < 0 || frame.TotalBlocks > ExtendedSyncWindowBlocks)
                 throw new ArgumentOutOfRangeException(nameof(frame));
+            if (frame.PreviewLastHash != null && frame.PreviewLastHash.Length != HashBytes)
+                throw new ArgumentException("preview last hash must be 32 bytes", nameof(frame));
 
-            var payload = new byte[GuidBytes + HashBytes + 8 + 4 + HashBytes + 16];
+            bool includePreview = frame.PreviewLastHash is { Length: HashBytes };
+            var payload = new byte[
+                GuidBytes + HashBytes + 8 + 4 + HashBytes + 16 +
+                (includePreview ? HashBytes + 8 : 0)];
             frame.BatchId.TryWriteBytes(payload.AsSpan(0, GuidBytes));
             Buffer.BlockCopy(frame.ForkHash, 0, payload, GuidBytes, HashBytes);
             BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(GuidBytes + HashBytes, 8), frame.ForkHeight);
             BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(GuidBytes + HashBytes + 8, 4), (uint)frame.TotalBlocks);
             Buffer.BlockCopy(frame.TipHash, 0, payload, GuidBytes + HashBytes + 8 + 4, HashBytes);
             U128.WriteBE(payload.AsSpan(GuidBytes + HashBytes + 8 + 4 + HashBytes, 16), frame.TipChainwork);
+
+            if (includePreview)
+            {
+                int offset = GuidBytes + HashBytes + 8 + 4 + HashBytes + 16;
+                Buffer.BlockCopy(frame.PreviewLastHash!, 0, payload, offset, HashBytes);
+                BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(offset + HashBytes, 8), frame.PreviewLastHeight);
+            }
+
             return payload;
         }
 
         public static bool TryParseBlocksBatchStart(byte[] payload, out SmallNetBlocksBatchStartFrame frame)
         {
             frame = default;
-            if (payload == null || payload.Length != GuidBytes + HashBytes + 8 + 4 + HashBytes + 16)
+            int baseLength = GuidBytes + HashBytes + 8 + 4 + HashBytes + 16;
+            int previewLength = baseLength + HashBytes + 8;
+            if (payload == null || (payload.Length != baseLength && payload.Length != previewLength))
                 return false;
 
             Guid batchId = new(payload.AsSpan(0, GuidBytes));
             byte[] forkHash = payload.AsSpan(GuidBytes, HashBytes).ToArray();
             ulong forkHeight = BinaryPrimitives.ReadUInt64LittleEndian(payload.AsSpan(GuidBytes + HashBytes, 8));
             uint totalBlocks = BinaryPrimitives.ReadUInt32LittleEndian(payload.AsSpan(GuidBytes + HashBytes + 8, 4));
-            if (totalBlocks > BatchMaxBlocks)
+            if (totalBlocks > ExtendedSyncWindowBlocks)
                 return false;
 
             byte[] tipHash = payload.AsSpan(GuidBytes + HashBytes + 8 + 4, HashBytes).ToArray();
             UInt128 tipChainwork = U128.ReadBE(payload.AsSpan(GuidBytes + HashBytes + 8 + 4 + HashBytes, 16));
-            frame = new SmallNetBlocksBatchStartFrame(batchId, forkHash, forkHeight, (int)totalBlocks, tipHash, tipChainwork);
+            byte[]? previewLastHash = null;
+            ulong previewLastHeight = 0;
+            if (payload.Length == previewLength)
+            {
+                int offset = baseLength;
+                previewLastHash = payload.AsSpan(offset, HashBytes).ToArray();
+                previewLastHeight = BinaryPrimitives.ReadUInt64LittleEndian(payload.AsSpan(offset + HashBytes, 8));
+            }
+
+            frame = new SmallNetBlocksBatchStartFrame(
+                batchId,
+                forkHash,
+                forkHeight,
+                (int)totalBlocks,
+                tipHash,
+                tipChainwork,
+                previewLastHash,
+                previewLastHeight);
             return true;
         }
+
+        public static byte[] BuildBlocksBatchData(ulong firstHeight, IReadOnlyList<byte[]> blocks)
+            => BlockSyncProtocol.BuildBlockBatch(firstHeight, blocks);
+
+        public static bool TryParseBlocksBatchData(byte[] payload, out BlockBatchFrame frame)
+            => BlockSyncProtocol.TryParseBlockBatch(payload, out frame);
 
         public static byte[] BuildBlocksChunk(ulong firstHeight, IReadOnlyList<byte[]> blocks)
             => BlockSyncProtocol.BuildBlockChunk(firstHeight, blocks);

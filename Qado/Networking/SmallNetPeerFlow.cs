@@ -15,6 +15,7 @@ namespace Qado.Networking
         private readonly Func<SmallNetLocalChainView> _getLocalChainView;
         private readonly Func<ulong, byte[]?> _getCanonicalHashAtHeight;
         private readonly Func<ulong, byte[]?> _getCanonicalPayloadAtHeight;
+        private readonly Func<PeerSession, byte[], bool> _shouldPushBlockToPeer;
         private readonly Func<PeerSession, MsgType, byte[], CancellationToken, Task> _sendFrameAsync;
         private readonly Action<PeerSession, string> _dropSession;
         private readonly ILogSink? _log;
@@ -27,6 +28,7 @@ namespace Qado.Networking
             Func<SmallNetLocalChainView> getLocalChainView,
             Func<ulong, byte[]?> getCanonicalHashAtHeight,
             Func<ulong, byte[]?> getCanonicalPayloadAtHeight,
+            Func<PeerSession, byte[], bool> shouldPushBlockToPeer,
             Func<PeerSession, MsgType, byte[], CancellationToken, Task> sendFrameAsync,
             Action<PeerSession, string> dropSession,
             ILogSink? log = null)
@@ -40,6 +42,7 @@ namespace Qado.Networking
             _getLocalChainView = getLocalChainView ?? throw new ArgumentNullException(nameof(getLocalChainView));
             _getCanonicalHashAtHeight = getCanonicalHashAtHeight ?? throw new ArgumentNullException(nameof(getCanonicalHashAtHeight));
             _getCanonicalPayloadAtHeight = getCanonicalPayloadAtHeight ?? throw new ArgumentNullException(nameof(getCanonicalPayloadAtHeight));
+            _shouldPushBlockToPeer = shouldPushBlockToPeer ?? throw new ArgumentNullException(nameof(shouldPushBlockToPeer));
             _sendFrameAsync = sendFrameAsync ?? throw new ArgumentNullException(nameof(sendFrameAsync));
             _dropSession = dropSession ?? throw new ArgumentNullException(nameof(dropSession));
             _log = log;
@@ -198,12 +201,19 @@ namespace Qado.Networking
             var payloads = new List<byte[]>((int)gap);
             for (ulong height = remoteTip.Height + 1UL; height <= localView.Height; height++)
             {
+                var hash = _getCanonicalHashAtHeight(height);
+                if (hash is not { Length: 32 } || !_shouldPushBlockToPeer(peer, hash))
+                    continue;
+
                 var payload = _getCanonicalPayloadAtHeight(height);
                 if (payload == null || payload.Length == 0)
                     return;
 
                 payloads.Add(payload);
             }
+
+            if (payloads.Count == 0)
+                return;
 
             for (int i = 0; i < payloads.Count; i++)
             {

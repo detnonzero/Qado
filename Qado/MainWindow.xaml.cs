@@ -77,6 +77,7 @@ namespace Qado
         private int _accountsReloadWorkerRunning;
         private int _peersReloadRequested;
         private int _peersReloadWorkerRunning;
+        private int _nodeStatusTimerArmed;
         private int _nodeStatusRefreshRequested;
         private int _nodeStatusRefreshWorkerRunning;
         private int _blockExplorerRefreshRequested;
@@ -132,6 +133,7 @@ namespace Qado
 
             _nodeStatusDebounceTimer = new Timer(_ =>
             {
+                Interlocked.Exchange(ref _nodeStatusTimerArmed, 0);
                 if (_isClosing) return;
                 try { Dispatcher.BeginInvoke(new Action(RefreshNodeStatusHeader)); } catch { }
             }, null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
@@ -969,7 +971,18 @@ namespace Qado
         private void ScheduleNodeStatusRefresh()
         {
             if (_isClosing) return;
-            try { _nodeStatusDebounceTimer?.Change(NodeStatusDebounceMs, Timeout.Infinite); } catch { }
+            Interlocked.Exchange(ref _nodeStatusRefreshRequested, 1);
+            if (Interlocked.CompareExchange(ref _nodeStatusTimerArmed, 1, 0) != 0)
+                return;
+
+            try
+            {
+                _nodeStatusDebounceTimer?.Change(NodeStatusDebounceMs, Timeout.Infinite);
+            }
+            catch
+            {
+                Interlocked.Exchange(ref _nodeStatusTimerArmed, 0);
+            }
         }
 
         private void ClearLogButton_Click(object sender, RoutedEventArgs e)
@@ -1598,7 +1611,18 @@ LIMIT 200;";
 
         private string GetConnectedPeerStatus(string ip, int port)
         {
+            string? direction = _p2pNode?.GetPeerDirectionText(ip, port);
             bool? isPublic = _p2pNode?.GetPeerPublicStatus(ip, port);
+
+            if (!string.IsNullOrWhiteSpace(direction))
+            {
+                if (isPublic == true)
+                    return $"Connected ({direction}, public)";
+                if (isPublic == false)
+                    return $"Connected ({direction}, non-public)";
+                return $"Connected ({direction})";
+            }
+
             if (isPublic == true)
                 return "Connected (public)";
             if (isPublic == false)

@@ -11,16 +11,17 @@ namespace Qado.Networking
 {
     public sealed class BlockDownloadManager : IDisposable
     {
-        public const int MaxInflightGlobal = 1;
+        public const int MaxInflightGlobal = 4;
         public const int MaxInflightPerPeer = 1;
         public const int RecoveryRequestBatchSize = 1;
-        public const int SequentialChunkSize = 240;
+        public const int SequentialChunkSize = 128;
         public static readonly TimeSpan RequestedTimeout = TimeSpan.FromSeconds(12);
 
         private static readonly TimeSpan PeerFailureCooldownBase = TimeSpan.FromSeconds(25);
         private static readonly TimeSpan PeerFailureCooldownCap = TimeSpan.FromMinutes(10);
         private static readonly TimeSpan PeerFailureStreakResetAfter = TimeSpan.FromMinutes(15);
         private static readonly TimeSpan OutOfPlanFallbackTtl = TimeSpan.FromMinutes(2);
+        private static readonly TimeSpan OutOfPlanFallbackLogWindow = TimeSpan.FromSeconds(10);
         private static readonly TimeSpan LatencyFreshWindow = TimeSpan.FromMinutes(2);
         private const int MaxOutOfPlanFallbackHashes = 1024;
 
@@ -32,6 +33,8 @@ namespace Qado.Networking
         private readonly Dictionary<string, DateTime> _peerCooldownUntilUtc = new(StringComparer.Ordinal);
         private readonly Dictionary<string, PeerFailureState> _peerFailureStateByKey = new(StringComparer.Ordinal);
         private readonly Dictionary<string, DateTime> _outOfPlanFallbackUntilUtc = new(StringComparer.Ordinal);
+        private readonly object _fallbackLogGate = new();
+        private readonly Dictionary<string, SuppressedInfoLogState> _fallbackLogStateBySource = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<string, BlockSyncItemState> _stateByHash = new(StringComparer.Ordinal);
 
         private readonly Func<IReadOnlyCollection<PeerSession>> _sessionSnapshot;
@@ -61,6 +64,13 @@ namespace Qado.Networking
         {
             public int FailureStreak;
             public DateTime LastFailureUtc = DateTime.MinValue;
+        }
+
+        private sealed class SuppressedInfoLogState
+        {
+            public DateTime LastLogUtc = DateTime.MinValue;
+            public int Suppressed;
+            public string LastMessage = string.Empty;
         }
 
         public BlockDownloadManager(
@@ -217,7 +227,7 @@ namespace Qado.Networking
                 RequestPump();
 
             if (armed > 0 || queued > 0)
-                _log?.Info("Sync", $"{source}: armed={armed}, queued={queued}");
+                LogOutOfPlanFallback(source, armed, queued);
 
             return queued;
         }
@@ -706,6 +716,38 @@ namespace Qado.Networking
             if (ticks <= 0 || ticks > PeerFailureCooldownCap.Ticks)
                 ticks = PeerFailureCooldownCap.Ticks;
             return new TimeSpan(ticks);
+        }
+
+        private void LogOutOfPlanFallback(string source, int armed, int queued)
+        {
+            string category = string.IsNullOrWhiteSpace(source) ? "fallback" : source.Trim();
+            string message = $"{category}: armed={armed}, queued={queued}";
+
+            lock (_fallbackLogGate)
+            {
+                if (!_fallbackLogStateBySource.TryGetValue(category, out var state))
+                {
+                    state = new SuppressedInfoLogState();
+                    _fallbackLogStateBySource[category] = state;
+                }
+
+                var now = DateTime.UtcNow;
+                state.LastMessage = message;
+                if ((now - state.LastLogUtc) >= OutOfPlanFallbackLogWindow)
+                {
+                    if (state.Suppressed > 0)
+                        _log?.Info("Sync", $"{state.LastMessage} (+{state.Suppressed} similar events suppressed)");
+                    else
+                        _log?.Info("Sync", state.LastMessage);
+
+                    state.LastLogUtc = now;
+                    state.Suppressed = 0;
+                }
+                else
+                {
+                    state.Suppressed++;
+                }
+            }
         }
 
         private PeerSession? ResolveActiveChunkPeer_NoLock(List<PeerSession> orderedPeers, DateTime now, bool allowRotate)

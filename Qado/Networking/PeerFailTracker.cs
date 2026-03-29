@@ -10,7 +10,7 @@ namespace Qado.Networking
         private const int MaxFails = 20;
         private static readonly TimeSpan BanThresholdWindow = TimeSpan.FromMinutes(10);
         public static readonly bool EnforceNetworkCooldown = ReadBoolEnv("QADO_ENFORCE_PEER_COOLDOWN", defaultValue: false);
-        private static readonly string SeedNeverBanKey = Normalize(GenesisConfig.GenesisHost);
+        private static readonly HashSet<string> SeedNeverBanKeys = BuildNeverBanSeedKeys();
 
         private static readonly ConcurrentDictionary<string, int> _failCounts = new(StringComparer.Ordinal);
 
@@ -114,8 +114,21 @@ namespace Qado.Networking
 
         private static bool IsNeverBan(string address)
         {
-            if (SeedNeverBanKey.Length == 0) return false;
-            return string.Equals(address, SeedNeverBanKey, StringComparison.Ordinal);
+            return SeedNeverBanKeys.Contains(address);
+        }
+
+        private static HashSet<string> BuildNeverBanSeedKeys()
+        {
+            var set = new HashSet<string>(StringComparer.Ordinal);
+            var configuredSeeds = GenesisConfig.BootstrapHosts ?? Array.Empty<string>();
+            for (int i = 0; i < configuredSeeds.Length; i++)
+            {
+                string normalized = Normalize(configuredSeeds[i]);
+                if (normalized.Length != 0)
+                    set.Add(normalized);
+            }
+
+            return set;
         }
 
         private static void TryPruneExpired_NoThrow()

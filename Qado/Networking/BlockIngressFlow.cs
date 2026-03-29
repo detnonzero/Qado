@@ -15,10 +15,12 @@ namespace Qado.Networking
     public sealed class BlockIngressFlow
     {
         private static readonly TimeSpan TooFarBehindAdmissionLogWindow = TimeSpan.FromSeconds(15);
+        private static readonly TimeSpan BufferedOrphanLogWindow = TimeSpan.FromSeconds(5);
         private static readonly TimeSpan TooFarBehindLiveRejectTtl = TimeSpan.FromSeconds(90);
         private static readonly TimeSpan MissingParentResyncTtl = TimeSpan.FromSeconds(60);
         private const int MaxTooFarBehindLiveRejectEntries = 20_000;
         private const int MaxMissingParentResyncEntries = 20_000;
+        private const ulong LiveNearTipWindow = 8UL;
 
         public delegate bool TryStoreOrphanDelegate(
             byte[] payload,
@@ -56,9 +58,18 @@ namespace Qado.Networking
         private readonly Dictionary<string, DateTime> _tooFarBehindLiveRejectUntilUtc = new(StringComparer.Ordinal);
         private readonly object _missingParentResyncGate = new();
         private readonly Dictionary<string, DateTime> _missingParentResyncUntilUtc = new(StringComparer.Ordinal);
+        private readonly object _bufferedOrphanLogGate = new();
+        private readonly Dictionary<string, SuppressedInfoLogState> _bufferedOrphanLogsByCategory = new(StringComparer.Ordinal);
         private DateTime _lastTooFarBehindAdmissionLogUtc = DateTime.MinValue;
         private int _tooFarBehindAdmissionSuppressed;
         private string _lastTooFarBehindAdmissionReason = string.Empty;
+
+        private sealed class SuppressedInfoLogState
+        {
+            public DateTime LastLogUtc = DateTime.MinValue;
+            public int Suppressed;
+            public string LastMessage = string.Empty;
+        }
 
         public BlockIngressFlow(
             BlockDownloadManager blockDownloadManager,
@@ -190,10 +201,12 @@ namespace Qado.Networking
             if (prevKnown)
                 candidateHeight = prevHeight + 1UL;
 
-            bool nearTip = candidateHeight >= tipHeight || (tipHeight - candidateHeight) <= 32UL;
-            bool armedOutOfPlanFallback = _blockDownloadManager.IsOutOfPlanFallbackHash(block.BlockHash!);
+            bool nearTip = IsNearTipCandidate(candidateHeight, tipHeight);
+            bool armedOutOfPlanFallback =
+                _blockDownloadManager.IsOutOfPlanFallbackHash(block.BlockHash!) ||
+                _blockDownloadManager.IsOutOfPlanFallbackHash(prevHash);
             bool allowOutOfPlan = prevIsTip ||
-                                  prevKnown ||
+                                  (prevKnown && nearTip) ||
                                   armedOutOfPlanFallback ||
                                   (_blockSyncClient.IsActive && nearTip && headerKnown);
             if (allowOutOfPlan)
@@ -201,6 +214,30 @@ namespace Qado.Networking
 
             if (!headerKnown && !prevKnown)
             {
+                if (!armedOutOfPlanFallback && !_blockSyncClient.IsActive)
+                {
+                    _requestParentFromPeer(peer, prevHash, "live-orphan-parent");
+                    _ = _blockDownloadManager.QueueOutOfPlanFallback(prevHash, "live-orphan-parent-fallback");
+                    if (_shouldRequestMissingHeaderResync() &&
+                        ShouldRequestMissingParentResync(prevHash))
+                    {
+                        _requestSyncNow("live-orphan-parent-missing");
+                    }
+
+                    _log?.Info(
+                        "P2P",
+                        $"Live orphan deferred until recovery is armed: hash={Hex16(block.BlockHash!)}");
+                    return true;
+                }
+
+                if (!nearTip && !armedOutOfPlanFallback)
+                {
+                    _log?.Info(
+                        "P2P",
+                        $"Live orphan ignored outside near-tip window: hash={Hex16(block.BlockHash!)} claimedHeight={FormatHeightForLog(block.BlockHeight)} tip={tipHeight.ToString(CultureInfo.InvariantCulture)}");
+                    return true;
+                }
+
                 TryLooseValidateAndBufferOrphanPayload(
                     payload,
                     block,
@@ -215,6 +252,23 @@ namespace Qado.Networking
                     parentRequestSource: "live-orphan-parent",
                     fallbackSource: "live-orphan-parent-fallback",
                     syncReason: "live-orphan-parent-missing");
+                return true;
+            }
+
+            if (prevKnown && !nearTip)
+            {
+                RememberTooFarBehindLiveReject(block.BlockHash!);
+                _ = _blockDownloadManager.QueueOutOfPlanFallback(prevHash, "live-side-too-far-parent-fallback");
+                if (!_blockSyncClient.IsActive &&
+                    _shouldRequestMissingHeaderResync() &&
+                    ShouldRequestMissingParentResync(prevHash))
+                {
+                    _requestSyncNow("live-side-too-far-parent");
+                }
+
+                _log?.Info(
+                    "P2P",
+                    $"Live sidechain deferred to request/response path: hash={Hex16(block.BlockHash!)} height={FormatHeightForLog(candidateHeight)} tip={tipHeight.ToString(CultureInfo.InvariantCulture)}");
                 return true;
             }
 
@@ -284,11 +338,10 @@ namespace Qado.Networking
                 if (IsAlreadyBufferedReason(orphanReason))
                     return;
 
-                _log?.Info("P2P", $"{bufferedPrefix}: h={FormatHeightForLog(block.BlockHeight)} {Hex16(block.BlockHash!)}");
-                _requestParentFromPeer(peer, prevHash, parentRequestSource);
-                _ = _blockDownloadManager.QueueOutOfPlanFallback(prevHash, fallbackSource);
-                if (_shouldRequestMissingHeaderResync())
-                    _requestSyncNow(syncReason);
+                LogBufferedOrphan(
+                    bufferedPrefix,
+                    $"{bufferedPrefix}: h={FormatHeightForLog(block.BlockHeight)} {Hex16(block.BlockHash!)}");
+                ScheduleMissingParentRecovery(peer, prevHash, ingress, parentRequestSource, fallbackSource, syncReason);
             }
             else
             {
@@ -379,7 +432,9 @@ namespace Qado.Networking
                     candidateHeight = prevHeightKnown + 1UL;
 
                 bool nearTip = candidateHeight >= tipHeight || (tipHeight - candidateHeight) <= 32UL;
-                bool armedOutOfPlanFallback = _blockDownloadManager.IsOutOfPlanFallbackHash(block.BlockHash!);
+                bool armedOutOfPlanFallback =
+                    _blockDownloadManager.IsOutOfPlanFallbackHash(block.BlockHash!) ||
+                    _blockDownloadManager.IsOutOfPlanFallbackHash(prevHash);
                 bool allowOutOfPlan = prevIsTip ||
                                       outOfPlanPrevKnown ||
                                       armedOutOfPlanFallback ||
@@ -402,11 +457,16 @@ namespace Qado.Networking
                             if (IsAlreadyBufferedReason(orphanReason))
                                 return;
 
-                            _log?.Info("P2P", $"Out-of-plan orphan buffered: h={FormatHeightForLog(block.BlockHeight)} {Hex16(block.BlockHash!)}");
-                            _requestParentFromPeer(peer, prevHash, "out-of-plan-parent");
-                            _ = _blockDownloadManager.QueueOutOfPlanFallback(prevHash, "out-of-plan-parent-fallback");
-                            if (_shouldRequestMissingHeaderResync())
-                                _requestSyncNow("out-of-plan-parent-missing");
+                            LogBufferedOrphan(
+                                "Out-of-plan orphan buffered",
+                                $"Out-of-plan orphan buffered: h={FormatHeightForLog(block.BlockHeight)} {Hex16(block.BlockHash!)}");
+                            ScheduleMissingParentRecovery(
+                                peer,
+                                prevHash,
+                                ingress,
+                                "out-of-plan-parent",
+                                "out-of-plan-parent-fallback",
+                                "out-of-plan-parent-missing");
                         }
                         else
                         {
@@ -510,11 +570,16 @@ namespace Qado.Networking
                     if (IsAlreadyBufferedReason(orphanReason))
                         return;
 
-                    _log?.Info("P2P", $"Orphan buffered: h={FormatHeightForLog(block.BlockHeight)} {Hex16(block.BlockHash!)}");
-                    _requestParentFromPeer(peer, prevHash, "orphan-parent");
-                    _ = _blockDownloadManager.QueueOutOfPlanFallback(prevHash, "orphan-parent-fallback");
-                    if (_shouldRequestMissingHeaderResync())
-                        _requestSyncNow("orphan-parent-missing");
+                    LogBufferedOrphan(
+                        "Orphan buffered",
+                        $"Orphan buffered: h={FormatHeightForLog(block.BlockHeight)} {Hex16(block.BlockHash!)}");
+                    ScheduleMissingParentRecovery(
+                        peer,
+                        prevHash,
+                        ingress,
+                        "orphan-parent",
+                        "orphan-parent-fallback",
+                        "orphan-parent-missing");
                 }
                 else
                 {
@@ -526,22 +591,30 @@ namespace Qado.Networking
                 return;
             }
 
-            bool persistedRaw = alreadyHavePayload;
-            if (!alreadyHavePayload)
+            bool liveUnrequestedSideCandidate =
+                ingress == BlockIngressKind.LivePush &&
+                arrivalKind != BlockArrivalKind.Requested &&
+                !isTipExtending;
+            if (liveUnrequestedSideCandidate &&
+                !IsNearTipCandidate(block.BlockHeight, tipHeightSnapshot))
             {
-                try
+                RememberTooFarBehindLiveReject(block.BlockHash!);
+                _ = _blockDownloadManager.QueueOutOfPlanFallback(prevHash, "live-side-too-far-parent-fallback");
+                if (!_blockSyncClient.IsActive &&
+                    _shouldRequestMissingHeaderResync() &&
+                    ShouldRequestMissingParentResync(prevHash))
                 {
-                    PersistRawBlockAsHaveBlock(block);
-                    persistedRaw = true;
+                    _requestSyncNow("live-side-too-far-parent");
                 }
-                catch (Exception ex)
-                {
-                    _log?.Warn("P2P", $"Block raw persist failed: {ex.Message}");
-                    _blockDownloadManager.MarkBlockValidated(block.BlockHash!, valid: false);
-                    return;
-                }
+
+                _log?.Info(
+                    "P2P",
+                    $"Live sidechain deferred to request/response path: hash={Hex16(block.BlockHash!)} height={FormatHeightForLog(block.BlockHeight)} tip={tipHeightSnapshot.ToString(CultureInfo.InvariantCulture)}");
+                _blockDownloadManager.MarkBlockValidated(block.BlockHash!, valid: false);
+                return;
             }
 
+            bool persistedRaw = alreadyHavePayload;
             bool validateAsSidechain = !isTipExtending;
             if (isTipExtending)
             {
@@ -582,10 +655,13 @@ namespace Qado.Networking
                                 return;
 
                             _log?.Info("P2P", $"Sidechain deferred (parent missing): h={FormatHeightForLog(block.BlockHeight)} {Hex16(block.BlockHash!)}");
-                            _requestParentFromPeer(peer, prevHash, "sidechain-parent");
-                            _ = _blockDownloadManager.QueueOutOfPlanFallback(prevHash, "sidechain-parent-fallback");
-                            if (_shouldRequestMissingHeaderResync())
-                                _requestSyncNow("sidechain-parent-missing");
+                            ScheduleMissingParentRecovery(
+                                peer,
+                                prevHash,
+                                ingress,
+                                "sidechain-parent",
+                                "sidechain-parent-fallback",
+                                "sidechain-parent-missing");
                         }
                         else
                         {
@@ -644,6 +720,17 @@ namespace Qado.Networking
                 {
                     using var tx = Db.Connection!.BeginTransaction();
 
+                    if (!alreadyHavePayload)
+                    {
+                        BlockStore.SaveBlock(
+                            block,
+                            tx,
+                            validateAsSidechain
+                                ? BlockIndexStore.StatusSideStatelessAccepted
+                                : BlockIndexStore.StatusHaveBlockPayload);
+                        persistedRaw = true;
+                    }
+
                     if (TryExtendCanonTipNoReorg(block, tx, out _))
                     {
                         extendedCanon = true;
@@ -651,7 +738,7 @@ namespace Qado.Networking
                     }
                     else
                     {
-                        BlockIndexStore.SetStatus(block.BlockHash!, BlockIndexStore.StatusHaveBlockPayload, tx);
+                        BlockIndexStore.SetStatus(block.BlockHash!, BlockIndexStore.StatusSideStatelessAccepted, tx);
                     }
 
                     tx.Commit();
@@ -746,16 +833,6 @@ namespace Qado.Networking
             StateApplier.ApplyBlockWithUndo(block, tx);
             BlockStore.SetCanonicalHashAtHeight(newHeight, block.BlockHash!, tx);
             return true;
-        }
-
-        private static void PersistRawBlockAsHaveBlock(Block block)
-        {
-            lock (Db.Sync)
-            {
-                using var tx = Db.Connection!.BeginTransaction();
-                BlockStore.SaveBlock(block, tx, BlockIndexStore.StatusHaveBlockPayload);
-                tx.Commit();
-            }
         }
 
         private static bool IsZero32(byte[]? hash)
@@ -922,6 +999,61 @@ namespace Qado.Networking
                 _missingParentResyncUntilUtc.Remove(expired[i]);
         }
 
+        private void ScheduleMissingParentRecovery(
+            PeerSession peer,
+            byte[] prevHash,
+            BlockIngressKind ingress,
+            string parentRequestSource,
+            string fallbackSource,
+            string syncReason)
+        {
+            if (_blockSyncClient.IsActive)
+            {
+                // Keep one sender-first direct chase alive even during initial sync so live orphan
+                // recovery does not fully stall behind the bulk planner. RequestParentFromPeer and
+                // the download manager both apply their own dedupe/budgeting.
+                _requestParentFromPeer(peer, prevHash, parentRequestSource);
+                return;
+            }
+
+            _ = _blockDownloadManager.QueueOutOfPlanFallback(prevHash, fallbackSource);
+            _requestParentFromPeer(peer, prevHash, parentRequestSource);
+            if (_shouldRequestMissingHeaderResync() &&
+                ShouldRequestMissingParentResync(prevHash))
+            {
+                _requestSyncNow(syncReason);
+            }
+        }
+
+        private void LogBufferedOrphan(string category, string message)
+        {
+            lock (_bufferedOrphanLogGate)
+            {
+                if (!_bufferedOrphanLogsByCategory.TryGetValue(category, out var state))
+                {
+                    state = new SuppressedInfoLogState();
+                    _bufferedOrphanLogsByCategory[category] = state;
+                }
+
+                var now = DateTime.UtcNow;
+                state.LastMessage = message;
+                if ((now - state.LastLogUtc) >= BufferedOrphanLogWindow)
+                {
+                    if (state.Suppressed > 0)
+                        _log?.Info("P2P", $"{state.LastMessage} (+{state.Suppressed} similar events suppressed)");
+                    else
+                        _log?.Info("P2P", state.LastMessage);
+
+                    state.LastLogUtc = now;
+                    state.Suppressed = 0;
+                }
+                else
+                {
+                    state.Suppressed++;
+                }
+            }
+        }
+
         private static bool BytesEqual32(byte[] left, byte[] right)
         {
             if (left.Length != 32 || right.Length != 32)
@@ -959,6 +1091,16 @@ namespace Qado.Networking
 
         private static string FormatHeightForLog(ulong height)
             => height == 0UL ? "?" : height.ToString(CultureInfo.InvariantCulture);
+
+        private static bool IsNearTipCandidate(ulong candidateHeight, ulong tipHeight)
+        {
+            if (candidateHeight == 0UL)
+                return true;
+            if (candidateHeight >= tipHeight)
+                return true;
+
+            return (tipHeight - candidateHeight) <= LiveNearTipWindow;
+        }
 
         private static bool IsTipMovedReason(string? reason)
         {

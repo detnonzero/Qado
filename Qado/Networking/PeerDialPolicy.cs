@@ -186,32 +186,7 @@ namespace Qado.Networking
         }
 
         private static string NormalizeHost(string host)
-        {
-            string s = host.Trim().ToLowerInvariant();
-
-            if (s.StartsWith("[", StringComparison.Ordinal))
-            {
-                int close = s.IndexOf(']');
-                if (close > 1)
-                    s = s.Substring(1, close - 1);
-            }
-            else
-            {
-                int firstColon = s.IndexOf(':');
-                int lastColon = s.LastIndexOf(':');
-                if (firstColon > 0 && firstColon == lastColon)
-                {
-                    string tail = s[(firstColon + 1)..];
-                    if (int.TryParse(tail, out _))
-                        s = s[..firstColon];
-                }
-            }
-
-            if (s.StartsWith("::ffff:", StringComparison.Ordinal))
-                s = s[7..];
-
-            return s;
-        }
+            => PeerAddress.NormalizeHost(host);
 
         private static void TryPrune_NoThrow(DateTime nowUtc)
         {

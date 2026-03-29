@@ -32,7 +32,8 @@ namespace Qado.Networking
         AncestorPack = 27,
         BlocksBatchStart = 28,
         BlocksChunk = 29,
-        BlocksBatchEnd = 30
+        BlocksBatchEnd = 30,
+        BlocksBatchData = 31
     }
 }
 

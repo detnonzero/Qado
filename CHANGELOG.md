@@ -2,6 +2,69 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.0.0] - 2026-03-29
+
+### Added
+- A capability-gated mainnet-compatible P2P upgrade path:
+  - new nodes advertise support for direct block/transaction relay, `BlocksBatchData`, IPv6 peer exchange, dual-stack networking, extended sync windows, and sync-window previews
+  - older nodes continue to interoperate through the legacy handshake shape and `BlocksChunk` fallback
+- True dual-stack peer support across the active networking stack:
+  - parallel IPv4 + IPv6 listeners
+  - IPv4/IPv6 outbound dialing
+  - IPv6-capable peer normalization, storage, and peer exchange
+- A headless `Qado.NodeHost` runner plus testing docs for operating relay/sync nodes without the GUI.
+
+### Changed
+- The P2P/sync architecture was redesigned toward a bitcoin-style small-network model while preserving compatibility with older live nodes:
+  - fresh blocks are still propagated as full `Block` payloads
+  - fresh transactions are still propagated as full `Tx` payloads
+  - historical catch-up now uses request/response windows via `GetBlocksByLocator` / `GetBlocksFrom`
+  - SQLite commit granularity for historical sync is now `128` blocks
+- Historical sync now prefers better modern peers and pipelines work more intelligently:
+  - capability-rich peers are favored for bulk sync
+  - sync windows grow/shrink adaptively per peer
+  - parallel historic windows scale dynamically instead of staying fixed
+  - timeout handling prunes stalled windows and continues planning instead of eagerly collapsing the whole pipeline
+- Relay behavior is now more robust under load:
+  - block and transaction relay use per-peer queues with bounded backpressure
+  - per-peer relay dedupe avoids re-pushing the same block/tx repeatedly to one peer
+  - canonical-tail pushes to slightly lagging peers reuse the same peer-specific block dedupe
+- Peer handling is stricter and more deterministic:
+  - duplicate sessions are resolved by stable tie-breaking using the exchanged node IDs
+  - the preferred surviving session is reflected in the peer view instead of showing long-lived merged `inbound+outbound` ambiguity
+  - public-peer probing and peer exchange are more conservative and more IPv6-aware
+
+### Fixed
+- Nodes no longer need to upgrade together to share one mainnet:
+  - mixed old/new deployments can synchronize and relay together
+  - no consensus rules were changed
+  - no chain reset is required
+- Best-chain convergence after sync progress is much more reliable:
+  - adoption is triggered after meaningful batch progress instead of only after coarse sync units
+  - stronger chainwork wins more consistently across live gossip, backfill progress, and resumed sync
+- A long series of historic-sync race conditions and stall modes was eliminated:
+  - stale `batch start` / `batch end` frames no longer trigger unnecessary hard resets
+  - preview continuations no longer fail just because the future start hash is not yet local
+  - completed continuation windows now wait for earlier prepared windows instead of committing out of order
+  - the planner can recover from idle/stalled states instead of silently stopping
+  - repeated continuation requests for the same exhausted `fromHash` near remote tip are now suppressed
+- Live orphan/sidechain handling is less expensive and less disruptive:
+  - clearly out-of-plan sidechain/orphan traffic is deferred into the recovery/request-response path earlier
+  - parent recovery is deduped and budgeted more tightly
+  - live orphan buffering and related recovery logs are summarized instead of hot-loop spamming
+  - early raw persistence of far-behind live sidechain candidates was removed from the hot path
+- Transaction and block relay behave better under repeated duplicate arrival:
+  - accepted transactions are relayed with peer-specific dedupe/backpressure instead of inline fanout only
+  - repeated `Block already known` and duplicate-session noise is reduced substantially
+  - zero-block canonical-tail pushes are no longer logged as if useful work happened
+
+### Notes
+- `1.0.0` is the first release of the redesigned compatible mainnet stack:
+  - direct full-object gossip remains the primary path for fresh blocks and transactions
+  - request/response remains the backfill path for missing history and missing parents
+  - modern peers can use `BlocksBatchData`, while older peers remain on `BlocksChunk`
+- This release is intentionally optimized for small PoW networks with very small blocks, where convergence, stability, and fast re-joining of the best chain matter more than minimizing relay bandwidth.
+
 ## [0.5.3] - 2026-03-27
 
 ### Fixed

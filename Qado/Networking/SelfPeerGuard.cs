@@ -96,45 +96,9 @@ namespace Qado.Networking
         }
 
         private static bool TryBuildEndpointKey(string normalizedHost, int port, out string key)
-        {
-            key = string.Empty;
-            if (normalizedHost.Length == 0)
-                return false;
-            if (port <= 0 || port > 65535)
-                return false;
-
-            key = $"{normalizedHost}:{port}";
-            return true;
-        }
+            => PeerAddress.TryBuildEndpointKey(normalizedHost, port, out key);
 
         private static string NormalizeHost(string? value)
-        {
-            if (string.IsNullOrWhiteSpace(value)) return string.Empty;
-
-            string s = value.Trim().ToLowerInvariant();
-
-            if (s.StartsWith("[", StringComparison.Ordinal))
-            {
-                int close = s.IndexOf(']');
-                if (close > 1)
-                    s = s.Substring(1, close - 1);
-            }
-            else
-            {
-                int firstColon = s.IndexOf(':');
-                int lastColon = s.LastIndexOf(':');
-                if (firstColon > 0 && firstColon == lastColon)
-                {
-                    string tail = s[(firstColon + 1)..];
-                    if (int.TryParse(tail, out _))
-                        s = s[..firstColon];
-                }
-            }
-
-            if (s.StartsWith("::ffff:", StringComparison.Ordinal))
-                s = s[7..];
-
-            return s;
-        }
+            => PeerAddress.NormalizeHost(value);
     }
 }

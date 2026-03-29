@@ -29,9 +29,9 @@ namespace Qado.Networking
         private static int _pexReceivedSuppressed;
         private static readonly Dictionary<string, DateTime> _pexAdvertisedAtByEndpoint = new(StringComparer.Ordinal);
 
-        public static async Task HandleGetPeersAsync(NetworkStream ns, ILogSink? log, CancellationToken ct)
+        public static async Task HandleGetPeersAsync(PeerSession peer, NetworkStream ns, ILogSink? log, CancellationToken ct)
         {
-            var payload = BuildPeersPayload(maxPeers: 64);
+            var payload = BuildPeersPayload(peer, maxPeers: 64);
             await P2PNode.WriteFrame(ns, MsgType.Peers, payload, ct).ConfigureAwait(false);
             LogPexSent(log, GetCountFromPayload(payload));
         }
@@ -68,7 +68,7 @@ namespace Qado.Networking
                     int port = portU16;
                     if (port <= 0) port = DefaultP2PPort;
 
-                    if (!IsPublicRoutableIPv4Literal(ip)) continue;
+                    if (!PeerAddress.IsPublicRoutable(ip)) continue;
                     if (port is < 1 or > 65535) continue;
                     if (SelfPeerGuard.IsSelf(ip, port)) continue;
                     if (IsConfiguredSeed(ip, port)) continue;
@@ -94,13 +94,14 @@ namespace Qado.Networking
             }
         }
 
-        public static byte[] BuildPeersPayload(int maxPeers = 64)
+        public static byte[] BuildPeersPayload(PeerSession? targetPeer, int maxPeers = 64)
         {
             if (maxPeers <= 0) return MakeEmpty();
             if (maxPeers > MaxPeersInPayload) maxPeers = MaxPeersInPayload;
 
             int candidateLimit = Math.Min(MaxPeersInPayload, Math.Max(maxPeers, maxPeers * 4));
-            var peers = P2PNode.Instance?.GetPeerCandidatesForPex(candidateLimit)
+            bool includeIpv6 = targetPeer?.Supports(HandshakeCapabilities.PeerExchangeIpv6) == true;
+            var peers = P2PNode.Instance?.GetPeerCandidatesForPex(candidateLimit, includeIpv6: includeIpv6)
                         ?? new List<(string ip, int port)>();
             var selected = SelectPeersForPayload(peers, maxPeers);
             var chunks = new List<byte[]>(selected.Count);
@@ -108,7 +109,8 @@ namespace Qado.Networking
             ushort count = 0;
             foreach (var (ip, port) in selected)
             {
-                if (!IsPublicRoutableIPv4Literal(ip)) continue;
+                if (!PeerAddress.IsPublicRoutable(ip)) continue;
+                if (!includeIpv6 && !IsPublicRoutableIPv4Literal(ip)) continue;
 
                 int p = port;
                 if (p <= 0) p = DefaultP2PPort;
@@ -222,16 +224,7 @@ namespace Qado.Networking
         }
 
         private static bool TryBuildEndpointKey(string ip, int port, out string key)
-        {
-            key = string.Empty;
-            if (port <= 0 || port > 65535) return false;
-
-            var host = NormalizeHost(ip);
-            if (host.Length == 0) return false;
-
-            key = $"{host}:{port}";
-            return true;
-        }
+            => PeerAddress.TryBuildEndpointKey(ip, port, out key);
 
 
         private static byte[] MakeEmpty()
@@ -273,19 +266,25 @@ namespace Qado.Networking
         private static bool IsConfiguredSeed(string ip, int port)
         {
             if (port != GenesisConfig.P2PPort) return false;
+            string normalizedIp = NormalizeHost(ip);
+            if (normalizedIp.Length == 0) return false;
 
-            var seed = NormalizeHost(GenesisConfig.GenesisHost);
-            if (seed.Length == 0) return false;
+            var configuredSeeds = GenesisConfig.BootstrapHosts ?? Array.Empty<string>();
+            for (int i = 0; i < configuredSeeds.Length; i++)
+            {
+                var seed = NormalizeHost(configuredSeeds[i]);
+                if (seed.Length == 0)
+                    continue;
 
-            return string.Equals(NormalizeHost(ip), seed, StringComparison.OrdinalIgnoreCase);
+                if (string.Equals(normalizedIp, seed, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+
+            return false;
         }
 
         private static string NormalizeHost(string value)
-        {
-            if (string.IsNullOrWhiteSpace(value)) return string.Empty;
-            var s = value.Trim().ToLowerInvariant();
-            return s.StartsWith("::ffff:", StringComparison.Ordinal) ? s[7..] : s;
-        }
+            => PeerAddress.NormalizeHost(value);
 
         private static bool Skip(byte[] payload, ref int idx, int bytes)
         {

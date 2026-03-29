@@ -22,6 +22,17 @@ namespace Qado.Networking
     {
         public const int DefaultPort = GenesisConfig.P2PPort;
         private const byte CurrentHandshakeVersion = 2;
+        private static readonly HandshakeCapabilities DefaultHandshakeCapabilities =
+            HandshakeCapabilities.DirectTransactions |
+            HandshakeCapabilities.DirectBlocks |
+            HandshakeCapabilities.BlocksBatchData |
+            HandshakeCapabilities.PeerExchangeIpv6 |
+            HandshakeCapabilities.DualStack |
+            HandshakeCapabilities.LegacyChunkSync |
+            HandshakeCapabilities.ExtendedSyncWindow |
+            HandshakeCapabilities.SyncWindowPreview;
+        private const int HandshakeBaseLength = 1 + 1 + 32 + 2;
+        private const int HandshakeCapabilitiesLength = 4;
         private static readonly int MaxFramePayloadBytes =
             Math.Max(
                 Math.Max(ConsensusRules.MaxBlockSizeBytes, BlockSyncProtocol.MaxFramePayloadBytes),
@@ -57,10 +68,22 @@ namespace Qado.Networking
         private const int MaxKnownBlockLogEntries = 4096;
         private static readonly TimeSpan ValidationQueueFullLogWindow = TimeSpan.FromSeconds(10);
         private static readonly TimeSpan ParentPackBenignFailureLogWindow = TimeSpan.FromSeconds(15);
+        private static readonly TimeSpan ParentPackRequestLogWindow = TimeSpan.FromSeconds(10);
+        private static readonly TimeSpan DuplicateSessionLogWindow = TimeSpan.FromSeconds(10);
+        private static readonly TimeSpan ParentPackRequestBudgetWindow = TimeSpan.FromSeconds(1);
         private static readonly TimeSpan MissingHeaderResyncCooldown = TimeSpan.FromSeconds(12);
         private static readonly TimeSpan BlockRelayCooldown = TimeSpan.FromMinutes(2);
         private const int MaxBlockRelayEntries = 8192;
-        private static readonly LruSet ParentRequestSeen = new(capacity: 200_000, ttl: TimeSpan.FromMinutes(5));
+        private static readonly TimeSpan TxRelayCooldown = TimeSpan.FromMinutes(10);
+        private const int MaxTxRelayEntries = 200_000;
+        private static readonly TimeSpan PeerRelayDedupeTtl = TimeSpan.FromMinutes(10);
+        private const int MaxPeerRelayEntries = 8192;
+        private const int MaxRelayQueuePerPeer = 256;
+        private static readonly TimeSpan RelayQueueOverflowLogWindow = TimeSpan.FromSeconds(10);
+        private const int MaxParentPackRequestsPerBudgetWindowGlobal = 4;
+        private const int MaxParentPackRequestsPerBudgetWindowPerPeer = 1;
+        private static readonly LruSet ParentRequestSeen = new(capacity: 200_000, ttl: TimeSpan.FromSeconds(60));
+        private static readonly LruSet RecentRelayedTxSeen = new(capacity: MaxTxRelayEntries, ttl: TxRelayCooldown);
         private static readonly TimeSpan PeerExchangeInterval = TimeSpan.FromMinutes(15);
         private static readonly TimeSpan InventoryRefreshInterval = TimeSpan.FromSeconds(5);
         private static readonly TimeSpan ImmediateTipStateBroadcastCooldown = TimeSpan.FromSeconds(2);
@@ -75,7 +98,8 @@ namespace Qado.Networking
         private readonly MempoolManager _mempool;
         private readonly ILogSink? _log;
 
-        private TcpListener? _listener;
+        private TcpListener? _listenerV4;
+        private TcpListener? _listenerV6;
         private int _listenPort = DefaultPort;
         private int _stopped;
         private int _reconnectLoopStarted;
@@ -107,13 +131,27 @@ namespace Qado.Networking
         private DateTime _lastAncestorPackQueueFullLogUtc = DateTime.MinValue;
         private int _ancestorPackQueueFullSuppressed;
         private readonly object _parentPackFailureLogGate = new();
+        private readonly object _parentPackRequestBudgetGate = new();
+        private readonly object _parentPackRequestLogGate = new();
+        private readonly object _duplicateSessionLogGate = new();
         private DateTime _lastBenignParentPackFailureLogUtc = DateTime.MinValue;
         private int _benignParentPackFailureSuppressed;
         private string _lastBenignParentPackFailureMessage = string.Empty;
+        private DateTime _parentPackRequestWindowStartUtc = DateTime.MinValue;
+        private int _parentPackRequestCountInWindow;
+        private readonly Dictionary<string, int> _parentPackRequestCountByPeer = new(StringComparer.Ordinal);
+        private DateTime _lastParentPackRequestLogUtc = DateTime.MinValue;
+        private int _parentPackRequestSuppressed;
+        private string _lastParentPackRequestMessage = string.Empty;
+        private DateTime _lastDuplicateSessionLogUtc = DateTime.MinValue;
+        private int _duplicateSessionLogSuppressed;
+        private string _lastDuplicateSessionMessage = string.Empty;
         private readonly object _missingHeaderResyncGate = new();
         private DateTime _nextMissingHeaderResyncAllowedUtc = DateTime.MinValue;
         private readonly object _blockRelayGate = new();
         private readonly Dictionary<string, DateTime> _blockRelayByHash = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, LruSet> _peerSentBlocks = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, LruSet> _peerSentTxs = new(StringComparer.Ordinal);
         private readonly object _tipStateBroadcastGate = new();
         private DateTime _nextImmediateTipStateBroadcastAllowedUtc = DateTime.MinValue;
         private int _immediateTipStateBroadcastInFlight;
@@ -197,8 +235,17 @@ namespace Qado.Networking
                         return BlockStore.GetCanonicalHashAtHeight(BlockStore.GetLatestHeight()) ?? new byte[32];
                     }
                 },
+                getLocalTipHeight: () =>
+                {
+                    lock (Db.Sync)
+                    {
+                        if (BlockIndexStore.TryGetBestValidatedTip(out _, out var bestValidatedHeight, out _))
+                            return bestValidatedHeight;
+                        return BlockStore.GetLatestHeight();
+                    }
+                },
                 prepareBatchAsync: _bulkSyncRuntime.PrepareBatchAsync,
-                commitChunkAsync: _bulkSyncRuntime.CommitChunkAsync,
+                commitBlocksAsync: _bulkSyncRuntime.CommitBlocksAsync,
                 completeBatchAsync: _bulkSyncRuntime.CompleteBatchAsync,
                 abortBatchAsync: _bulkSyncRuntime.AbortBatchAsync,
                 penalizePeer: (peer, reason) =>
@@ -222,6 +269,7 @@ namespace Qado.Networking
                 getLocalChainView: GetLocalChainView,
                 getCanonicalHashAtHeight: GetCanonicalHashAtHeightSnapshot,
                 getCanonicalPayloadAtHeight: GetCanonicalPayloadAtHeightSnapshot,
+                shouldPushBlockToPeer: ShouldPushBlockToPeer,
                 sendFrameAsync: SendFrameViaSessionAsync,
                 dropSession: DropSessionNoThrow,
                 log: _log);
@@ -250,18 +298,32 @@ namespace Qado.Networking
             Volatile.Write(ref _stopped, 0);
             _listenPort = port;
             _reachability.DecayIfExpired(PublicReachabilityTimeout);
-
-            _listener = new TcpListener(IPAddress.Any, port); // IPv4 only
-            _listener.Server.ExclusiveAddressUse = true;
-            _listener.Start();
+            bool listeningV4;
+            bool listeningV6 = false;
+            _listenerV4 = TryStartListener(IPAddress.Any, port, ipv6Only: false, out listeningV4);
+            if (Socket.OSSupportsIPv6)
+                _listenerV6 = TryStartListener(IPAddress.IPv6Any, port, ipv6Only: true, out listeningV6);
 
             // Validation is serialized by _validationSerializeGate, so one dispatcher
             // preserves FIFO for sync/recovery payloads and avoids synthetic orphan cascades.
             _validationWorker.Start(1, ct);
             _blockDownloadManager.Start(ct);
 
-            _ = AcceptLoop(ct);
-            _log?.Info("P2P", $"listening on 0.0.0.0:{port} (IPv4 only)");
+            if (listeningV4 && _listenerV4 != null)
+                _ = AcceptLoop(_listenerV4, "ipv4", ct);
+
+            if (_listenerV6 != null)
+                _ = AcceptLoop(_listenerV6, "ipv6", ct);
+
+            if (!listeningV4 && _listenerV6 == null)
+                throw new InvalidOperationException("No P2P listener could be started for IPv4 or IPv6.");
+
+            if (listeningV4 && _listenerV6 != null)
+                _log?.Info("P2P", $"listening on 0.0.0.0:{port} and [::]:{port}");
+            else if (listeningV4)
+                _log?.Info("P2P", $"listening on 0.0.0.0:{port}");
+            else
+                _log?.Info("P2P", $"listening on [::]:{port}");
         }
 
         public void Stop()
@@ -269,8 +331,10 @@ namespace Qado.Networking
             if (Interlocked.Exchange(ref _stopped, 1) != 0)
                 return;
 
-            try { _listener?.Stop(); } catch { }
-            _listener = null;
+            try { _listenerV4?.Stop(); } catch { }
+            try { _listenerV6?.Stop(); } catch { }
+            _listenerV4 = null;
+            _listenerV6 = null;
             Interlocked.Exchange(ref _reconnectLoopStarted, 0);
             Interlocked.Exchange(ref _peerExchangeLoopStarted, 0);
             Interlocked.Exchange(ref _inventoryRefreshLoopStarted, 0);
@@ -279,9 +343,7 @@ namespace Qado.Networking
             foreach (var kv in _sessions)
             {
                 var s = kv.Value;
-                try { s.Stream.Close(); } catch { }
-                try { s.Client.Close(); } catch { }
-                _sessions.TryRemove(kv.Key, out _);
+                TeardownSessionNoThrow(s);
             }
 
             try { _blockDownloadManager.Dispose(); } catch { }
@@ -321,36 +383,55 @@ namespace Qado.Networking
                 if (IsPeerSessionPresent(host, port))
                     return ConnectOutcome.Skipped;
 
-                var client = new TcpClient(AddressFamily.InterNetwork); // IPv4 only
-                client.NoDelay = true;
-                client.ReceiveTimeout = 15000;
-                client.SendTimeout = 15000;
+                var dialAddresses = await ResolveDialAddressesAsync(host, ct).ConfigureAwait(false);
+                Exception? lastError = null;
+
+                for (int i = 0; i < dialAddresses.Count; i++)
+                {
+                    var address = dialAddresses[i];
+                    TcpClient? client = null;
+                    try
+                    {
+                        client = new TcpClient(address.AddressFamily);
+                        client.NoDelay = true;
+                        client.ReceiveTimeout = 15000;
+                        client.SendTimeout = 15000;
 
 #if NET8_0_OR_GREATER
-                await client.ConnectAsync(host, port, ct).ConfigureAwait(false);
+                        await client.ConnectAsync(address, port, ct).ConfigureAwait(false);
 #else
-                await client.ConnectAsync(host, port).ConfigureAwait(false);
+                        await client.ConnectAsync(address.ToString(), port).ConfigureAwait(false);
 #endif
 
-                var ns = client.GetStream();
+                        var ns = client.GetStream();
+                        string remoteIp = PeerAddress.NormalizeHost(address.ToString());
+                        var sess = new PeerSession
+                        {
+                            Client = client,
+                            Stream = ns,
+                            RemoteEndpoint = client.Client.RemoteEndPoint?.ToString() ?? EndpointLogFormatter.FormatHostPort(remoteIp, port),
+                            RemoteBanKey = NormalizeBanKey(remoteIp),
+                            IsInbound = false
+                        };
 
-                var sess = new PeerSession
-                {
-                    Client = client,
-                    Stream = ns,
-                    RemoteEndpoint = client.Client.RemoteEndPoint?.ToString() ?? $"{host}:{port}",
-                    RemoteBanKey = banKey,
-                    IsInbound = false
-                };
+                        _sessions[sess.RemoteEndpoint] = sess;
 
-                _sessions[sess.RemoteEndpoint] = sess;
+                        await SendFrameAsync(sess, MsgType.Handshake, BuildHandshakePayload(), ct).ConfigureAwait(false);
 
-                await SendFrameAsync(sess, MsgType.Handshake, BuildHandshakePayload(), ct).ConfigureAwait(false);
+                        PeerFailTracker.ReportSuccess(sess.RemoteBanKey);
+                        _log?.Info("P2P", $"dialed {EndpointLogFormatter.FormatHostPort(remoteIp, port)} ({address.AddressFamily})");
+                        _ = HandleClient(sess, ct);
+                        return ConnectOutcome.Succeeded;
+                    }
+                    catch (Exception ex)
+                    {
+                        lastError = ex;
+                        try { client?.Close(); } catch { }
+                    }
+                }
 
-                PeerFailTracker.ReportSuccess(banKey);
-                _log?.Info("P2P", $"dialed {EndpointLogFormatter.FormatHostPort(host, port)} (IPv4)");
-                _ = HandleClient(sess, ct);
-                return ConnectOutcome.Succeeded;
+                _log?.Warn("P2P", $"connect {EndpointLogFormatter.FormatHostPort(host, port)} failed: {lastError?.Message ?? "no address candidates"}");
+                return ConnectOutcome.Failed;
             }
             catch (Exception ex)
             {
@@ -377,7 +458,9 @@ namespace Qado.Networking
                 return;
 
             int seedPort = DefaultPort;
-            TryRememberSeedEndpointNoThrow(GenesisConfig.GenesisHost, seedPort);
+            var configuredSeeds = GenesisConfig.BootstrapHosts ?? Array.Empty<string>();
+            for (int i = 0; i < configuredSeeds.Length; i++)
+                TryRememberSeedEndpointNoThrow(configuredSeeds[i], seedPort);
 
             var candidates = new List<(string ip, int port, ulong lastSeen, bool isSeed)>();
             var seen = new HashSet<string>(StringComparer.Ordinal);
@@ -391,7 +474,8 @@ namespace Qado.Networking
                     candidates.Add((ip, p, lastSeen, isSeed));
             }
 
-            AddCandidate(GenesisConfig.GenesisHost, seedPort, 0UL, isSeed: true);
+            for (int i = 0; i < configuredSeeds.Length; i++)
+                AddCandidate(configuredSeeds[i], seedPort, 0UL, isSeed: true);
             foreach (var (ip, port, lastSeen) in GetPeersFromDb())
                 AddCandidate(ip, port, lastSeen, isSeed: false);
 
@@ -618,7 +702,7 @@ namespace Qado.Networking
                         continue;
                     if (s.RemotePortAdvertised is not int p || p <= 0 || p > 65535)
                         continue;
-                    if (!IsPublicRoutableIPv4Literal(s.RemoteIpAdvertised!))
+                    if (!PeerAddress.IsPublicRoutable(s.RemoteIpAdvertised!))
                         continue;
                     if (SelfPeerGuard.IsSelf(s.RemoteIpAdvertised!, p))
                         continue;
@@ -682,11 +766,313 @@ namespace Qado.Networking
             if (s == null)
                 return;
 
-            try { s.Client.Close(); } catch { }
-            _sessions.TryRemove(s.RemoteEndpoint, out _);
-            try { _blockDownloadManager.OnPeerDisconnected(s); } catch { }
-            _ = _blockSyncClient.OnPeerDisconnectedAsync(s, CancellationToken.None);
+            TeardownSessionNoThrow(s);
+
+            if (reason.StartsWith("duplicate peer session resolved", StringComparison.Ordinal))
+            {
+                LogDuplicateSessionDrop(reason);
+                return;
+            }
+
             _log?.Warn("P2P", $"dropping session {EndpointLogFormatter.FormatEndpoint(s.RemoteEndpoint)}: {reason}");
+        }
+
+        private void TeardownSessionNoThrow(PeerSession session)
+        {
+            if (session == null)
+                return;
+
+            try
+            {
+                if (Interlocked.Exchange(ref session.RelayStopRequested, 1) == 0)
+                    session.RelaySignal.Release();
+            }
+            catch { }
+
+            try { session.Client.Close(); } catch { }
+            _sessions.TryRemove(session.RemoteEndpoint, out _);
+            _peerSentBlocks.TryRemove(session.SessionKey, out _);
+            _peerSentTxs.TryRemove(session.SessionKey, out _);
+            try { _blockDownloadManager.OnPeerDisconnected(session); } catch { }
+            _ = _blockSyncClient.OnPeerDisconnectedAsync(session, CancellationToken.None);
+        }
+
+        private bool ResolveDuplicatePeerSessionAfterHandshake(PeerSession session, string ip, int port)
+        {
+            if (session == null || session.RemoteNodeId is not { Length: 32 })
+                return true;
+
+            var duplicates = new List<PeerSession>();
+            TryGetAdvertisedPeerEndpointKey(session, out var sessionEndpointKey);
+            foreach (var kv in _sessions)
+            {
+                var other = kv.Value;
+                if (other == null || ReferenceEquals(other, session))
+                    continue;
+
+                bool sameRemoteNode =
+                    other.RemoteNodeId is { Length: 32 } &&
+                    BytesEqual32(other.RemoteNodeId, session.RemoteNodeId) &&
+                    string.Equals(other.RemoteBanKey, session.RemoteBanKey, StringComparison.Ordinal) &&
+                    (!HasConflictingAdvertisedPort(other, session));
+
+                bool sameAdvertisedEndpoint =
+                    sessionEndpointKey != null &&
+                    TryGetAdvertisedPeerEndpointKey(other, out var otherEndpointKey) &&
+                    string.Equals(otherEndpointKey, sessionEndpointKey, StringComparison.Ordinal);
+
+                if (!sameRemoteNode && !sameAdvertisedEndpoint)
+                    continue;
+
+                duplicates.Add(other);
+            }
+
+            if (duplicates.Count == 0)
+                return true;
+
+            duplicates.Add(session);
+            var preferred = SelectPreferredDuplicateSession(duplicates, session.RemoteNodeId);
+            if (preferred == null)
+                return true;
+
+            foreach (var candidate in duplicates)
+            {
+                if (ReferenceEquals(candidate, preferred))
+                    continue;
+
+                string loserDirection = candidate.IsInbound ? "inbound" : "outbound";
+                string winnerDirection = preferred.IsInbound ? "inbound" : "outbound";
+                string loserLabel = loserDirection == winnerDirection
+                    ? $"duplicate {loserDirection}"
+                    : loserDirection;
+                string winnerLabel = loserDirection == winnerDirection
+                    ? $"existing {winnerDirection}"
+                    : winnerDirection;
+                DropSessionNoThrow(
+                    candidate,
+                    $"duplicate peer session resolved for {EndpointLogFormatter.FormatHostPort(ip, port)}: keeping {winnerLabel}, dropping {loserLabel}");
+            }
+
+            return ReferenceEquals(preferred, session);
+        }
+
+        private void ScheduleDuplicatePeerSessionRecheck(PeerSession session, string ip, int port)
+        {
+            if (session == null)
+                return;
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(250).ConfigureAwait(false);
+                    if (Volatile.Read(ref _stopped) != 0)
+                        return;
+
+                    if (!_sessions.TryGetValue(session.RemoteEndpoint, out var current) || !ReferenceEquals(current, session))
+                        return;
+
+                    ResolveDuplicatePeerSessionAfterHandshake(session, ip, port);
+                }
+                catch
+                {
+                }
+            }, CancellationToken.None);
+        }
+
+        private PeerSession? SelectPreferredDuplicateSession(IReadOnlyList<PeerSession> candidates, byte[] remoteNodeId)
+        {
+            if (candidates == null || candidates.Count == 0 || remoteNodeId is not { Length: 32 })
+                return null;
+
+            bool? preferOutbound = null;
+            int tie = CompareNodeIds(_nodeId, remoteNodeId);
+            if (tie < 0)
+                preferOutbound = true;
+            else if (tie > 0)
+                preferOutbound = false;
+
+            PeerSession? best = null;
+            foreach (var candidate in candidates)
+            {
+                if (candidate == null)
+                    continue;
+
+                if (best == null)
+                {
+                    best = candidate;
+                    continue;
+                }
+
+                if (preferOutbound.HasValue)
+                {
+                    bool candidatePreferredDir = candidate.IsInbound != preferOutbound.Value;
+                    bool bestPreferredDir = best.IsInbound != preferOutbound.Value;
+                    if (candidatePreferredDir != bestPreferredDir)
+                    {
+                        if (candidatePreferredDir)
+                            best = candidate;
+                        continue;
+                    }
+                }
+
+                if (candidate.ConnectedUtc < best.ConnectedUtc)
+                {
+                    best = candidate;
+                    continue;
+                }
+
+                if (candidate.ConnectedUtc == best.ConnectedUtc &&
+                    string.CompareOrdinal(candidate.RemoteEndpoint, best.RemoteEndpoint) < 0)
+                {
+                    best = candidate;
+                }
+            }
+
+            return best;
+        }
+
+        private void LogDuplicateSessionDrop(string reason)
+        {
+            var message = $"duplicate session drop: {reason}";
+            lock (_duplicateSessionLogGate)
+            {
+                var now = DateTime.UtcNow;
+                if (string.Equals(_lastDuplicateSessionMessage, message, StringComparison.Ordinal) &&
+                    (now - _lastDuplicateSessionLogUtc) < DuplicateSessionLogWindow)
+                {
+                    _duplicateSessionLogSuppressed++;
+                    return;
+                }
+
+                if (_duplicateSessionLogSuppressed > 0 && !string.IsNullOrWhiteSpace(_lastDuplicateSessionMessage))
+                    _log?.Warn("P2P", $"{_lastDuplicateSessionMessage} (+{_duplicateSessionLogSuppressed} similar drops suppressed)");
+
+                _lastDuplicateSessionMessage = message;
+                _lastDuplicateSessionLogUtc = now;
+                _duplicateSessionLogSuppressed = 0;
+                _log?.Warn("P2P", message);
+            }
+        }
+
+        private PeerSession? SelectPreferredPeerEndpointSession(IReadOnlyList<PeerSession> candidates)
+        {
+            if (candidates == null || candidates.Count == 0)
+                return null;
+
+            if (candidates.Count == 1)
+                return candidates[0];
+
+            byte[]? remoteNodeId = null;
+            bool consistentRemoteNode = true;
+
+            foreach (var candidate in candidates)
+            {
+                if (candidate?.RemoteNodeId is not { Length: 32 } candidateNodeId)
+                    continue;
+
+                if (remoteNodeId == null)
+                {
+                    remoteNodeId = candidateNodeId;
+                    continue;
+                }
+
+                if (!BytesEqual32(remoteNodeId, candidateNodeId))
+                {
+                    consistentRemoteNode = false;
+                    break;
+                }
+            }
+
+            if (consistentRemoteNode && remoteNodeId is { Length: 32 })
+            {
+                var preferred = SelectPreferredDuplicateSession(candidates, remoteNodeId);
+                if (preferred != null)
+                    return preferred;
+            }
+
+            PeerSession? best = null;
+            foreach (var candidate in candidates)
+            {
+                if (candidate == null)
+                    continue;
+
+                if (best == null)
+                {
+                    best = candidate;
+                    continue;
+                }
+
+                if (candidate.ConnectedUtc < best.ConnectedUtc)
+                {
+                    best = candidate;
+                    continue;
+                }
+
+                if (candidate.ConnectedUtc == best.ConnectedUtc &&
+                    string.CompareOrdinal(candidate.RemoteEndpoint, best.RemoteEndpoint) < 0)
+                {
+                    best = candidate;
+                }
+            }
+
+            return best;
+        }
+
+        private static bool HasConflictingAdvertisedPort(PeerSession left, PeerSession right)
+        {
+            if (left.RemotePortAdvertised is not int leftPort ||
+                right.RemotePortAdvertised is not int rightPort)
+            {
+                return false;
+            }
+
+            if (leftPort <= 0 || leftPort > 65535 || rightPort <= 0 || rightPort > 65535)
+                return false;
+
+            return leftPort != rightPort;
+        }
+
+        private static bool TryGetAdvertisedPeerEndpointKey(PeerSession session, out string? key)
+        {
+            key = null;
+            if (session == null ||
+                !session.RemoteClaimsListening ||
+                string.IsNullOrWhiteSpace(session.RemoteIpAdvertised) ||
+                session.RemotePortAdvertised is not int port ||
+                port <= 0 || port > 65535)
+            {
+                return false;
+            }
+
+            if (!PeerAddress.IsPublicRoutable(session.RemoteIpAdvertised))
+                return false;
+
+            return TryBuildPeerEndpointKey(session.RemoteIpAdvertised!, port, out key);
+        }
+
+        private bool TryGetPreferredConnectedPeerSession(string wantedIp, int port, out PeerSession? preferred)
+        {
+            preferred = null;
+            if (string.IsNullOrWhiteSpace(wantedIp) || port <= 0 || port > 65535)
+                return false;
+
+            List<PeerSession>? matches = null;
+            foreach (var kv in _sessions)
+            {
+                var s = kv.Value;
+                if (!IsMatchingConnectedPeerSession(s, wantedIp, port))
+                    continue;
+
+                matches ??= new List<PeerSession>();
+                matches.Add(s);
+            }
+
+            if (matches == null || matches.Count == 0)
+                return false;
+
+            preferred = SelectPreferredPeerEndpointSession(matches) ?? matches[0];
+            return true;
         }
 
         public bool IsPeerConnected(string ip, int port)
@@ -741,18 +1127,20 @@ namespace Qado.Networking
             return false;
         }
 
-        public async Task BroadcastTxAsync(Transaction tx)
+        public Task BroadcastTxAsync(Transaction tx)
         {
             try
             {
                 var payload = tx.ToBytes();
-                int sent = await BroadcastAsync(MsgType.Tx, payload).ConfigureAwait(false);
+                int sent = QueueTxRelay(tx, payload, exceptEndpoint: null);
                 _log?.Info("Gossip", $"Tx gossiped to {sent} peer(s).");
             }
             catch { }
+
+            return Task.CompletedTask;
         }
 
-        public async Task BroadcastBlockAsync(Block block)
+        public Task BroadcastBlockAsync(Block block)
         {
             try
             {
@@ -763,31 +1151,29 @@ namespace Qado.Networking
                 if (targets <= 0)
                 {
                     _log?.Warn("Gossip", $"No handshake peers for block gossip {Hex16(block.BlockHash!)}.");
-                    return;
+                    return Task.CompletedTask;
                 }
 
-                int blockSent = await BroadcastBlockPayloadAsync(block, exceptEndpoint: null, ct: default).ConfigureAwait(false);
-                var tipStatePayload = _smallNetPeerFlow.BuildLocalTipStatePayload();
-                int tipStateSent = await BroadcastAsync(MsgType.TipState, tipStatePayload, ct: default).ConfigureAwait(false);
+                int blockSent = QueueBlockRelay(block, exceptEndpoint: null, includeTipState: true);
+                int tipStateSent = blockSent;
                 _log?.Info("Gossip", $"Block pushed h={block.BlockHeight} {Hex16(block.BlockHash!)} to {blockSent} peer(s), tipstate to {tipStateSent} peer(s) (handshakeTargets={targets}).");
             }
             catch (Exception ex)
             {
                 _log?.Warn("Gossip", $"Block gossip failed: {ex.Message}");
             }
+
+            return Task.CompletedTask;
         }
 
 
-        private async Task AcceptLoop(CancellationToken ct)
+        private async Task AcceptLoop(TcpListener listener, string listenerTag, CancellationToken ct)
         {
             while (!ct.IsCancellationRequested && Volatile.Read(ref _stopped) == 0)
             {
                 TcpClient? c = null;
                 try
                 {
-                    var listener = _listener;
-                    if (listener == null) return;
-
 #if NET8_0_OR_GREATER
                     c = await listener.AcceptTcpClientAsync(ct).ConfigureAwait(false);
 #else
@@ -836,6 +1222,8 @@ namespace Qado.Networking
                 catch
                 {
                     try { c?.Close(); } catch { }
+                    if (Volatile.Read(ref _stopped) == 0)
+                        _log?.Warn("P2P", $"accept loop ({listenerTag}) recovered after socket error");
                 }
             }
         }
@@ -885,9 +1273,7 @@ namespace Qado.Networking
             }
             finally
             {
-                _blockDownloadManager.OnPeerDisconnected(s);
-                _sessions.TryRemove(s.RemoteEndpoint, out _);
-                _ = _blockSyncClient.OnPeerDisconnectedAsync(s, CancellationToken.None);
+                TeardownSessionNoThrow(s);
             }
         }
 
@@ -901,8 +1287,7 @@ namespace Qado.Networking
             {
                 PeerFailTracker.ReportFailure(GetBanKey(s));
                 _log?.Warn("P2P", $"Rejected pre-handshake message {type} from {EndpointLogFormatter.FormatEndpoint(s.RemoteEndpoint)}.");
-                try { s.Client.Close(); } catch { }
-                _sessions.TryRemove(s.RemoteEndpoint, out _);
+                TeardownSessionNoThrow(s);
                 return;
             }
 
@@ -942,7 +1327,7 @@ namespace Qado.Networking
                     return;
 
                 case MsgType.GetPeers:
-                    var peersPayload = PeerDiscovery.BuildPeersPayload(maxPeers: 64);
+                    var peersPayload = PeerDiscovery.BuildPeersPayload(s, maxPeers: 64);
                     await SendFrameAsync(s, MsgType.Peers, peersPayload, ct).ConfigureAwait(false);
                     return;
 
@@ -972,6 +1357,10 @@ namespace Qado.Networking
 
                 case MsgType.BlocksChunk:
                     await _blockSyncClient.OnBlocksChunkAsync(s, payload, ct).ConfigureAwait(false);
+                    return;
+
+                case MsgType.BlocksBatchData:
+                    await _blockSyncClient.OnBlocksBatchDataAsync(s, payload, ct).ConfigureAwait(false);
                     return;
 
                 case MsgType.BlocksBatchEnd:
@@ -1019,12 +1408,11 @@ namespace Qado.Networking
         {
             var banKey = GetBanKey(s);
 
-            if (payload.Length < 1 + 1 + 32 + 2)
+            if (payload.Length < HandshakeBaseLength)
             {
                 PeerFailTracker.ReportFailure(banKey);
                 _log?.Warn("P2P", "Rejected legacy handshake without network id.");
-                try { s.Client.Close(); } catch { }
-                _sessions.TryRemove(s.RemoteEndpoint, out _);
+                TeardownSessionNoThrow(s);
                 return;
             }
 
@@ -1036,8 +1424,7 @@ namespace Qado.Networking
                 _log?.Warn(
                     "P2P",
                     $"Rejected peer {EndpointLogFormatter.FormatEndpoint(s.RemoteEndpoint)} on unsupported handshake version {ver} (expected {CurrentHandshakeVersion}).");
-                try { s.Client.Close(); } catch { }
-                _sessions.TryRemove(s.RemoteEndpoint, out _);
+                TeardownSessionNoThrow(s);
                 return;
             }
 
@@ -1047,14 +1434,14 @@ namespace Qado.Networking
                 _log?.Warn(
                     "P2P",
                     $"Rejected peer {EndpointLogFormatter.FormatEndpoint(s.RemoteEndpoint)} on foreign network id {networkId} (expected {GenesisConfig.NetworkId}, inbound={s.IsInbound}, raw={s.RemoteEndpoint}).");
-                try { s.Client.Close(); } catch { }
-                _sessions.TryRemove(s.RemoteEndpoint, out _);
+                TeardownSessionNoThrow(s);
                 return;
             }
 
             ushort portRaw = BinaryPrimitives.ReadUInt16LittleEndian(payload.AsSpan(34, 2));
             bool claimsListening = portRaw != 0;
             int port = claimsListening ? portRaw : DefaultPort;
+            HandshakeCapabilities capabilities = ParseHandshakeCapabilities(payload);
 
             var peerId = payload.AsSpan(2, 32); // peerId is untrusted metadata; use only for self-loop detection.
             if (peerId.SequenceEqual(_nodeId))
@@ -1064,23 +1451,28 @@ namespace Qado.Networking
                 SelfPeerGuard.RememberSelf(endpointIp, port);
 
                 _log?.Warn("P2P", $"Rejected self-loop handshake from {EndpointLogFormatter.FormatHost(endpointIp)}.");
-                try { s.Client.Close(); } catch { }
-                _sessions.TryRemove(s.RemoteEndpoint, out _);
+                TeardownSessionNoThrow(s);
                 return;
             }
 
-            var ip = (s.Client.Client.RemoteEndPoint as IPEndPoint)?.Address?.ToString()
-                     ?? s.RemoteEndpoint;
+            var ip = PeerAddress.NormalizeHost(
+                (s.Client.Client.RemoteEndPoint as IPEndPoint)?.Address?.ToString()
+                ?? s.RemoteEndpoint);
 
             s.RemoteClaimsListening = claimsListening;
             s.RemoteIpAdvertised = ip;
             s.RemotePortAdvertised = port;
+            s.RemoteNodeId = peerId.ToArray();
             s.RemoteBanKey = NormalizeBanKey(ip);
+            s.Capabilities = capabilities;
             s.RemoteIsPublic = IsPeerMarkedPublic(ip, port);
+
+            if (!ResolveDuplicatePeerSessionAfterHandshake(s, ip, port))
+                return;
 
             // Public proof for a remote peer exists when THIS node dials the peer successfully.
             // Inbound sessions (remote dialed us) are not proof of remote reachability.
-            bool outboundReachabilityProof = !s.IsInbound && claimsListening && IsPublicRoutableIPv4Literal(ip);
+            bool outboundReachabilityProof = !s.IsInbound && claimsListening && PeerAddress.IsPublicRoutable(ip);
             if (outboundReachabilityProof)
             {
                 MarkPeerAsPublic(ip, port);
@@ -1089,7 +1481,7 @@ namespace Qado.Networking
                 if (TryBuildPeerEndpointKey(ip, port, out var endpointKey))
                     _publicClaimsByPex.TryRemove(endpointKey, out _);
             }
-            else if (s.IsInbound && claimsListening && IsPublicRoutableIPv4Literal(ip))
+            else if (s.IsInbound && claimsListening && PeerAddress.IsPublicRoutable(ip))
             {
                 if (IsPeerMarkedNonPublic(ip, port))
                 {
@@ -1107,7 +1499,7 @@ namespace Qado.Networking
                 }
             }
 
-            if (claimsListening && IsPublicRoutableIPv4Literal(ip))
+            if (claimsListening && PeerAddress.IsPublicRoutable(ip))
             {
                 try
                 {
@@ -1118,8 +1510,9 @@ namespace Qado.Networking
 
             bool firstHandshakeForSession = !s.HandshakeOk;
             s.HandshakeOk = true;
+            ScheduleDuplicatePeerSessionRecheck(s, ip, port);
             PeerFailTracker.ReportSuccess(GetBanKey(s));
-            if (IsPublicRoutableIPv4Literal(ip) && port > 0 && port <= 65535)
+            if (PeerAddress.IsPublicRoutable(ip) && port > 0 && port <= 65535)
                 PeerDialPolicy.ReportSuccess(ip, port);
             _blockDownloadManager.OnPeerReady(s);
             await _blockSyncClient.OnPeerReadyAsync(s, ct).ConfigureAwait(false);
@@ -1128,7 +1521,7 @@ namespace Qado.Networking
             if (firstHandshakeForSession)
             {
                 _log?.Info("P2P",
-                    $"handshake from {EndpointLogFormatter.FormatHostPort(ip, port)} (v{ver}, inbound={s.IsInbound}, public={s.RemoteIsPublic}, claimsListening={claimsListening}, advertisedPort={port})");
+                    $"handshake from {EndpointLogFormatter.FormatHostPort(ip, port)} (v{ver}, inbound={s.IsInbound}, public={s.RemoteIsPublic}, claimsListening={claimsListening}, advertisedPort={port}, caps={(uint)capabilities})");
 
                 try { await SendFrameAsync(s, MsgType.GetPeers, Array.Empty<byte>(), ct).ConfigureAwait(false); } catch { }
                 try { await _smallNetPeerFlow.SendLocalHelloAsync(s, ct).ConfigureAwait(false); } catch { }
@@ -1239,8 +1632,8 @@ namespace Qado.Networking
             }
             catch { }
 
-            await BroadcastAsync(MsgType.Tx, payload, exceptEndpoint: s.RemoteEndpoint, ct: ct).ConfigureAwait(false);
-            _log?.Info("P2P", $"TX accepted (nonce={txMsg.TxNonce}) gossiped");
+            int sent = QueueTxRelay(txMsg, payload, exceptEndpoint: s.RemoteEndpoint);
+            _log?.Info("P2P", $"TX accepted (nonce={txMsg.TxNonce}) gossiped to {sent} peer(s).");
         }
 
         private async Task HandleGetBlock(byte[] payload, PeerSession s, CancellationToken ct)
@@ -1411,7 +1804,14 @@ namespace Qado.Networking
 
             try
             {
-                string key = $"{NormalizeBanKey(peer.SessionKey)}:{Convert.ToHexString(parentHash).ToLowerInvariant()}";
+                string peerKey = NormalizeBanKey(peer.SessionKey);
+                string key = Convert.ToHexString(parentHash).ToLowerInvariant();
+                if (ParentRequestSeen.Seen(key))
+                    return;
+
+                if (!TryReserveParentPackRequest(peerKey))
+                    return;
+
                 if (!ParentRequestSeen.TryAdd(key))
                     return;
 
@@ -1421,7 +1821,7 @@ namespace Qado.Networking
                     try
                     {
                         await SendFrameAsync(peer, MsgType.GetAncestorPack, payload, CancellationToken.None).ConfigureAwait(false);
-                        _log?.Info("Sync", $"{source}: requested parent pack {Hex16(parentHash)} from {EndpointLogFormatter.FormatEndpoint(peer.RemoteEndpoint)}");
+                        LogParentPackRequest(source, parentHash, peer);
                     }
                     catch (Exception ex)
                     {
@@ -1431,6 +1831,65 @@ namespace Qado.Networking
             }
             catch
             {
+            }
+        }
+
+        private bool TryReserveParentPackRequest(string peerKey)
+        {
+            lock (_parentPackRequestBudgetGate)
+            {
+                var now = DateTime.UtcNow;
+                if ((now - _parentPackRequestWindowStartUtc) >= ParentPackRequestBudgetWindow)
+                {
+                    _parentPackRequestWindowStartUtc = now;
+                    _parentPackRequestCountInWindow = 0;
+                    _parentPackRequestCountByPeer.Clear();
+                }
+
+                if (_parentPackRequestCountInWindow >= MaxParentPackRequestsPerBudgetWindowGlobal)
+                    return false;
+
+                if (!string.IsNullOrWhiteSpace(peerKey) &&
+                    _parentPackRequestCountByPeer.TryGetValue(peerKey, out var perPeerCount) &&
+                    perPeerCount >= MaxParentPackRequestsPerBudgetWindowPerPeer)
+                {
+                    return false;
+                }
+
+                _parentPackRequestCountInWindow++;
+                if (!string.IsNullOrWhiteSpace(peerKey))
+                {
+                    int updated = _parentPackRequestCountByPeer.TryGetValue(peerKey, out var current)
+                        ? current + 1
+                        : 1;
+                    _parentPackRequestCountByPeer[peerKey] = updated;
+                }
+
+                return true;
+            }
+        }
+
+        private void LogParentPackRequest(string source, byte[] parentHash, PeerSession peer)
+        {
+            string message = $"{source}: requested parent pack {Hex16(parentHash)} from {EndpointLogFormatter.FormatEndpoint(peer.RemoteEndpoint)}";
+            lock (_parentPackRequestLogGate)
+            {
+                var now = DateTime.UtcNow;
+                _lastParentPackRequestMessage = message;
+                if ((now - _lastParentPackRequestLogUtc) >= ParentPackRequestLogWindow)
+                {
+                    if (_parentPackRequestSuppressed > 0)
+                        _log?.Info("Sync", $"{_lastParentPackRequestMessage} (+{_parentPackRequestSuppressed} similar requests suppressed)");
+                    else
+                        _log?.Info("Sync", _lastParentPackRequestMessage);
+
+                    _lastParentPackRequestLogUtc = now;
+                    _parentPackRequestSuppressed = 0;
+                }
+                else
+                {
+                    _parentPackRequestSuppressed++;
+                }
             }
         }
 
@@ -1533,10 +1992,7 @@ namespace Qado.Networking
                 }
                 catch (Exception ex)
                 {
-                    try { sess.Client.Close(); } catch { }
-                    try { _blockDownloadManager.OnPeerDisconnected(sess); } catch { }
-                    _sessions.TryRemove(kv.Key, out _);
-                    _ = _blockSyncClient.OnPeerDisconnectedAsync(sess, CancellationToken.None);
+                    TeardownSessionNoThrow(sess);
                     _log?.Warn("Gossip", $"send {t} failed for {EndpointLogFormatter.FormatEndpoint(kv.Key)}: {ex.Message}");
                 }
             }
@@ -1544,7 +2000,28 @@ namespace Qado.Networking
             return sent;
         }
 
-        private async Task<int> BroadcastBlockPayloadAsync(Block block, string? exceptEndpoint, CancellationToken ct)
+        private int QueueTxRelay(Transaction tx, byte[] payload, string? exceptEndpoint)
+        {
+            if (tx == null || payload == null || payload.Length == 0)
+                return 0;
+
+            byte[] txid;
+            try
+            {
+                txid = tx.ComputeTransactionHash();
+            }
+            catch
+            {
+                return 0;
+            }
+
+            if (txid is not { Length: 32 } || !RecentRelayedTxSeen.TryAdd(txid))
+                return 0;
+
+            return QueueRelayBroadcast(MsgType.Tx, payload, txid, exceptEndpoint);
+        }
+
+        private int QueueBlockRelay(Block block, string? exceptEndpoint, bool includeTipState)
         {
             if (block == null)
                 return 0;
@@ -1555,20 +2032,176 @@ namespace Qado.Networking
             int size = BlockBinarySerializer.GetSize(block);
             var blockPayload = new byte[size];
             _ = BlockBinarySerializer.Write(blockPayload, block);
-            return await BroadcastAsync(MsgType.Block, blockPayload, exceptEndpoint: exceptEndpoint, ct: ct).ConfigureAwait(false);
+
+            if (!ShouldRelayBlock(block.BlockHash))
+                return 0;
+
+            int sent = QueueRelayBroadcast(MsgType.Block, blockPayload, block.BlockHash, exceptEndpoint);
+            if (includeTipState && sent > 0)
+            {
+                _ = QueueRelayBroadcast(
+                    MsgType.TipState,
+                    _smallNetPeerFlow.BuildLocalTipStatePayload(),
+                    itemId: null,
+                    exceptEndpoint: exceptEndpoint);
+            }
+
+            return sent;
         }
 
-        private async Task RelayValidatedBlockAsync(Block block, PeerSession sourcePeer, CancellationToken ct)
+        private int QueueRelayBroadcast(MsgType t, byte[] payload, byte[]? itemId, string? exceptEndpoint)
         {
-            if (block?.BlockHash is not { Length: 32 } || !ShouldRelayBlock(block.BlockHash))
+            if (Volatile.Read(ref _stopped) != 0 || payload == null || payload.Length == 0)
+                return 0;
+
+            int sent = 0;
+            foreach (var kv in _sessions)
+            {
+                if (exceptEndpoint != null && string.Equals(kv.Key, exceptEndpoint, StringComparison.Ordinal))
+                    continue;
+
+                var sess = kv.Value;
+                if (sess == null || !sess.HandshakeOk || !sess.Client.Connected)
+                    continue;
+
+                if (itemId is { Length: 32 } && !ShouldRelayToPeer(sess, t, itemId))
+                    continue;
+
+                if (!TryEnqueueRelayFrame(sess, t, payload))
+                    continue;
+
+                sent++;
+            }
+
+            return sent;
+        }
+
+        private bool TryEnqueueRelayFrame(PeerSession session, MsgType type, byte[] payload)
+        {
+            if (session == null || payload == null || payload.Length == 0)
+                return false;
+
+            if (Volatile.Read(ref session.RelayStopRequested) != 0)
+                return false;
+
+            int queued = Interlocked.Increment(ref session.RelayQueuedCount);
+            if (queued > MaxRelayQueuePerPeer)
+            {
+                Interlocked.Decrement(ref session.RelayQueuedCount);
+                LogRelayQueueOverflow(session, type);
+                return false;
+            }
+
+            session.RelayQueue.Enqueue(new QueuedRelayFrame(type, payload));
+            EnsureRelayPump(session);
+            try { session.RelaySignal.Release(); } catch (SemaphoreFullException) { }
+            return true;
+        }
+
+        private void EnsureRelayPump(PeerSession session)
+        {
+            if (session == null)
                 return;
 
-            await BroadcastBlockPayloadAsync(block, exceptEndpoint: sourcePeer.RemoteEndpoint, ct: ct).ConfigureAwait(false);
-            await BroadcastAsync(
-                MsgType.TipState,
-                _smallNetPeerFlow.BuildLocalTipStatePayload(),
-                exceptEndpoint: sourcePeer.RemoteEndpoint,
-                ct: ct).ConfigureAwait(false);
+            if (Interlocked.CompareExchange(ref session.RelayPumpStarted, 1, 0) != 0)
+                return;
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    while (true)
+                    {
+                        await session.RelaySignal.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+
+                        while (session.RelayQueue.TryDequeue(out var frame))
+                        {
+                            Interlocked.Decrement(ref session.RelayQueuedCount);
+
+                            if (Volatile.Read(ref _stopped) != 0 || Volatile.Read(ref session.RelayStopRequested) != 0)
+                                continue;
+
+                            try
+                            {
+                                await SendFrameAsync(session, frame.Type, frame.Payload, CancellationToken.None).ConfigureAwait(false);
+                            }
+                            catch (Exception ex)
+                            {
+                                TeardownSessionNoThrow(session);
+                                _log?.Warn("Gossip", $"queued send {frame.Type} failed for {EndpointLogFormatter.FormatEndpoint(session.RemoteEndpoint)}: {ex.Message}");
+                                return;
+                            }
+                        }
+
+                        Interlocked.Exchange(ref session.RelayPumpStarted, 0);
+                        if (session.RelayQueue.IsEmpty || Interlocked.CompareExchange(ref session.RelayPumpStarted, 1, 0) != 0)
+                            return;
+                    }
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+                catch (OperationCanceledException)
+                {
+                }
+            }, CancellationToken.None);
+        }
+
+        private void LogRelayQueueOverflow(PeerSession session, MsgType type)
+        {
+            lock (session.RelayOverflowLogGate)
+            {
+                var now = DateTime.UtcNow;
+                if ((now - session.RelayOverflowLastLogUtc) >= RelayQueueOverflowLogWindow)
+                {
+                    if (session.RelayOverflowSuppressed > 0)
+                    {
+                        _log?.Warn(
+                            "Gossip",
+                            $"Relay queue full for {EndpointLogFormatter.FormatEndpoint(session.RemoteEndpoint)} while queueing {type} (+{session.RelayOverflowSuppressed} similar drops suppressed)");
+                    }
+                    else
+                    {
+                        _log?.Warn("Gossip", $"Relay queue full for {EndpointLogFormatter.FormatEndpoint(session.RemoteEndpoint)} while queueing {type}.");
+                    }
+
+                    session.RelayOverflowLastLogUtc = now;
+                    session.RelayOverflowSuppressed = 0;
+                }
+                else
+                {
+                    session.RelayOverflowSuppressed++;
+                }
+            }
+        }
+
+        private bool ShouldRelayToPeer(PeerSession session, MsgType type, byte[] itemId)
+        {
+            if (session == null || itemId is not { Length: 32 })
+                return false;
+
+            var bucket = GetPeerRelaySet(session, type);
+            return bucket.TryAdd(itemId);
+        }
+
+        private bool ShouldPushBlockToPeer(PeerSession session, byte[] blockHash)
+            => ShouldRelayToPeer(session, MsgType.Block, blockHash);
+
+        private LruSet GetPeerRelaySet(PeerSession session, MsgType type)
+        {
+            var map = type == MsgType.Block ? _peerSentBlocks : _peerSentTxs;
+            return map.GetOrAdd(
+                session.SessionKey,
+                static _ => new LruSet(MaxPeerRelayEntries, PeerRelayDedupeTtl));
+        }
+
+        private Task RelayValidatedBlockAsync(Block block, PeerSession sourcePeer, CancellationToken ct)
+        {
+            if (block == null)
+                return Task.CompletedTask;
+
+            _ = QueueBlockRelay(block, exceptEndpoint: sourcePeer?.RemoteEndpoint, includeTipState: true);
+            return Task.CompletedTask;
         }
 
         public static async Task WriteFrame(NetworkStream ns, MsgType t, byte[] payload, CancellationToken ct)
@@ -1606,12 +2239,66 @@ namespace Qado.Networking
 
         private byte[] BuildHandshakePayload()
         {
-            var buf = new byte[1 + 1 + 32 + 2];
+            var buf = new byte[HandshakeBaseLength + HandshakeCapabilitiesLength];
             buf[0] = CurrentHandshakeVersion;
             buf[1] = GenesisConfig.NetworkId;
             Buffer.BlockCopy(_nodeId, 0, buf, 2, 32);
             BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(34, 2), (ushort)_listenPort);
+            BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(HandshakeBaseLength, HandshakeCapabilitiesLength), (uint)DefaultHandshakeCapabilities);
             return buf;
+        }
+
+        private static HandshakeCapabilities ParseHandshakeCapabilities(byte[] payload)
+        {
+            if (payload == null || payload.Length < HandshakeBaseLength + HandshakeCapabilitiesLength)
+                return HandshakeCapabilities.None;
+
+            uint raw = BinaryPrimitives.ReadUInt32LittleEndian(payload.AsSpan(HandshakeBaseLength, HandshakeCapabilitiesLength));
+            return (HandshakeCapabilities)raw;
+        }
+
+        private TcpListener? TryStartListener(IPAddress bindAddress, int port, bool ipv6Only, out bool listening)
+        {
+            listening = false;
+            try
+            {
+                var listener = new TcpListener(bindAddress, port);
+                listener.Server.ExclusiveAddressUse = true;
+                if (listener.Server.AddressFamily == AddressFamily.InterNetworkV6)
+                {
+                    try { listener.Server.DualMode = !ipv6Only; } catch { }
+                    try { listener.Server.SetSocketOption(SocketOptionLevel.IPv6, SocketOptionName.IPv6Only, ipv6Only); } catch { }
+                }
+
+                listener.Start();
+                listening = true;
+                return listener;
+            }
+            catch (SocketException ex)
+            {
+                _log?.Warn("P2P", $"listener {bindAddress} failed on port {port}: {ex.SocketErrorCode}");
+                return null;
+            }
+        }
+
+        private static async Task<IReadOnlyList<IPAddress>> ResolveDialAddressesAsync(string host, CancellationToken ct)
+        {
+            if (PeerAddress.TryParseIp(host, out var literal))
+                return new[] { literal };
+
+            try
+            {
+#if NET8_0_OR_GREATER
+                var resolved = await Dns.GetHostAddressesAsync(host, ct).ConfigureAwait(false);
+#else
+                var resolved = await Dns.GetHostAddressesAsync(host).ConfigureAwait(false);
+#endif
+                return PeerAddress.OrderDialAddresses(resolved);
+            }
+            catch
+            {
+                return Array.Empty<IPAddress>();
+            }
         }
 
         private static byte[] GetOrCreateNodeId()
@@ -1833,50 +2520,20 @@ namespace Qado.Networking
                 return true;
 
             string wantedIp = NormalizeBanKey(ip);
+            return TryGetPreferredConnectedPeerSession(wantedIp, port, out var preferred)
+                ? preferred?.RemoteIsPublic
+                : null;
+        }
 
-            foreach (var kv in _sessions)
-            {
-                var s = kv.Value;
-                if (!s.HandshakeOk || !s.Client.Connected) continue;
+        public string? GetPeerDirectionText(string ip, int port)
+        {
+            if (string.IsNullOrWhiteSpace(ip)) return null;
+            if (port <= 0 || port > 65535) return null;
 
-                string sessionIp = "";
-                int sessionPort = 0;
-
-                if (!string.IsNullOrWhiteSpace(s.RemoteIpAdvertised))
-                    sessionIp = NormalizeBanKey(s.RemoteIpAdvertised!);
-
-                if (s.RemotePortAdvertised is int advPort && advPort > 0 && advPort <= 65535)
-                    sessionPort = advPort;
-
-                if (sessionIp.Length == 0 || sessionPort == 0)
-                {
-                    try
-                    {
-                        if (s.Client?.Client?.RemoteEndPoint is IPEndPoint iep)
-                        {
-                            if (sessionIp.Length == 0)
-                                sessionIp = NormalizeBanKey(iep.Address.ToString());
-                            if (sessionPort == 0)
-                                sessionPort = iep.Port;
-                        }
-                    }
-                    catch { }
-                }
-
-                if (sessionPort == 0 && TryParsePortFromEndpoint(s.RemoteEndpoint, out int parsedPort))
-                    sessionPort = parsedPort;
-
-                if (sessionIp.Length == 0)
-                    sessionIp = EndpointToBanKey(s.Client?.Client?.RemoteEndPoint);
-
-                if (sessionIp.Length == 0)
-                    sessionIp = NormalizeBanKey(s.RemoteEndpoint);
-
-                if (sessionIp == wantedIp && sessionPort == port)
-                    return s.RemoteIsPublic;
-            }
-
-            return null;
+            string wantedIp = NormalizeBanKey(ip);
+            return TryGetPreferredConnectedPeerSession(wantedIp, port, out var preferred)
+                ? (preferred!.IsInbound ? "inbound" : "outbound")
+                : null;
         }
 
         public int? GetPeerLatencyMs(string ip, int port)
@@ -1885,53 +2542,50 @@ namespace Qado.Networking
             if (port <= 0 || port > 65535) return null;
 
             string wantedIp = NormalizeBanKey(ip);
+            return TryGetPreferredConnectedPeerSession(wantedIp, port, out var preferred)
+                ? (preferred!.LastLatencyMs >= 0 ? preferred.LastLatencyMs : null)
+                : null;
+        }
 
-            foreach (var kv in _sessions)
+        private bool IsMatchingConnectedPeerSession(PeerSession? s, string wantedIp, int port)
+        {
+            if (s == null || !s.HandshakeOk || !s.Client.Connected)
+                return false;
+
+            string sessionIp = "";
+            int sessionPort = 0;
+
+            if (!string.IsNullOrWhiteSpace(s.RemoteIpAdvertised))
+                sessionIp = NormalizeBanKey(s.RemoteIpAdvertised!);
+
+            if (s.RemotePortAdvertised is int advPort && advPort > 0 && advPort <= 65535)
+                sessionPort = advPort;
+
+            if (sessionIp.Length == 0 || sessionPort == 0)
             {
-                var s = kv.Value;
-                if (s == null || !s.HandshakeOk || !s.Client.Connected)
-                    continue;
-
-                string sessionIp = "";
-                int sessionPort = 0;
-
-                if (!string.IsNullOrWhiteSpace(s.RemoteIpAdvertised))
-                    sessionIp = NormalizeBanKey(s.RemoteIpAdvertised!);
-
-                if (s.RemotePortAdvertised is int advPort && advPort > 0 && advPort <= 65535)
-                    sessionPort = advPort;
-
-                if (sessionIp.Length == 0 || sessionPort == 0)
+                try
                 {
-                    try
+                    if (s.Client?.Client?.RemoteEndPoint is IPEndPoint iep)
                     {
-                        if (s.Client?.Client?.RemoteEndPoint is IPEndPoint iep)
-                        {
-                            if (sessionIp.Length == 0)
-                                sessionIp = NormalizeBanKey(iep.Address.ToString());
-                            if (sessionPort == 0)
-                                sessionPort = iep.Port;
-                        }
+                        if (sessionIp.Length == 0)
+                            sessionIp = NormalizeBanKey(iep.Address.ToString());
+                        if (sessionPort == 0)
+                            sessionPort = iep.Port;
                     }
-                    catch { }
                 }
-
-                if (sessionPort == 0 && TryParsePortFromEndpoint(s.RemoteEndpoint, out int parsedPort))
-                    sessionPort = parsedPort;
-
-                if (sessionIp.Length == 0)
-                    sessionIp = EndpointToBanKey(s.Client?.Client?.RemoteEndPoint);
-
-                if (sessionIp.Length == 0)
-                    sessionIp = NormalizeBanKey(s.RemoteEndpoint);
-
-                if (sessionIp != wantedIp || sessionPort != port)
-                    continue;
-
-                return s.LastLatencyMs >= 0 ? s.LastLatencyMs : null;
+                catch { }
             }
 
-            return null;
+            if (sessionPort == 0 && TryParsePortFromEndpoint(s.RemoteEndpoint, out int parsedPort))
+                sessionPort = parsedPort;
+
+            if (sessionIp.Length == 0)
+                sessionIp = EndpointToBanKey(s.Client?.Client?.RemoteEndPoint);
+
+            if (sessionIp.Length == 0)
+                sessionIp = NormalizeBanKey(s.RemoteEndpoint);
+
+            return sessionIp == wantedIp && sessionPort == port;
         }
 
         private async Task ProcessValidationWorkItemAsync(ValidationWorkItem item, CancellationToken ct)
@@ -1963,7 +2617,7 @@ namespace Qado.Networking
                     continue;
                 }
 
-                if (!IsPublicRoutableIPv4Literal(ip) || SelfPeerGuard.IsSelf(ip, port))
+                if (!PeerAddress.IsPublicRoutable(ip) || SelfPeerGuard.IsSelf(ip, port))
                 {
                     _publicClaimsByPex.TryRemove(key, out _);
                     continue;
@@ -2004,7 +2658,7 @@ namespace Qado.Networking
         {
             if (Volatile.Read(ref _stopped) != 0)
                 return;
-            if (!IsPublicRoutableIPv4Literal(ip))
+            if (!PeerAddress.IsPublicRoutable(ip))
                 return;
             if (port <= 0 || port > 65535)
                 return;
@@ -2041,12 +2695,12 @@ namespace Qado.Networking
 
         private static async Task<(bool reachable, string reason)> TryTcpReachabilityProbeAsync(string ip, int port, CancellationToken ct)
         {
-            if (!IsPublicRoutableIPv4Literal(ip))
-                return (false, "non-public IPv4");
+            if (!PeerAddress.TryParseIp(ip, out var address) || !PeerAddress.IsPublicRoutable(address))
+                return (false, "non-public endpoint");
             if (port <= 0 || port > 65535)
                 return (false, "invalid port");
 
-            using var client = new TcpClient(AddressFamily.InterNetwork)
+            using var client = new TcpClient(address.AddressFamily)
             {
                 NoDelay = true,
                 ReceiveTimeout = (int)PublicClaimProbeTimeout.TotalMilliseconds,
@@ -2059,9 +2713,9 @@ namespace Qado.Networking
             try
             {
 #if NET8_0_OR_GREATER
-                await client.ConnectAsync(ip, port, timeoutCts.Token).ConfigureAwait(false);
+                await client.ConnectAsync(address, port, timeoutCts.Token).ConfigureAwait(false);
 #else
-                var connectTask = client.ConnectAsync(ip, port);
+                var connectTask = client.ConnectAsync(address.ToString(), port);
                 var done = await Task.WhenAny(connectTask, Task.Delay(PublicClaimProbeTimeout, timeoutCts.Token)).ConfigureAwait(false);
                 if (!ReferenceEquals(done, connectTask))
                     return (false, $"timeout after {(int)PublicClaimProbeTimeout.TotalSeconds}s");
@@ -2087,14 +2741,14 @@ namespace Qado.Networking
 
         public void NotePeerPublicClaim(string ip, int port)
         {
-            if (!IsPublicRoutableIPv4Literal(ip)) return;
+            if (!PeerAddress.IsPublicRoutable(ip)) return;
             if (port <= 0 || port > 65535) return;
             if (IsPeerMarkedNonPublic(ip, port)) return;
             if (TryBuildPeerEndpointKey(ip, port, out var key))
                 _publicClaimsByPex[key] = 0;
         }
 
-        public List<(string ip, int port)> GetPublicPeerCandidates(int maxPeers)
+        public List<(string ip, int port)> GetPublicPeerCandidates(int maxPeers, bool includeIpv6 = true)
         {
             if (maxPeers <= 0)
                 return new List<(string ip, int port)>();
@@ -2110,7 +2764,8 @@ namespace Qado.Networking
                 if (!s.HandshakeOk || !s.Client.Connected || !s.RemoteIsPublic) continue;
                 if (string.IsNullOrWhiteSpace(s.RemoteIpAdvertised)) continue;
                 if (s.RemotePortAdvertised is not int p || p <= 0 || p > 65535) continue;
-                if (!IsPublicRoutableIPv4Literal(s.RemoteIpAdvertised!)) continue;
+                if (!PeerAddress.IsPublicRoutable(s.RemoteIpAdvertised!)) continue;
+                if (!includeIpv6 && !IsPublicRoutableIPv4Literal(s.RemoteIpAdvertised!)) continue;
                 if (SelfPeerGuard.IsSelf(s.RemoteIpAdvertised!, p)) continue;
                 if (IsPeerMarkedNonPublic(s.RemoteIpAdvertised!, p)) continue;
 
@@ -2122,17 +2777,35 @@ namespace Qado.Networking
             return list;
         }
 
-        public List<(string ip, int port)> GetPeerCandidatesForPex(int maxPeers, int unverifiedPercent = 20)
+        public List<(string ip, int port)> GetPeerCandidatesForPex(int maxPeers, int unverifiedPercent = 20, bool includeIpv6 = true)
         {
             if (maxPeers <= 0)
                 return new List<(string ip, int port)>();
-            _ = unverifiedPercent;
-            return GetPublicPeerCandidates(maxPeers);
+
+            int percent = Math.Clamp(unverifiedPercent, 0, 100);
+            int unverifiedBudget = percent == 0
+                ? 0
+                : Math.Min(maxPeers, Math.Max(1, (maxPeers * percent + 99) / 100));
+            int verifiedTarget = Math.Max(0, maxPeers - unverifiedBudget);
+
+            var verified = new List<(string ip, int port)>(maxPeers);
+            var unverified = new List<(string ip, int port)>(maxPeers);
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+
+            AppendConnectedPublicCandidates(verified, seen, maxPeers, includeIpv6);
+            AppendStoredPexCandidates(verified, unverified, seen, maxPeers, includeIpv6);
+
+            var selected = new List<(string ip, int port)>(maxPeers);
+            int verifiedAdded = AddCandidates(selected, verified, startIndex: 0, maxToAdd: verifiedTarget);
+            int unverifiedAdded = AddCandidates(selected, unverified, startIndex: 0, maxToAdd: maxPeers - selected.Count);
+            AddCandidates(selected, verified, startIndex: verifiedAdded, maxToAdd: maxPeers - selected.Count);
+            AddCandidates(selected, unverified, startIndex: unverifiedAdded, maxToAdd: maxPeers - selected.Count);
+            return selected;
         }
 
         private void MarkPeerAsPublic(string ip, int port)
         {
-            if (!IsPublicRoutableIPv4Literal(ip)) return;
+            if (!PeerAddress.IsPublicRoutable(ip)) return;
             if (port <= 0 || port > 65535) return;
             if (!TryBuildPeerEndpointKey(ip, port, out var key)) return;
 
@@ -2152,7 +2825,7 @@ namespace Qado.Networking
 
         private void MarkPeerAsNonPublic(string ip, int port)
         {
-            if (!IsPublicRoutableIPv4Literal(ip)) return;
+            if (!PeerAddress.IsPublicRoutable(ip)) return;
             if (port <= 0 || port > 65535) return;
             if (!TryBuildPeerEndpointKey(ip, port, out var key)) return;
 
@@ -2187,37 +2860,100 @@ namespace Qado.Networking
             return _nonPublicPeerEndpoints.ContainsKey(key);
         }
 
-        private static bool TryBuildPeerEndpointKey(string ip, int port, out string key)
+        private void AppendConnectedPublicCandidates(
+            List<(string ip, int port)> target,
+            HashSet<string> seen,
+            int maxPeers,
+            bool includeIpv6)
         {
-            key = string.Empty;
-            if (string.IsNullOrWhiteSpace(ip)) return false;
-            if (port <= 0 || port > 65535) return false;
+            foreach (var kv in _sessions)
+            {
+                if (target.Count >= maxPeers)
+                    break;
 
-            string host = NormalizeBanKey(ip);
-            if (host.StartsWith("::ffff:", StringComparison.Ordinal))
-                host = host[7..];
+                var s = kv.Value;
+                if (!s.HandshakeOk || !s.Client.Connected || !s.RemoteIsPublic)
+                    continue;
+                if (string.IsNullOrWhiteSpace(s.RemoteIpAdvertised))
+                    continue;
+                if (s.RemotePortAdvertised is not int p || p <= 0 || p > 65535)
+                    continue;
 
-            if (!IPAddress.TryParse(host, out var addr)) return false;
-            if (addr.AddressFamily != AddressFamily.InterNetwork) return false;
+                TryAddPexCandidate(target, seen, s.RemoteIpAdvertised!, p, includeIpv6);
+            }
+        }
 
-            key = $"{addr}:{port}";
+        private void AppendStoredPexCandidates(
+            List<(string ip, int port)> verified,
+            List<(string ip, int port)> unverified,
+            HashSet<string> seen,
+            int maxPeers,
+            bool includeIpv6)
+        {
+            int storeLimit = Math.Min(256, Math.Max(maxPeers * 4, maxPeers));
+            foreach (var (ip, port, _) in PeerStore.GetRecentPeers(storeLimit))
+            {
+                if ((verified.Count + unverified.Count) >= maxPeers * 2)
+                    break;
+                if (IsPeerMarkedNonPublic(ip, port))
+                    continue;
+
+                bool isVerified = IsPeerMarkedPublic(ip, port);
+                var target = isVerified ? verified : unverified;
+                TryAddPexCandidate(target, seen, ip, port, includeIpv6);
+            }
+        }
+
+        private bool TryAddPexCandidate(
+            List<(string ip, int port)> target,
+            HashSet<string> seen,
+            string ip,
+            int port,
+            bool includeIpv6)
+        {
+            if (string.IsNullOrWhiteSpace(ip))
+                return false;
+            if (port <= 0 || port > 65535)
+                return false;
+            if (!PeerAddress.IsPublicRoutable(ip))
+                return false;
+            if (!includeIpv6 && !IsPublicRoutableIPv4Literal(ip))
+                return false;
+            if (SelfPeerGuard.IsSelf(ip, port))
+                return false;
+            if (!TryBuildPeerEndpointKey(ip, port, out var key))
+                return false;
+            if (!seen.Add(key))
+                return false;
+
+            target.Add((ip, port));
             return true;
         }
 
-        private static bool TryParsePeerEndpointKey(string key, out string ip, out int port)
+        private static int AddCandidates(
+            List<(string ip, int port)> target,
+            List<(string ip, int port)> source,
+            int startIndex,
+            int maxToAdd)
         {
-            ip = string.Empty;
-            port = 0;
-            if (string.IsNullOrWhiteSpace(key)) return false;
+            if (maxToAdd <= 0 || source.Count == 0)
+                return 0;
 
-            int idx = key.LastIndexOf(':');
-            if (idx <= 0 || idx >= key.Length - 1) return false;
-            if (!int.TryParse(key[(idx + 1)..], out port)) return false;
-            if (port <= 0 || port > 65535) return false;
+            int added = 0;
+            for (int i = Math.Max(0, startIndex); i < source.Count && maxToAdd > 0; i++, maxToAdd--)
+            {
+                target.Add(source[i]);
+                added++;
+            }
 
-            ip = key[..idx];
-            return !string.IsNullOrWhiteSpace(ip);
+            return added;
         }
+
+        private static bool TryBuildPeerEndpointKey(string ip, int port, out string key)
+            => PeerAddress.TryBuildEndpointKey(ip, port, out key);
+
+        private static bool TryParsePeerEndpointKey(string key, out string ip, out int port)
+            => PeerAddress.TryParseEndpointKey(key, out ip, out port);
 
         private bool HasAnyHandshakePeerConnected()
         {
@@ -2251,14 +2987,8 @@ namespace Qado.Networking
 
             try
             {
-                string normalized = NormalizeBanKey(hostOrIp);
-                if (normalized.StartsWith("::ffff:", StringComparison.Ordinal))
-                    normalized = normalized[7..];
-
-                if (!IPAddress.TryParse(normalized, out var addr)) return;
-                if (addr.AddressFamily != AddressFamily.InterNetwork) return;
-
-                string ip = addr.ToString();
+                if (!PeerAddress.TryParseIp(hostOrIp, out var addr)) return;
+                string ip = PeerAddress.NormalizeHost(addr.ToString());
                 if (SelfPeerGuard.IsSelf(ip, port)) return;
 
                 PeerStore.AnnouncePeer(ip, port, GenesisConfig.NetworkId);
@@ -2869,6 +3599,21 @@ namespace Qado.Networking
             return true;
         }
 
+        private static int CompareNodeIds(byte[] left, byte[] right)
+        {
+            if (left is not { Length: 32 } || right is not { Length: 32 })
+                return 0;
+
+            for (int i = 0; i < 32; i++)
+            {
+                int diff = left[i].CompareTo(right[i]);
+                if (diff != 0)
+                    return diff;
+            }
+
+            return 0;
+        }
+
         private static string Hex16(byte[] h)
         {
             var s = Convert.ToHexString(h).ToLowerInvariant();
@@ -2897,16 +3642,7 @@ namespace Qado.Networking
         private static bool TryParsePortFromEndpoint(string endpoint, out int port)
         {
             port = 0;
-            if (string.IsNullOrWhiteSpace(endpoint)) return false;
-
-            int idx = endpoint.LastIndexOf(':');
-            if (idx <= 0 || idx >= endpoint.Length - 1) return false;
-
-            if (!int.TryParse(endpoint[(idx + 1)..], out int p)) return false;
-            if (p <= 0 || p > 65535) return false;
-
-            port = p;
-            return true;
+            return PeerAddress.TrySplitHostPort(endpoint, out _, out port);
         }
 
         private bool IsPeerSessionPresent(string ipOrHost, int port)
@@ -2962,26 +3698,7 @@ namespace Qado.Networking
         }
 
         private static bool IsPublicRoutableIPv4Literal(string ip)
-        {
-            if (string.IsNullOrWhiteSpace(ip)) return false;
-            if (!IPAddress.TryParse(ip, out var a)) return false;
-            if (a.AddressFamily != AddressFamily.InterNetwork) return false;
-
-            var b = a.GetAddressBytes();
-            if (b.Length != 4) return false;
-
-            if (b[0] == 0) return false;
-            if (b[0] == 10) return false;
-            if (b[0] == 100 && b[1] >= 64 && b[1] <= 127) return false;
-            if (b[0] == 127) return false;
-            if (b[0] == 169 && b[1] == 254) return false;
-            if (b[0] == 172 && b[1] >= 16 && b[1] <= 31) return false;
-            if (b[0] == 192 && b[1] == 168) return false;
-            if (b[0] == 198 && (b[1] == 18 || b[1] == 19)) return false;
-            if (b[0] >= 224) return false;
-
-            return true;
-        }
+            => PeerAddress.IsPublicRoutableIPv4(ip);
 
         private static bool IsExpectedSessionTermination(Exception ex)
         {
@@ -3015,7 +3732,12 @@ namespace Qado.Networking
         }
 
         private static string NormalizeBanKey(string raw)
-            => (raw ?? string.Empty).Trim().ToLowerInvariant();
+        {
+            string normalized = PeerAddress.NormalizeHost(raw);
+            return normalized.Length > 0
+                ? normalized
+                : (raw ?? string.Empty).Trim().ToLowerInvariant();
+        }
     }
 }
 

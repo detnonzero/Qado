@@ -85,15 +85,25 @@ namespace Qado.Networking
             CancellationToken ct)
         {
             ulong tipHeight = BlockStore.GetLatestHeight();
+            bool useBatchData = peer.Supports(HandshakeCapabilities.BlocksBatchData);
+            bool useExtendedWindow = useBatchData && peer.Supports(HandshakeCapabilities.ExtendedSyncWindow);
+            bool usePreview = useBatchData && peer.Supports(HandshakeCapabilities.SyncWindowPreview);
+            int maxWindowBlocks = useExtendedWindow
+                ? BlockSyncProtocol.ExtendedSyncWindowBlocks
+                : BlockSyncProtocol.BatchMaxBlocks;
             int totalBlocks = 0;
             if (tipHeight > forkHeight)
             {
                 ulong available = tipHeight - forkHeight;
-                totalBlocks = (int)Math.Min(available, (ulong)Math.Min(maxBlocks, BlockSyncProtocol.BatchMaxBlocks));
+                totalBlocks = (int)Math.Min(available, (ulong)Math.Min(maxBlocks, maxWindowBlocks));
             }
 
             ulong startHeight = forkHeight + 1UL;
             Guid batchId = Guid.NewGuid();
+            ulong previewLastHeight = forkHeight + (ulong)totalBlocks;
+            byte[] previewLastHash = totalBlocks > 0
+                ? BlockStore.GetCanonicalHashAtHeight(previewLastHeight) ?? forkHash
+                : forkHash;
             await sendFrameAsync(
                 peer,
                 MsgType.BlocksBatchStart,
@@ -103,18 +113,22 @@ namespace Qado.Networking
                     forkHeight,
                     totalBlocks,
                     BlockStore.GetCanonicalHashAtHeight(tipHeight) ?? new byte[32],
-                    TryGetTipChainwork(tipHeight))),
+                    TryGetTipChainwork(tipHeight),
+                    usePreview ? previewLastHash : null,
+                    usePreview ? previewLastHeight : 0UL)),
                 ct).ConfigureAwait(false);
 
             int sentBlocks = 0;
             ulong currentHeight = startHeight;
             while (sentBlocks < totalBlocks)
             {
-                int chunkTake = Math.Min(BlockSyncProtocol.ChunkBlocks, totalBlocks - sentBlocks);
-                var chunk = new List<byte[]>(chunkTake);
+                int take = Math.Min(
+                    useBatchData ? BlockSyncProtocol.BatchMaxBlocks : BlockSyncProtocol.LegacyChunkBlocks,
+                    totalBlocks - sentBlocks);
+                var payloads = new List<byte[]>(take);
                 ulong firstHeight = currentHeight;
 
-                for (int i = 0; i < chunkTake; i++)
+                for (int i = 0; i < take; i++)
                 {
                     if (!BlockStore.TryGetSerializedCanonicalBlockAtHeight(currentHeight, out var blockBlob))
                     {
@@ -132,17 +146,19 @@ namespace Qado.Networking
                         return;
                     }
 
-                    chunk.Add(blockBlob);
+                    payloads.Add(blockBlob);
                     currentHeight++;
                 }
 
                 await sendFrameAsync(
                     peer,
-                    MsgType.BlocksChunk,
-                    SmallNetSyncProtocol.BuildBlocksChunk(firstHeight, chunk),
+                    useBatchData ? MsgType.BlocksBatchData : MsgType.BlocksChunk,
+                    useBatchData
+                        ? SmallNetSyncProtocol.BuildBlocksBatchData(firstHeight, payloads)
+                        : SmallNetSyncProtocol.BuildBlocksChunk(firstHeight, payloads),
                     ct).ConfigureAwait(false);
 
-                sentBlocks += chunk.Count;
+                sentBlocks += payloads.Count;
             }
 
             var status = (forkHeight + (ulong)totalBlocks) >= tipHeight

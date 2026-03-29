@@ -55,7 +55,7 @@ namespace Qado.Storage
             SqliteTransaction? tx = null)
         {
             if (string.IsNullOrWhiteSpace(ip) || port <= 0) return;
-            if (!IsPublicRoutableIPv4Literal(ip)) return;
+            if (!PeerAddress.IsPublicRoutable(ip)) return;
             if (SelfPeerGuard.IsSelf(ip, port)) return;
 
             string ipNorm = NormalizeHost(ip);
@@ -147,7 +147,7 @@ namespace Qado.Storage
         public static bool AnnouncePeer(string ip, int port, byte networkId, SqliteTransaction? tx = null)
         {
             if (string.IsNullOrWhiteSpace(ip) || port <= 0) return false;
-            if (!IsPublicRoutableIPv4Literal(ip)) return false;
+            if (!PeerAddress.IsPublicRoutable(ip)) return false;
             if (SelfPeerGuard.IsSelf(ip, port)) return false;
 
             string ipNorm = NormalizeHost(ip);
@@ -528,7 +528,7 @@ ON CONFLICT(id) DO UPDATE SET announced_at = excluded.announced_at;";
                 {
                     byte[] id = (byte[])r[0];
                     string ip = r.GetString(1);
-                    if (!IsPublicRoutableIPv4Literal(ip))
+                    if (!PeerAddress.IsPublicRoutable(ip))
                         deleteIds.Add(id);
                 }
             }
@@ -595,34 +595,7 @@ ON CONFLICT(id) DO UPDATE SET announced_at = excluded.announced_at;";
         }
 
         private static string NormalizeHost(string value)
-        {
-            if (string.IsNullOrWhiteSpace(value)) return string.Empty;
-
-            string s = value.Trim().ToLowerInvariant();
-
-            if (s.StartsWith("[", StringComparison.Ordinal))
-            {
-                int close = s.IndexOf(']');
-                if (close > 1)
-                    s = s.Substring(1, close - 1);
-            }
-            else
-            {
-                int firstColon = s.IndexOf(':');
-                int lastColon = s.LastIndexOf(':');
-                if (firstColon > 0 && firstColon == lastColon)
-                {
-                    string tail = s[(firstColon + 1)..];
-                    if (int.TryParse(tail, out _))
-                        s = s[..firstColon];
-                }
-            }
-
-            if (s.StartsWith("::ffff:", StringComparison.Ordinal))
-                s = s[7..];
-
-            return s;
-        }
+            => PeerAddress.NormalizeHost(value);
 
         private static void RaisePeerListChanged()
         {

@@ -13,6 +13,13 @@ namespace Qado.Blockchain
 {
     public static class ChainSelector
     {
+        private enum TipExtensionProbeResult
+        {
+            NotApplicable,
+            Ready,
+            Failed
+        }
+
         private const int MaxReorgRequeueGossipPerAdoption = 512;
         private const int ReorgRequeueGossipBurstSize = 16;
         private static readonly TimeSpan ReorgRequeueGossipPause = TimeSpan.FromMilliseconds(20);
@@ -29,6 +36,10 @@ namespace Qado.Blockchain
         private static readonly object MissingPayloadRecoveryGate = new();
         private static DateTime _nextMissingPayloadRecoveryAllowedUtc = DateTime.MinValue;
         private static readonly TimeSpan MissingPayloadRecoveryCooldown = TimeSpan.FromSeconds(15);
+        private static readonly object TipExtensionAdoptionLogGate = new();
+        private static DateTime _lastTipExtensionAdoptionLogUtc = DateTime.MinValue;
+        private static int _tipExtensionAdoptionLogSuppressed;
+        private static readonly TimeSpan TipExtensionAdoptionLogWindow = TimeSpan.FromMilliseconds(750);
 
         private sealed class MissingCandidateState
         {
@@ -50,6 +61,12 @@ namespace Qado.Blockchain
                 lock (MissingPayloadRecoveryGate)
                     _nextMissingPayloadRecoveryAllowedUtc = DateTime.MinValue;
 
+                lock (TipExtensionAdoptionLogGate)
+                {
+                    _lastTipExtensionAdoptionLogUtc = DateTime.MinValue;
+                    _tipExtensionAdoptionLogSuppressed = 0;
+                }
+
                 ReorgRequeueGossipSeen.Clear();
             }
             catch
@@ -58,6 +75,20 @@ namespace Qado.Blockchain
         }
 
         public static void MaybeAdoptNewTip(byte[] candidateTipHash, ILogSink? log = null, MempoolManager? mempool = null)
+            => MaybeAdoptNewTipCore(candidateTipHash, null, log, mempool);
+
+        public static void MaybeAdoptNewTip(
+            byte[] candidateTipHash,
+            IReadOnlyList<Block> prefetchedTipExtensionBlocks,
+            ILogSink? log = null,
+            MempoolManager? mempool = null)
+            => MaybeAdoptNewTipCore(candidateTipHash, prefetchedTipExtensionBlocks, log, mempool);
+
+        private static void MaybeAdoptNewTipCore(
+            byte[] candidateTipHash,
+            IReadOnlyList<Block>? prefetchedTipExtensionBlocks,
+            ILogSink? log = null,
+            MempoolManager? mempool = null)
         {
             if (candidateTipHash is not { Length: 32 })
                 return;
@@ -90,6 +121,54 @@ namespace Qado.Blockchain
 
             if (currentWork != 0 && candidateWork <= currentWork)
                 return;
+
+            var tipExtensionProbe = TryBuildTipExtensionMapping(
+                candidateTipHash,
+                canonTipHeight,
+                canonTipHash,
+                out var tipExtensionHeight,
+                out var tipExtensionAsc,
+                log);
+
+            if (tipExtensionProbe == TipExtensionProbeResult.Failed)
+                return;
+
+            if (tipExtensionProbe == TipExtensionProbeResult.Ready)
+            {
+                if (TryAdoptTipExtensionFastPath(
+                    candidateTipHash,
+                    canonTipHeight,
+                    canonTipHash,
+                    tipExtensionHeight,
+                    tipExtensionAsc,
+                    prefetchedTipExtensionBlocks,
+                    log,
+                    mempool))
+                {
+                    return;
+                }
+
+                canonTipHeight = BlockStore.GetLatestHeight();
+                canonTipHash = BlockStore.GetCanonicalHashAtHeight(canonTipHeight);
+
+                if (canonTipHash is not { Length: 32 })
+                    return;
+
+                if (BytesEqual32(canonTipHash, candidateTipHash))
+                    return;
+
+                currentWork = BlockIndexStore.GetChainwork(canonTipHash);
+                candidateWork = BlockIndexStore.GetChainwork(candidateTipHash);
+
+                if (candidateWork == 0)
+                {
+                    log?.Warn("ChainSel", "Candidate has no chainwork (0). Skipping adoption until chainwork is available.");
+                    return;
+                }
+
+                if (currentWork != 0 && candidateWork <= currentWork)
+                    return;
+            }
 
             if (!TryBuildCandidateHeightMap(candidateTipHash, out var candTipHeight, out var candByHeight, log))
             {
@@ -211,6 +290,297 @@ namespace Qado.Blockchain
             {
                 log?.Warn("ChainSel", $"Unhandled adoption error: {ex.Message}");
             }
+        }
+
+        private static TipExtensionProbeResult TryBuildTipExtensionMapping(
+            byte[] candidateTipHash,
+            ulong canonTipHeight,
+            byte[] canonTipHash,
+            out ulong candidateTipHeight,
+            out List<(ulong Height, byte[] Hash)> newCanonAsc,
+            ILogSink? log)
+        {
+            candidateTipHeight = 0;
+            newCanonAsc = new List<(ulong Height, byte[] Hash)>();
+
+            var curHash = candidateTipHash;
+            int guard = 0;
+
+            while (curHash is { Length: 32 })
+            {
+                if (BlockIndexStore.IsBadOrHasBadAncestor(curHash))
+                {
+                    log?.Warn("ChainSel", $"Candidate chain contains state-invalid block {ToHex(curHash, 16)}.");
+                    return TipExtensionProbeResult.Failed;
+                }
+
+                if (!BlockIndexStore.TryGetMeta(curHash, out var h, out var prevHash, out _))
+                {
+                    log?.Warn("ChainSel", $"Missing block_index row for hash {ToHex(curHash, 16)} while probing tip extension.");
+                    return TipExtensionProbeResult.Failed;
+                }
+
+                if (guard == 0)
+                    candidateTipHeight = h;
+
+                if (h <= canonTipHeight)
+                {
+                    if (h == canonTipHeight && BytesEqual32(curHash, canonTipHash))
+                    {
+                        newCanonAsc.Reverse();
+                        return newCanonAsc.Count > 0
+                            ? TipExtensionProbeResult.Ready
+                            : TipExtensionProbeResult.NotApplicable;
+                    }
+
+                    return TipExtensionProbeResult.NotApplicable;
+                }
+
+                newCanonAsc.Add((h, (byte[])curHash.Clone()));
+
+                if (prevHash is not { Length: 32 })
+                {
+                    log?.Warn("ChainSel", $"Invalid prevHash length while probing tip extension at height {h}.");
+                    return TipExtensionProbeResult.Failed;
+                }
+
+                if (h == canonTipHeight + 1UL)
+                {
+                    if (BytesEqual32(prevHash, canonTipHash))
+                    {
+                        newCanonAsc.Reverse();
+                        return TipExtensionProbeResult.Ready;
+                    }
+
+                    return TipExtensionProbeResult.NotApplicable;
+                }
+
+                if (IsZero32(prevHash))
+                {
+                    log?.Warn("ChainSel", $"Non-genesis block at height {h} has zero prevHash while probing tip extension.");
+                    return TipExtensionProbeResult.Failed;
+                }
+
+                curHash = prevHash;
+
+                guard++;
+                if (guard > 5_000_000)
+                {
+                    log?.Error("ChainSel", "Tip-extension probe exceeded guard limit (possible loop/corruption).");
+                    return TipExtensionProbeResult.Failed;
+                }
+            }
+
+            return TipExtensionProbeResult.NotApplicable;
+        }
+
+        private static bool TryAdoptTipExtensionFastPath(
+            byte[] candidateTipHash,
+            ulong canonTipHeight,
+            byte[] canonTipHash,
+            ulong candTipHeight,
+            List<(ulong Height, byte[] Hash)> newCanonAsc,
+            IReadOnlyList<Block>? prefetchedTipExtensionBlocks,
+            ILogSink? log,
+            MempoolManager? mempool)
+        {
+            if (newCanonAsc == null || newCanonAsc.Count == 0)
+                return false;
+
+            if (IsMissingCandidateBlocked_NoThrow(newCanonAsc, out _, out _, out _))
+                return true;
+
+            List<Block> newBlocksAsc = new();
+            byte[]? stateFailedBlockHash = null;
+            string? adoptionError = null;
+            bool staleCanonSnapshot = false;
+
+            lock (Db.Sync)
+            {
+                if (!TryResolveTipExtensionBlocks(newCanonAsc, prefetchedTipExtensionBlocks, out newBlocksAsc, log))
+                {
+                    log?.Warn("ChainSel", "Failed to resolve candidate tip-extension blocks; skipping adoption.");
+                    return true;
+                }
+
+                try
+                {
+                    using var tx = Db.Connection.BeginTransaction();
+
+                    ulong currentCanonTipHeight = BlockStore.GetLatestHeight(tx);
+                    var currentCanonTipHash = BlockStore.GetCanonicalHashAtHeight(currentCanonTipHeight, tx);
+                    if (currentCanonTipHeight != canonTipHeight ||
+                        currentCanonTipHash is not { Length: 32 } ||
+                        !BytesEqual32(currentCanonTipHash, canonTipHash))
+                    {
+                        staleCanonSnapshot = true;
+                    }
+                    else
+                    {
+                        for (int i = 0; i < newCanonAsc.Count; i++)
+                        {
+                            BlockStore.SetCanonicalHashAtHeight(newCanonAsc[i].Height, newCanonAsc[i].Hash, tx);
+                            BlockIndexStore.SetStatus(newCanonAsc[i].Hash, BlockIndexStore.StatusCanonicalStateValidated, tx);
+                        }
+
+                        for (int i = 0; i < newBlocksAsc.Count; i++)
+                        {
+                            try
+                            {
+                                StateApplier.ApplyBlockWithUndo(newBlocksAsc[i], tx);
+                            }
+                            catch (Exception ex)
+                            {
+                                stateFailedBlockHash = newBlocksAsc[i].BlockHash;
+                                throw new InvalidOperationException(
+                                    $"State apply failed at height {newBlocksAsc[i].BlockHeight}: {ex.Message}",
+                                    ex);
+                            }
+                        }
+
+                        tx.Commit();
+                        LogTipExtensionAdopted(log, candidateTipHash, candTipHeight, newCanonAsc[0].Height);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    adoptionError = ex.Message;
+                }
+            }
+
+            if (staleCanonSnapshot)
+                return false;
+
+            if (!string.IsNullOrWhiteSpace(adoptionError))
+            {
+                if (stateFailedBlockHash is { Length: 32 })
+                    MarkStateInvalid_NoThrow(stateFailedBlockHash, log);
+
+                log?.Error("ChainSel", $"Atomic adoption failed: {adoptionError}");
+                TryNotifyUiReload();
+                return true;
+            }
+
+            if (mempool != null)
+            {
+                try
+                {
+                    var recon = mempool.ReconcileAfterReorg(Array.Empty<Block>(), newBlocksAsc);
+                    if (recon.RequeuedTransactions is { Count: > 0 })
+                        TriggerReorgRequeueGossip(recon.RequeuedTransactions, log);
+                }
+                catch (Exception ex)
+                {
+                    log?.Warn("ChainSel", $"Mempool reconcile after reorg failed: {ex.Message}");
+                }
+            }
+
+            TryNotifyUiReload();
+            return true;
+        }
+
+        private static void LogTipExtensionAdopted(ILogSink? log, byte[] candidateTipHash, ulong candTipHeight, ulong fromHeight)
+        {
+            if (log == null)
+                return;
+
+            bool shouldLog = false;
+            int suppressed = 0;
+            var now = DateTime.UtcNow;
+
+            lock (TipExtensionAdoptionLogGate)
+            {
+                if ((now - _lastTipExtensionAdoptionLogUtc) >= TipExtensionAdoptionLogWindow)
+                {
+                    shouldLog = true;
+                    suppressed = _tipExtensionAdoptionLogSuppressed;
+                    _tipExtensionAdoptionLogSuppressed = 0;
+                    _lastTipExtensionAdoptionLogUtc = now;
+                }
+                else
+                {
+                    _tipExtensionAdoptionLogSuppressed++;
+                }
+            }
+
+            if (!shouldLog)
+                return;
+
+            string suffix = suppressed > 0
+                ? $", suppressed={suppressed}"
+                : string.Empty;
+
+            log.Info("ChainSel", $"Adopted tip {ToHex(candidateTipHash, 16)} @ height {candTipHeight} (fromHeight={fromHeight}{suffix}).");
+        }
+
+        private static bool TryResolveTipExtensionBlocks(
+            List<(ulong Height, byte[] Hash)> mappingAsc,
+            IReadOnlyList<Block>? prefetchedTipExtensionBlocks,
+            out List<Block> blocksAsc,
+            ILogSink? log)
+        {
+            blocksAsc = new List<Block>(mappingAsc.Count);
+
+            if (TryUsePrefetchedTipExtensionBlocks(mappingAsc, prefetchedTipExtensionBlocks, out blocksAsc, log))
+                return true;
+
+            if (!TryPrefetchBlocksAscending(mappingAsc, out blocksAsc, log))
+            {
+                RememberPrefetchFailure_NoThrow();
+                return false;
+            }
+
+            return true;
+        }
+
+        private static bool TryUsePrefetchedTipExtensionBlocks(
+            List<(ulong Height, byte[] Hash)> mappingAsc,
+            IReadOnlyList<Block>? prefetchedTipExtensionBlocks,
+            out List<Block> blocksAsc,
+            ILogSink? log)
+        {
+            blocksAsc = new List<Block>();
+
+            if (prefetchedTipExtensionBlocks == null || prefetchedTipExtensionBlocks.Count == 0)
+                return false;
+
+            if (prefetchedTipExtensionBlocks.Count != mappingAsc.Count)
+            {
+                log?.Info("ChainSel", $"Tip-extension fast path ignored prefetched blocks due to count mismatch (prefetched={prefetchedTipExtensionBlocks.Count}, expected={mappingAsc.Count}).");
+                return false;
+            }
+
+            blocksAsc = new List<Block>(prefetchedTipExtensionBlocks.Count);
+            Block? previous = null;
+
+            for (int i = 0; i < mappingAsc.Count; i++)
+            {
+                var block = prefetchedTipExtensionBlocks[i];
+                if (block == null || block.Header?.PreviousBlockHash is not { Length: 32 })
+                    return false;
+
+                var (height, hash) = mappingAsc[i];
+                block.BlockHeight = height;
+                if (block.BlockHash is not { Length: 32 } || IsZero32(block.BlockHash))
+                    block.BlockHash = block.ComputeBlockHash();
+
+                if (!BytesEqual32(block.BlockHash!, hash))
+                {
+                    log?.Info("ChainSel", $"Tip-extension fast path ignored prefetched block at height {height} due to hash mismatch.");
+                    return false;
+                }
+
+                if (previous != null && !BytesEqual32(block.Header.PreviousBlockHash, previous.BlockHash!))
+                {
+                    log?.Info("ChainSel", $"Tip-extension fast path ignored prefetched block at height {height} due to linkage mismatch.");
+                    return false;
+                }
+
+                blocksAsc.Add(block);
+                previous = block;
+            }
+
+            return true;
         }
 
 
