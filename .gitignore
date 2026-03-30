@@ -372,3 +372,4 @@ Qado.Avalonia/
 selftest*.log
 selftest*.out
 selftest*.err
+docs/P2P_STACK_REDESIGN.md

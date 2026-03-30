@@ -15,7 +15,7 @@ All notable changes to this project are documented in this file.
 - A headless `Qado.NodeHost` runner plus testing docs for operating relay/sync nodes without the GUI.
 
 ### Changed
-- The P2P/sync architecture was redesigned toward a bitcoin-style small-network model while preserving compatibility with older live nodes:
+- The P2P/sync architecture was redesigned toward a convergence-focused small-network model while preserving compatibility with older live nodes:
   - fresh blocks are still propagated as full `Block` payloads
   - fresh transactions are still propagated as full `Tx` payloads
   - historical catch-up now uses request/response windows via `GetBlocksByLocator` / `GetBlocksFrom`
