@@ -100,6 +100,37 @@ namespace Qado.Mining
             _globalWorkSize[0] = (IntPtr)HashBatchSize;
         }
 
+        public OpenClMiner(
+            OpenClMiningDevice device,
+            string minerPublicKeyHex,
+            Func<List<Transaction>> getReadyTransactions,
+            Func<Block, Task> onBlockMinedAsync,
+            Action<Block> onBlockAccepted,
+            Action? onTemplateStarted,
+            Action<long> onHashesCompleted,
+            ILogSink? log,
+            bool treatKeyAsPublic)
+        {
+            _device = device ?? throw new ArgumentNullException(nameof(device));
+            _getReadyTransactions = getReadyTransactions ?? throw new ArgumentNullException(nameof(getReadyTransactions));
+            _onBlockMinedAsync = onBlockMinedAsync ?? throw new ArgumentNullException(nameof(onBlockMinedAsync));
+            _onBlockAccepted = onBlockAccepted ?? throw new ArgumentNullException(nameof(onBlockAccepted));
+            _onTemplateStarted = onTemplateStarted;
+            _onHashesCompleted = onHashesCompleted ?? throw new ArgumentNullException(nameof(onHashesCompleted));
+            _log = log;
+
+            var profile = ResolveTuningProfile(device);
+            _tuningProfileName = profile.ProfileName;
+            _preferredLocalWorkSizes = profile.PreferredLocalWorkSizes;
+            _buildOptions = profile.BuildOptions;
+
+            if (!treatKeyAsPublic)
+                throw new ArgumentException("Use the private-key constructor for private keys.", nameof(treatKeyAsPublic));
+
+            _minerPublicKey = ParseMinerPublicKeyHex(minerPublicKeyHex);
+            _globalWorkSize[0] = (IntPtr)HashBatchSize;
+        }
+
         public ulong CurrentNonce { get; private set; }
 
         public Task StartMiningAsync(CancellationToken token)
@@ -270,6 +301,22 @@ namespace Qado.Mining
             }
 
             return false;
+        }
+
+        private static byte[] ParseMinerPublicKeyHex(string minerPublicKeyHex)
+        {
+            if (string.IsNullOrWhiteSpace(minerPublicKeyHex))
+                throw new ArgumentException("minerPublicKeyHex required", nameof(minerPublicKeyHex));
+
+            string normalized = minerPublicKeyHex.Trim();
+            if (normalized.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                normalized = normalized[2..];
+
+            byte[] bytes = Convert.FromHexString(normalized);
+            if (bytes.Length != 32)
+                throw new ArgumentException("minerPublicKeyHex must be 32 bytes", nameof(minerPublicKeyHex));
+
+            return bytes;
         }
 
         private bool TryMineBatch(ulong nonceBase, out ulong foundNonce, out byte[] foundHash)

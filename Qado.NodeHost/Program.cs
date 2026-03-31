@@ -1,8 +1,10 @@
 using System.Globalization;
+using Microsoft.Data.Sqlite;
 using Qado.Api;
 using Qado.Blockchain;
 using Qado.Logging;
 using Qado.Mempool;
+using Qado.Mining;
 using Qado.Networking;
 using Qado.Storage;
 
@@ -46,6 +48,8 @@ internal static class Program
 
         P2PNode? node = null;
         ExchangeApiHost? apiHost = null;
+        OpenClMiner? openClMiner = null;
+        Task? miningTask = null;
 
         try
         {
@@ -90,16 +94,62 @@ internal static class Program
                 await apiHost.StartAsync(apiPort, shutdownCts.Token).ConfigureAwait(false);
             }
 
+            if (options.MineOpenCl)
+            {
+                if (string.IsNullOrWhiteSpace(options.MinerPublicKey))
+                    throw new InvalidOperationException("OpenCL mining requires --miner-public-key <hex32>.");
+
+                string minerPublicKey = NormalizeHex32(options.MinerPublicKey, "--miner-public-key");
+                var device = ResolveOpenClDevice(options.OpenClDeviceSelector, log);
+                if (device == null)
+                    throw new InvalidOperationException("No suitable OpenCL GPU device was found.");
+
+                var buffer = mempool.GetBuffer();
+                openClMiner = new OpenClMiner(
+                    device,
+                    minerPublicKey,
+                    () => buffer.GetAllReadyTransactionsSortedByFee(),
+                    block => OnBlockMinedAsync(block, node, mempool, log),
+                    _ => { },
+                    () => { },
+                    _ => { },
+                    log,
+                    true);
+
+                miningTask = openClMiner.StartMiningAsync(shutdownCts.Token);
+                log.Info(
+                    "NodeHost",
+                    $"Headless OpenCL mining enabled. device={device.DisplayName} miner={ShortHex(minerPublicKey)}");
+            }
+
             log.Info(
                 "NodeHost",
                 $"Running label={options.Label} dataDir={dataDir} p2p={options.P2pPort}" +
                 $"{(options.ApiPort is int activeApiPort ? $" api={activeApiPort}" : " api=disabled")}" +
                 $"{(options.NoDefaultSeed ? " defaultSeed=off" : " defaultSeed=on")}" +
+                $"{(options.MineOpenCl ? " mining=opencl" : " mining=off")}" +
                 $" bootstrapPeers={options.BootstrapPeers.Count}");
 
             try
             {
-                await Task.Delay(Timeout.InfiniteTimeSpan, shutdownCts.Token).ConfigureAwait(false);
+                var lifetimeTask = Task.Delay(Timeout.InfiniteTimeSpan, shutdownCts.Token);
+                if (miningTask == null)
+                {
+                    await lifetimeTask.ConfigureAwait(false);
+                }
+                else
+                {
+                    var completed = await Task.WhenAny(lifetimeTask, miningTask).ConfigureAwait(false);
+                    if (completed == miningTask)
+                    {
+                        await miningTask.ConfigureAwait(false);
+                        if (!shutdownCts.IsCancellationRequested)
+                        {
+                            log.Warn("NodeHost", "OpenCL mining task exited unexpectedly.");
+                            return 1;
+                        }
+                    }
+                }
             }
             catch (OperationCanceledException) when (shutdownCts.IsCancellationRequested)
             {
@@ -134,6 +184,11 @@ internal static class Program
                 try { apiHost.Dispose(); } catch { }
             }
 
+            if (openClMiner != null)
+            {
+                try { openClMiner.Dispose(); } catch { }
+            }
+
             if (node != null)
             {
                 try { node.Stop(); } catch { }
@@ -157,6 +212,9 @@ internal static class Program
         Console.WriteLine("  --api-port <port>           Enable embedded API on this port.");
         Console.WriteLine("  --peer <host:port>          Bootstrap peer; repeatable.");
         Console.WriteLine("  --no-default-seed           Do not auto-dial the built-in genesis seed/known peers.");
+        Console.WriteLine("  --mine-opencl               Enable headless OpenCL mining.");
+        Console.WriteLine("  --miner-public-key <hex32>  32-byte miner public key as 64-char hex.");
+        Console.WriteLine("  --opencl-device <value>     OpenCL device id or case-insensitive substring match.");
         Console.WriteLine("  --help                      Show this help.");
         Console.WriteLine();
         Console.WriteLine("Environment overrides:");
@@ -166,6 +224,9 @@ internal static class Program
         Console.WriteLine("  QADO_NODE_API_PORT");
         Console.WriteLine("  QADO_NODE_BOOTSTRAP_PEERS   Comma/semicolon-separated host:port list.");
         Console.WriteLine("  QADO_NODE_NO_DEFAULT_SEED   1/true to disable built-in seed dialing.");
+        Console.WriteLine("  QADO_NODE_MINE_OPENCL       1/true to enable headless OpenCL mining.");
+        Console.WriteLine("  QADO_NODE_MINER_PUBLIC_KEY  64-char hex public key for mining rewards.");
+        Console.WriteLine("  QADO_NODE_OPENCL_DEVICE     Device id or name substring selector.");
     }
 
     private static async Task RunBootstrapReconnectLoopAsync(
@@ -239,6 +300,9 @@ internal static class Program
         public int P2pPort { get; private init; } = ParsePortOrDefault(Environment.GetEnvironmentVariable("QADO_NODE_P2P_PORT"), GenesisConfig.P2PPort);
         public int? ApiPort { get; private init; } = ParseOptionalPort(Environment.GetEnvironmentVariable("QADO_NODE_API_PORT"));
         public bool NoDefaultSeed { get; private init; } = ParseBool(Environment.GetEnvironmentVariable("QADO_NODE_NO_DEFAULT_SEED"));
+        public bool MineOpenCl { get; private init; } = ParseBool(Environment.GetEnvironmentVariable("QADO_NODE_MINE_OPENCL"));
+        public string? MinerPublicKey { get; private init; } = Environment.GetEnvironmentVariable("QADO_NODE_MINER_PUBLIC_KEY");
+        public string? OpenClDeviceSelector { get; private init; } = Environment.GetEnvironmentVariable("QADO_NODE_OPENCL_DEVICE");
         public bool ShowHelp { get; private init; }
         public List<BootstrapPeer> BootstrapPeers { get; } = ParseBootstrapPeers(Environment.GetEnvironmentVariable("QADO_NODE_BOOTSTRAP_PEERS"));
 
@@ -279,6 +343,18 @@ internal static class Program
 
                     case "--no-default-seed":
                         options = options with { NoDefaultSeed = true };
+                        break;
+
+                    case "--mine-opencl":
+                        options = options with { MineOpenCl = true };
+                        break;
+
+                    case "--miner-public-key":
+                        options = options with { MinerPublicKey = RequireValue(args, ref i, arg) };
+                        break;
+
+                    case "--opencl-device":
+                        options = options with { OpenClDeviceSelector = RequireValue(args, ref i, arg) };
                         break;
 
                     default:
@@ -402,5 +478,221 @@ internal static class Program
 
             return new string(chars);
         }
+    }
+
+    private static OpenClMiningDevice? ResolveOpenClDevice(string? selector, ILogSink log)
+    {
+        var devices = OpenClDiscovery.DiscoverDevices(log);
+        if (devices.Count == 0)
+            return null;
+
+        if (!string.IsNullOrWhiteSpace(selector))
+        {
+            string needle = selector.Trim();
+            for (int i = 0; i < devices.Count; i++)
+            {
+                var device = devices[i];
+                if (string.Equals(device.Id, needle, StringComparison.Ordinal) ||
+                    device.DisplayName.Contains(needle, StringComparison.OrdinalIgnoreCase) ||
+                    device.DeviceName.Contains(needle, StringComparison.OrdinalIgnoreCase) ||
+                    device.Vendor.Contains(needle, StringComparison.OrdinalIgnoreCase) ||
+                    device.PlatformName.Contains(needle, StringComparison.OrdinalIgnoreCase))
+                    return device;
+            }
+
+            log.Warn("NodeHost", $"OpenCL device selector '{selector}' did not match any discovered GPU. Falling back to auto-select.");
+        }
+
+        for (int i = 0; i < devices.Count; i++)
+        {
+            if (devices[i].DeviceName.Contains("1070", StringComparison.OrdinalIgnoreCase))
+                return devices[i];
+        }
+
+        return devices[0];
+    }
+
+    private static async Task OnBlockMinedAsync(
+        Block block,
+        P2PNode node,
+        MempoolManager mempool,
+        ILogSink log)
+    {
+        try
+        {
+            if (Db.Connection == null)
+            {
+                log.Error("Mining", "Db.Connection is null (cannot persist block).");
+                return;
+            }
+
+            bool extendedCanon = false;
+            bool canonicalized = false;
+            ulong newCanonHeight = 0;
+            string? rejectReason = null;
+            bool syncActive = node.IsInitialBlockSyncActive;
+
+            lock (Db.Sync)
+            {
+                using var tx = Db.Connection.BeginTransaction();
+
+                if (!syncActive && TryComputeCanonExtensionHeight(block, tx, out newCanonHeight))
+                {
+                    block.BlockHeight = newCanonHeight;
+
+                    if (block.BlockHash is not { Length: 32 } || IsZero32(block.BlockHash))
+                        block.BlockHash = block.ComputeBlockHash();
+
+                    if (!BlockValidator.ValidateNetworkTipBlock(block, out var tipReason, tx))
+                    {
+                        rejectReason = tipReason;
+                        tx.Rollback();
+                        goto PersistDone;
+                    }
+
+                    BlockStore.SaveBlock(block, tx, BlockIndexStore.StatusCanonicalStateValidated);
+                    StateApplier.ApplyBlockWithUndo(block, tx);
+                    BlockStore.SetCanonicalHashAtHeight(newCanonHeight, block.BlockHash!, tx);
+                    extendedCanon = true;
+                }
+                else
+                {
+                    if (block.BlockHash is not { Length: 32 } || IsZero32(block.BlockHash))
+                        block.BlockHash = block.ComputeBlockHash();
+
+                    if (!BlockValidator.ValidateNetworkSideBlockStateless(block, out var sideReason, tx))
+                    {
+                        rejectReason = sideReason;
+                        tx.Rollback();
+                        goto PersistDone;
+                    }
+
+                    BlockStore.SaveBlock(block, tx, BlockIndexStore.StatusSideStatelessAccepted);
+                }
+
+                tx.Commit();
+            }
+
+        PersistDone:
+            if (!string.IsNullOrWhiteSpace(rejectReason))
+            {
+                log.Warn("Mining", $"Rejecting mined block (current state): {rejectReason}");
+                return;
+            }
+
+            log.Info(
+                "Mining",
+                extendedCanon
+                    ? $"Mined + stored: h={newCanonHeight}"
+                    : $"Mined + stored (side/reorg candidate): h={block.BlockHeight}");
+
+            if (syncActive && !extendedCanon)
+                log.Info("Mining", "Initial block sync active; mined side candidate was not adopted into canonical chain.");
+
+            canonicalized = extendedCanon;
+
+            if (!extendedCanon && !syncActive)
+            {
+                try
+                {
+                    ChainSelector.MaybeAdoptNewTip(block.BlockHash!, log, mempool);
+                    if (BlockIndexStore.TryGetStatus(block.BlockHash!, out var status) &&
+                        BlockIndexStore.IsValidatedStatus(status))
+                    {
+                        canonicalized = true;
+                    }
+                }
+                catch
+                {
+                }
+            }
+
+            if (canonicalized)
+            {
+                try { mempool.RemoveIncluded(block); } catch { }
+            }
+
+            try
+            {
+                await node.BroadcastBlockAsync(block).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                log.Warn("Gossip", $"Block broadcast task failed: {ex.Message}");
+            }
+        }
+        catch (Exception ex)
+        {
+            log.Error("Mining", $"Persist error: {ex}");
+        }
+    }
+
+    private static bool TryComputeCanonExtensionHeight(Block blk, SqliteTransaction tx, out ulong newHeight)
+    {
+        newHeight = 0;
+
+        var prev = blk.Header?.PreviousBlockHash;
+        if (prev is not { Length: 32 })
+            return false;
+
+        ulong tipH = BlockStore.GetLatestHeight(tx);
+        var tipHash = BlockStore.GetCanonicalHashAtHeight(tipH, tx);
+        if (tipHash is not { Length: 32 })
+            return false;
+
+        if (!BytesEqual32(prev, tipHash))
+            return false;
+
+        newHeight = tipH + 1UL;
+        return true;
+    }
+
+    private static bool BytesEqual32(byte[] a, byte[] b)
+    {
+        if (a == null || b == null || a.Length != 32 || b.Length != 32)
+            return false;
+
+        return a.AsSpan().SequenceEqual(b);
+    }
+
+    private static bool IsZero32(byte[]? value)
+    {
+        if (value is not { Length: 32 })
+            return true;
+
+        for (int i = 0; i < value.Length; i++)
+        {
+            if (value[i] != 0)
+                return false;
+        }
+
+        return true;
+    }
+
+    private static string NormalizeHex32(string value, string paramName)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            throw new InvalidOperationException($"{paramName} is required.");
+
+        string normalized = value.Trim();
+        if (normalized.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+            normalized = normalized[2..];
+
+        byte[] bytes = Convert.FromHexString(normalized);
+        if (bytes.Length != 32)
+            throw new InvalidOperationException($"{paramName} must be a 32-byte hex value.");
+
+        return Convert.ToHexString(bytes).ToLowerInvariant();
+    }
+
+    private static string ShortHex(string hex)
+    {
+        if (string.IsNullOrWhiteSpace(hex))
+            return string.Empty;
+
+        string normalized = hex.Trim();
+        return normalized.Length <= 16
+            ? normalized
+            : $"{normalized[..8]}...{normalized[^8..]}";
     }
 }

@@ -42,23 +42,25 @@
                     </StackPanel>
 
                     <StackPanel Grid.Column="1" Orientation="Vertical" Margin="18,0,0,0" VerticalAlignment="Center">
-                        <TextBlock Text="Private Key (hex)" FontWeight="Bold"/>
+                        <TextBlock Text="Private key (hex)" FontWeight="Bold"/>
                         <ComboBox x:Name="PrivateKeyComboBox"
-                                  Width="420"
+                                  Width="438"
                                   Margin="0,6,0,0"
                                   IsEditable="True"
                                   SelectionChanged="PrivateKeyComboBox_SelectionChanged"/>
 
-                        <TextBlock Text="Wallet Address (PubKey32 hex)" FontWeight="Bold" Margin="0,10,0,0"/>
-                        <TextBox x:Name="SpendPublicKeyTextBox" Width="420" Margin="0,6,0,0" IsReadOnly="True"/>
+                        <TextBlock Text="Blockchain address" FontWeight="Bold" Margin="0,10,0,0"/>
+                        <TextBox x:Name="SpendPublicKeyTextBox" Width="438" Margin="0,6,0,0" IsReadOnly="True"/>
                     </StackPanel>
 
                     <StackPanel Grid.Column="2" Orientation="Horizontal" Margin="18,0,0,0" VerticalAlignment="Center">
-                        <Button x:Name="GeneratePrivateKeyButton" Content="Generate Key" Width="140" Margin="0,0,8,0"
+                        <Button x:Name="GeneratePrivateKeyButton" Content="Generate key pair" Width="145" Margin="0,0,8,0"
                                 Click="GeneratePrivateKeyButton_Click"/>
-                        <Button x:Name="AcceptPrivateKeyButton" Content="Accept" Width="90" Margin="0,0,8,0"
+                        <Button x:Name="AcceptPrivateKeyButton" Content="Accept private key" Width="145" Margin="0,0,8,0"
                                 Click="AcceptPrivateKeyButton_Click" Opacity="0.5" IsEnabled="False"/>
-                        <Button x:Name="CopyKeyButton" Content="Copy" Width="70"/>
+                        <Button x:Name="CopyKeyButton" Content="Copy address" Width="100"/>
+                        <Button x:Name="DeletePrivateKeyButton" Content="Delete private key" Width="140" Margin="8,0,0,0"
+                                Click="DeletePrivateKeyButton_Click" Opacity="0.5" IsEnabled="False"/>
                     </StackPanel>
                 </Grid>
             </ScrollViewer>
@@ -153,7 +155,7 @@
                             </StackPanel>
                         </GroupBox>
 
-                        <GroupBox Header="P2P" Padding="10">
+                        <GroupBox Header="P2P" Padding="10" Visibility="Collapsed">
                             <StackPanel>
                                 <StackPanel Orientation="Horizontal">
                                     <TextBox x:Name="PeerHostTextBox" Width="220"/>
@@ -180,7 +182,7 @@
                         <StackPanel Orientation="Horizontal" Grid.Row="0" Margin="0,0,0,8">
                             <Button x:Name="ReloadBlocksButton" Content="Reload" Width="90"
                                     Click="ReloadBlocksButton_Click"/>
-                            <Button x:Name="TrySyncButton" Content="Try Sync" Width="90" Margin="8,0,0,0"
+                            <Button x:Name="TrySyncButton" Content="Try Sync" Width="90" Margin="8,0,0,0" Visibility="Collapsed"
                                     Click="TrySyncButton_Click"/>
                             <TextBlock Text="(auto reload on new tip)" Margin="12,4,0,0"/>
                         </StackPanel>

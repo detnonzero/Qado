@@ -3,6 +3,7 @@ using System.Buffers.Binary;
 using System.Globalization;
 using System.Linq;
 using System.Numerics;
+using System.Reflection;
 using System.Security.Cryptography;
 using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.Builder;
@@ -32,7 +33,12 @@ namespace Qado.Api
 
         private const int MaxMiningJobs = 64;
         private const int MaxMiningJobsPerMiner = 16;
+        private const int RecommendedDepositConfirmations = 6;
+        private const string AddressFormat = "hex32_pubkey";
+        private const string PublicKeyCurve = "ed25519";
+        private const string TxBroadcastMode = "pre_signed_raw_tx";
         private static readonly TimeSpan MiningJobTtl = TimeSpan.FromMinutes(2);
+        private static readonly string NodeVersion = ResolveNodeVersion();
 
         private WebApplication? _app;
         private bool _disposed;
@@ -151,7 +157,39 @@ namespace Qado.Api
                 {
                     status = "ok",
                     network = NetworkParams.Name,
-                    node_version = typeof(ExchangeApiHost).Assembly.GetName().Version?.ToString() ?? "0.0.0",
+                    node_version = NodeVersion,
+                    timestamp_utc = DateTimeOffset.UtcNow.ToString("O")
+                });
+            });
+
+            app.MapGet("/v1/readiness", () =>
+            {
+                var node = _getP2PNode();
+                ulong tipHeight = BlockStore.GetLatestHeight();
+                var tipHash = BlockStore.GetCanonicalHashAtHeight(tipHeight);
+                int peerCount = node?.GetConnectedHandshakePeerCount() ?? 0;
+                bool initialSyncActive = node?.IsInitialBlockSyncActive == true;
+                bool peerTipAhead = node?.HasBetterPeerTipThanLocal == true;
+                string? reason = null;
+
+                if (node == null)
+                    reason = "node_unavailable";
+                else if (tipHash is not { Length: 32 })
+                    reason = "tip_unavailable";
+                else if (peerCount <= 0)
+                    reason = "no_connected_peers";
+                else if (peerTipAhead)
+                    reason = "peer_tip_ahead";
+
+                return Results.Json(new
+                {
+                    ready = reason == null,
+                    reason,
+                    initial_block_sync_active = initialSyncActive,
+                    tip_height = U64(tipHeight),
+                    tip_hash = tipHash is { Length: 32 } ? Hex(tipHash) : "",
+                    peer_count = peerCount,
+                    node_version = NodeVersion,
                     timestamp_utc = DateTimeOffset.UtcNow.ToString("O")
                 });
             });
@@ -168,6 +206,25 @@ namespace Qado.Api
                     network_id = GenesisConfig.NetworkId.ToString(CultureInfo.InvariantCulture),
                     p2p_port = GenesisConfig.P2PPort,
                     genesis_hash = genesis is { Length: 32 } ? Hex(genesis) : ""
+                });
+            });
+
+            app.MapGet("/v1/asset", () =>
+            {
+                var genesis = BlockStore.GetCanonicalHashAtHeight(0);
+                return Results.Json(new
+                {
+                    chain_name = "qado",
+                    symbol = "QADO",
+                    decimals = 9,
+                    chain_id = NetworkParams.ChainId.ToString(CultureInfo.InvariantCulture),
+                    network_id = GenesisConfig.NetworkId.ToString(CultureInfo.InvariantCulture),
+                    genesis_hash = genesis is { Length: 32 } ? Hex(genesis) : "",
+                    address_format = AddressFormat,
+                    public_key_curve = PublicKeyCurve,
+                    memo_required = false,
+                    recommended_deposit_confirmations = U64((ulong)RecommendedDepositConfirmations),
+                    tx_broadcast_mode = TxBroadcastMode
                 });
             });
 
@@ -242,6 +299,33 @@ namespace Qado.Api
                     pending_outgoing_count = pendingOutgoing < 0 ? 0 : pendingOutgoing,
                     pending_incoming_count = pendingIncoming,
                     latest_observed_height = U64(latestHeight)
+                });
+            });
+
+            app.MapPost("/v1/address/validate", (AddressValidateRequest body, HttpContext http) =>
+            {
+                if (body is null || string.IsNullOrWhiteSpace(body.address))
+                    return BadRequest(Error("invalid_request", "address is required.", http));
+
+                if (TryNormalizeHex32(body.address, out var normalized))
+                {
+                    return Results.Json(new
+                    {
+                        valid = true,
+                        normalized,
+                        address_format = AddressFormat,
+                        public_key_curve = PublicKeyCurve,
+                        reason = (string?)null
+                    });
+                }
+
+                return Results.Json(new
+                {
+                    valid = false,
+                    normalized = (string?)null,
+                    address_format = AddressFormat,
+                    public_key_curve = PublicKeyCurve,
+                    reason = "address must be 64-char lowercase hex public key."
                 });
             });
 
@@ -1603,10 +1687,30 @@ namespace Qado.Api
             string next_cursor,
             IncomingAddressEvent[] items);
 
+        private static string ResolveNodeVersion()
+        {
+            var assembly = typeof(ExchangeApiHost).Assembly;
+
+            var informational = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+            if (!string.IsNullOrWhiteSpace(informational))
+                return informational;
+
+            var fileVersion = assembly.GetCustomAttribute<AssemblyFileVersionAttribute>()?.Version;
+            if (!string.IsNullOrWhiteSpace(fileVersion))
+                return fileVersion;
+
+            return assembly.GetName().Version?.ToString() ?? "0.0.0";
+        }
+
         private sealed class BroadcastRequest
         {
             public string raw_tx_hex { get; set; } = "";
             public string? idempotency_key { get; set; }
+        }
+
+        private sealed class AddressValidateRequest
+        {
+            public string address { get; set; } = "";
         }
 
         private sealed class MiningJobRequest

@@ -27,7 +27,7 @@ namespace Qado.Networking
         private static readonly TimeSpan TimeoutCooldownShort = TimeSpan.FromSeconds(10);
         private static readonly TimeSpan TimeoutCooldownMedium = TimeSpan.FromSeconds(25);
         private static readonly TimeSpan PlannerLivenessPollInterval = TimeSpan.FromSeconds(5);
-        private static readonly TimeSpan IdleBehindRecoveryThreshold = TimeSpan.FromSeconds(15);
+        private static readonly TimeSpan IdleBehindRecoveryThreshold = TimeSpan.FromSeconds(20);
         private static readonly TimeSpan ActiveBehindRecoveryThreshold = TimeSpan.FromSeconds(30);
         private const int BaseMaxParallelWindows = 3;
         private const int MediumMaxParallelWindows = 4;
@@ -189,6 +189,15 @@ namespace Qado.Networking
             {
                 lock (_gate)
                     return _state != BlockSyncState.Idle;
+            }
+        }
+
+        public bool HasBetterPeerTipThanLocal
+        {
+            get
+            {
+                lock (_gate)
+                    return TryGetBestAheadPeer_NoLock(_getLocalTipChainwork(), out _, out _, out _);
             }
         }
 

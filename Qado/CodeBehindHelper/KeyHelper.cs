@@ -22,7 +22,7 @@ namespace Qado.CodeBehindHelper
             string selected = keyComboBox.SelectedItem as string ?? string.Empty;
             bool isNewEntry = string.Equals(selected, "New", StringComparison.Ordinal);
 
-            acceptButton.Content = "Accept Private Key";
+            acceptButton.Content = "Accept private key";
 
             if (isNewEntry)
             {

@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Qado Node API
-  version: 1.0.0
+  version: 1.0.1
   summary: Minimal REST/JSON API schema for exchange, wallet, and mining integration
   description: |
     Node-facing API for deposits, confirmations, transaction broadcast, and solo mining.
@@ -23,7 +23,7 @@ paths:
   /v1/health:
     get:
       tags: [System]
-      summary: Health and readiness probe
+      summary: Health probe
       operationId: getHealth
       responses:
         "200":
@@ -37,10 +37,35 @@ paths:
                   value:
                     status: ok
                     network: mainnet
-                    node_version: "1.0.0"
+                    node_version: "1.0.1+buildmeta"
                     timestamp_utc: "2026-02-12T10:30:10Z"
         "429":
           $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/readiness:
+    get:
+      tags: [System]
+      summary: Operational readiness for exchange workflows
+      operationId: getReadiness
+      responses:
+        "200":
+          description: Readiness state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadinessResponse"
+              examples:
+                ready:
+                  value:
+                    ready: true
+                    reason: null
+                    initial_block_sync_active: false
+                    tip_height: "15234"
+                    tip_hash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    peer_count: 8
+                    node_version: "1.0.1+buildmeta"
+                    timestamp_utc: "2026-03-31T18:00:00Z"
         "500":
           $ref: "#/components/responses/InternalError"
   /v1/network:
@@ -63,8 +88,36 @@ paths:
                     decimals: 9
                     chain_id: "1"
                     network_id: "1"
-                    p2p_port: 34000
+                    p2p_port: 33333
                     genesis_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/asset:
+    get:
+      tags: [System]
+      summary: Exchange-facing asset metadata
+      operationId: getAsset
+      responses:
+        "200":
+          description: Asset metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssetResponse"
+              examples:
+                default:
+                  value:
+                    chain_name: qado
+                    symbol: QADO
+                    decimals: 9
+                    chain_id: "1"
+                    network_id: "1"
+                    genesis_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    address_format: hex32_pubkey
+                    public_key_curve: ed25519
+                    memo_required: false
+                    recommended_deposit_confirmations: "6"
+                    tx_broadcast_mode: pre_signed_raw_tx
         "500":
           $ref: "#/components/responses/InternalError"
   /v1/tip:
@@ -145,6 +198,47 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/address/validate:
+    post:
+      tags: [Address]
+      summary: Validate and normalize a Qado address
+      operationId: validateAddress
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AddressValidateRequest"
+            examples:
+              default:
+                value:
+                  address: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      responses:
+        "200":
+          description: Validation result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AddressValidateResponse"
+              examples:
+                valid:
+                  value:
+                    valid: true
+                    normalized: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                    address_format: hex32_pubkey
+                    public_key_curve: ed25519
+                    reason: null
+                invalid:
+                  value:
+                    valid: false
+                    normalized: null
+                    address_format: hex32_pubkey
+                    public_key_curve: ed25519
+                    reason: address must be 64-char lowercase hex public key.
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "500":
           $ref: "#/components/responses/InternalError"
   /v1/address/{address}/incoming:
@@ -506,7 +600,43 @@ components:
           example: mainnet
         node_version:
           type: string
-          example: "1.0.0"
+          description: Explicit node product version. May include build metadata such as a commit suffix.
+          example: "1.0.1+buildmeta"
+        timestamp_utc:
+          type: string
+          format: date-time
+    ReadinessReason:
+      type: string
+      enum: [node_unavailable, tip_unavailable, no_connected_peers, peer_tip_ahead]
+    ReadinessResponse:
+      type: object
+      required: [ready, initial_block_sync_active, tip_height, tip_hash, peer_count, node_version, timestamp_utc]
+      properties:
+        ready:
+          type: boolean
+          description: |
+            True when the node is operationally ready for deposit polling and transaction broadcast.
+            This is the field exchanges should key off, not `initial_block_sync_active` alone.
+        reason:
+          anyOf:
+            - $ref: "#/components/schemas/ReadinessReason"
+            - type: "null"
+          description: Null when ready; otherwise the blocking readiness reason.
+        initial_block_sync_active:
+          type: boolean
+          description: Diagnostic sync-state flag. This can still be true while `ready` is also true.
+        tip_height:
+          $ref: "#/components/schemas/UIntString"
+        tip_hash:
+          type: string
+          pattern: "^[a-f0-9]{0,64}$"
+        peer_count:
+          type: integer
+          minimum: 0
+        node_version:
+          type: string
+          description: Explicit node product version. May include build metadata such as a commit suffix.
+          example: "1.0.1+buildmeta"
         timestamp_utc:
           type: string
           format: date-time
@@ -536,6 +666,40 @@ components:
           example: 34000
         genesis_hash:
           $ref: "#/components/schemas/HashHex"
+    AssetResponse:
+      type: object
+      required: [chain_name, symbol, decimals, chain_id, network_id, genesis_hash, address_format, public_key_curve, memo_required, recommended_deposit_confirmations, tx_broadcast_mode]
+      properties:
+        chain_name:
+          type: string
+          example: qado
+        symbol:
+          type: string
+          example: QADO
+        decimals:
+          type: integer
+          minimum: 0
+          maximum: 18
+          example: 9
+        chain_id:
+          $ref: "#/components/schemas/UIntString"
+        network_id:
+          $ref: "#/components/schemas/UIntString"
+        genesis_hash:
+          $ref: "#/components/schemas/HashHex"
+        address_format:
+          type: string
+          enum: [hex32_pubkey]
+        public_key_curve:
+          type: string
+          enum: [ed25519]
+        memo_required:
+          type: boolean
+        recommended_deposit_confirmations:
+          $ref: "#/components/schemas/UIntString"
+        tx_broadcast_mode:
+          type: string
+          enum: [pre_signed_raw_tx]
     TipResponse:
       type: object
       required: [height, hash, timestamp_utc, chainwork]
@@ -590,6 +754,32 @@ components:
           minimum: 0
         latest_observed_height:
           $ref: "#/components/schemas/UIntString"
+    AddressValidateRequest:
+      type: object
+      required: [address]
+      properties:
+        address:
+          type: string
+    AddressValidateResponse:
+      type: object
+      required: [valid, address_format, public_key_curve]
+      properties:
+        valid:
+          type: boolean
+        normalized:
+          anyOf:
+            - $ref: "#/components/schemas/AddressHex"
+            - type: "null"
+        address_format:
+          type: string
+          enum: [hex32_pubkey]
+        public_key_curve:
+          type: string
+          enum: [ed25519]
+        reason:
+          anyOf:
+            - type: string
+            - type: "null"
     AddressIncomingEvent:
       type: object
       required:

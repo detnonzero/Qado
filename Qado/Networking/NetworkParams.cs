@@ -13,7 +13,9 @@ namespace Qado.Networking
             public static readonly string[] BootstrapHosts =
             {
                 GenesisHost,
-                "2a01:4f8:231:44e1::15"
+                "2a02:2479:b2:4900::1",
+                "82.165.121.88",
+                "2a02:2479:7b:7a00::1"
             };
             public const string GenesisMinerHex = "e4449f3cce0e9b0db225e11cae2f97594725bee62255f2131310f9625fd26382";
             public const ulong GenesisTimestamp = 1773428400UL;

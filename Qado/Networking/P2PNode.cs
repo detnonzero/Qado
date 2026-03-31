@@ -64,12 +64,12 @@ namespace Qado.Networking
         private static readonly TimeSpan OrphanPeerStrikeWindow = TimeSpan.FromSeconds(30);
         private static readonly TimeSpan OrphanPeerInitialCooldown = TimeSpan.FromSeconds(15);
         private static readonly TimeSpan OrphanPeerMaxCooldown = TimeSpan.FromSeconds(60);
-        private static readonly TimeSpan KnownBlockLogCooldown = TimeSpan.FromSeconds(12);
+        private static readonly TimeSpan KnownBlockLogCooldown = TimeSpan.FromSeconds(60);
         private const int MaxKnownBlockLogEntries = 4096;
         private static readonly TimeSpan ValidationQueueFullLogWindow = TimeSpan.FromSeconds(10);
         private static readonly TimeSpan ParentPackBenignFailureLogWindow = TimeSpan.FromSeconds(15);
         private static readonly TimeSpan ParentPackRequestLogWindow = TimeSpan.FromSeconds(10);
-        private static readonly TimeSpan DuplicateSessionLogWindow = TimeSpan.FromSeconds(10);
+        private static readonly TimeSpan DuplicateSessionLogWindow = TimeSpan.FromSeconds(20);
         private static readonly TimeSpan ParentPackRequestBudgetWindow = TimeSpan.FromSeconds(1);
         private static readonly TimeSpan MissingHeaderResyncCooldown = TimeSpan.FromSeconds(12);
         private static readonly TimeSpan BlockRelayCooldown = TimeSpan.FromMinutes(2);
@@ -81,7 +81,7 @@ namespace Qado.Networking
         private const int MaxRelayQueuePerPeer = 256;
         private static readonly TimeSpan RelayQueueOverflowLogWindow = TimeSpan.FromSeconds(10);
         private const int MaxParentPackRequestsPerBudgetWindowGlobal = 4;
-        private const int MaxParentPackRequestsPerBudgetWindowPerPeer = 1;
+        private const int MaxParentPackRequestsPerBudgetWindowPerPeer = 2;
         private static readonly LruSet ParentRequestSeen = new(capacity: 200_000, ttl: TimeSpan.FromSeconds(60));
         private static readonly LruSet RecentRelayedTxSeen = new(capacity: MaxTxRelayEntries, ttl: TxRelayCooldown);
         private static readonly TimeSpan PeerExchangeInterval = TimeSpan.FromMinutes(15);
@@ -94,6 +94,8 @@ namespace Qado.Networking
         public static P2PNode? Instance { get; private set; }
         public bool IsPubliclyReachable => _reachability.IsPublic;
         public bool IsInitialBlockSyncActive => _blockSyncClient.IsActive;
+        public bool HasBetterPeerTipThanLocal => _blockSyncClient.HasBetterPeerTipThanLocal;
+        public int GetConnectedHandshakePeerCount() => CountBroadcastTargets();
 
         private readonly MempoolManager _mempool;
         private readonly ILogSink? _log;
@@ -145,6 +147,7 @@ namespace Qado.Networking
         private string _lastParentPackRequestMessage = string.Empty;
         private DateTime _lastDuplicateSessionLogUtc = DateTime.MinValue;
         private int _duplicateSessionLogSuppressed;
+        private string _lastDuplicateSessionLogKey = string.Empty;
         private string _lastDuplicateSessionMessage = string.Empty;
         private readonly object _missingHeaderResyncGate = new();
         private DateTime _nextMissingHeaderResyncAllowedUtc = DateTime.MinValue;
@@ -935,10 +938,11 @@ namespace Qado.Networking
         private void LogDuplicateSessionDrop(string reason)
         {
             var message = $"duplicate session drop: {reason}";
+            var key = GetDuplicateSessionLogKey(reason);
             lock (_duplicateSessionLogGate)
             {
                 var now = DateTime.UtcNow;
-                if (string.Equals(_lastDuplicateSessionMessage, message, StringComparison.Ordinal) &&
+                if (string.Equals(_lastDuplicateSessionLogKey, key, StringComparison.Ordinal) &&
                     (now - _lastDuplicateSessionLogUtc) < DuplicateSessionLogWindow)
                 {
                     _duplicateSessionLogSuppressed++;
@@ -946,13 +950,23 @@ namespace Qado.Networking
                 }
 
                 if (_duplicateSessionLogSuppressed > 0 && !string.IsNullOrWhiteSpace(_lastDuplicateSessionMessage))
-                    _log?.Warn("P2P", $"{_lastDuplicateSessionMessage} (+{_duplicateSessionLogSuppressed} similar drops suppressed)");
+                    _log?.Info("P2P", $"{_lastDuplicateSessionMessage} (+{_duplicateSessionLogSuppressed} similar drops suppressed)");
 
+                _lastDuplicateSessionLogKey = key;
                 _lastDuplicateSessionMessage = message;
                 _lastDuplicateSessionLogUtc = now;
                 _duplicateSessionLogSuppressed = 0;
                 _log?.Warn("P2P", message);
             }
+        }
+
+        private static string GetDuplicateSessionLogKey(string reason)
+        {
+            if (string.IsNullOrWhiteSpace(reason))
+                return string.Empty;
+
+            int keepingIndex = reason.IndexOf(": keeping ", StringComparison.Ordinal);
+            return keepingIndex >= 0 ? reason[keepingIndex..] : reason;
         }
 
         private PeerSession? SelectPreferredPeerEndpointSession(IReadOnlyList<PeerSession> candidates)

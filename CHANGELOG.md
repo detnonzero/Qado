@@ -2,6 +2,35 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.0.1] - 2026-03-31
+
+### Added
+- Exchange integration API coverage was expanded for listing/backoffice workflows:
+  - `GET /v1/readiness` exposes whether the node is operationally ready for deposit polling and transaction broadcast
+  - `GET /v1/asset` exposes exchange-facing chain metadata such as address format, curve, memo usage, and recommended deposit confirmations
+  - `POST /v1/address/validate` validates and normalizes QADO public-key addresses
+- Exchange documentation and OpenAPI coverage were updated accordingly:
+  - `docs/EXCHANGE_INTEGRATION.md`
+  - `docs/exchange-api-v1.openapi.yaml`
+
+### Changed
+- Exchange docs now make the address model explicit:
+  - a QADO address is the 32-byte public key encoded as 64-char lowercase hex
+  - exchanges are expected to generate keypairs externally and use the node only for validation, chain reads, confirmations, and raw-tx broadcast
+- Exchange readiness/version reporting was tightened:
+  - `GET /v1/readiness` now reports not-ready only when a real blocking condition exists (`node_unavailable`, `tip_unavailable`, `no_connected_peers`, or `peer_tip_ahead`) instead of treating any active initial-sync state as an automatic blocker
+  - `initial_block_sync_active` remains exposed as a diagnostic flag
+  - API `node_version` values now come from explicit assembly/product version metadata and may include build metadata suffixes
+- Mainnet bootstrap seed definitions were refreshed to the current dual-stack set:
+  - `212.227.21.183`
+  - `2a02:2479:b2:4900::1`
+  - `82.165.121.88`
+  - `2a02:2479:7b:7a00::1`
+- Minor sync robustness/noise tuning:
+  - idle watchdog recovery threshold increased from `15s` to `20s`
+  - known-block duplicate log cooldown increased from `12s` to `60s`
+  - direct parent-pack request budget per peer increased from `1` to `2` per `1s` window
+
 ## [1.0.0] - 2026-03-29
 
 ### Added

@@ -481,7 +481,10 @@ namespace Qado
                     AcceptPrivateKeyButton.Opacity = 1.0;
                     GeneratePrivateKeyButton.IsEnabled = true;
                     GeneratePrivateKeyButton.Opacity = 1.0;
+                    DeletePrivateKeyButton.IsEnabled = false;
+                    DeletePrivateKeyButton.Opacity = 0.5;
                     SpendPublicKeyTextBox.Text = "";
+                    BalanceTextBlock.Text = string.Empty;
                     ReloadPersonalTransactions();
                 }
                 else
@@ -493,6 +496,8 @@ namespace Qado
                     AcceptPrivateKeyButton.Opacity = 0.5;
                     GeneratePrivateKeyButton.IsEnabled = false;
                     GeneratePrivateKeyButton.Opacity = 0.5;
+                    DeletePrivateKeyButton.IsEnabled = true;
+                    DeletePrivateKeyButton.Opacity = 1.0;
 
                     BalanceHelper.UpdateBalanceUI(BalanceTextBlock, selected);
                     ReloadPersonalTransactions();
@@ -537,6 +542,8 @@ namespace Qado
                 AcceptPrivateKeyButton.Opacity = 0.5;
                 GeneratePrivateKeyButton.IsEnabled = false;
                 GeneratePrivateKeyButton.Opacity = 0.5;
+                DeletePrivateKeyButton.IsEnabled = true;
+                DeletePrivateKeyButton.Opacity = 1.0;
                 SpendPublicKeyTextBox.Text = publicKey;
 
                 BalanceHelper.UpdateBalanceUI(BalanceTextBlock, privateKey);
@@ -571,6 +578,8 @@ namespace Qado
             AcceptPrivateKeyButton.Opacity = 0.5;
             GeneratePrivateKeyButton.IsEnabled = false;
             GeneratePrivateKeyButton.Opacity = 0.5;
+            DeletePrivateKeyButton.IsEnabled = true;
+            DeletePrivateKeyButton.Opacity = 1.0;
 
             BalanceHelper.UpdateBalanceUI(BalanceTextBlock, newPrivateKey);
             ReloadPersonalTransactions();
@@ -586,12 +595,64 @@ namespace Qado
                 if (!string.IsNullOrWhiteSpace(txt))
                 {
                     Clipboard.SetText(txt);
-                    Info("UI", "Wallet address copied to clipboard.");
+                    Info("UI", "Blockchain address copied to clipboard.");
                 }
             }
             catch (Exception ex)
             {
                 Warn("UI", $"Copy failed: {ex.Message}");
+            }
+        }
+
+        private void DeletePrivateKeyButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (GuiUtils.IsDesignMode) return;
+
+            string selected = PrivateKeyComboBox.SelectedItem as string ?? PrivateKeyComboBox.Text.Trim();
+            if (string.IsNullOrWhiteSpace(selected) || string.Equals(selected, "New", StringComparison.Ordinal))
+                return;
+
+            var confirm = MessageBox.Show(
+                "Are you sure you want to delete this private key?",
+                "QADO",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Warning,
+                MessageBoxResult.No);
+
+            if (confirm != MessageBoxResult.Yes)
+                return;
+
+            try
+            {
+                string normalizedSelected = selected.Trim().ToLowerInvariant();
+                var keys = KeyStorage.LoadAllPrivateKeys();
+                int removed = keys.RemoveAll(k => string.Equals((k ?? string.Empty).Trim(), normalizedSelected, StringComparison.OrdinalIgnoreCase));
+                if (removed <= 0)
+                {
+                    PopulateKeyDropdown();
+                    return;
+                }
+
+                KeyStorage.SavePrivateKeys(keys);
+                PopulateKeyDropdown();
+
+                if (keys.Count == 0)
+                {
+                    PrivateKeyComboBox.Text = "";
+                    SpendPublicKeyTextBox.Text = "";
+                    BalanceTextBlock.Text = string.Empty;
+                    DeletePrivateKeyButton.IsEnabled = false;
+                    DeletePrivateKeyButton.Opacity = 0.5;
+                    ReloadPersonalTransactions();
+                }
+
+                PersistSelectedPrivateKeyNoThrow();
+                Info("Keys", "Private key deleted.");
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Could not delete the private key: {ex.Message}", "QADO", MessageBoxButton.OK, MessageBoxImage.Error);
+                Warn("Keys", $"Delete private key failed: {ex.Message}");
             }
         }
 
@@ -1526,17 +1587,31 @@ LIMIT 200;";
                         }
 
                         bool connected = _p2pNode?.IsPeerConnected(ip, port) == true;
+                        int? latencySortMs = connected ? _p2pNode?.GetPeerLatencyMs(ip, port) : null;
+                        if (latencySortMs is int rawLatency && rawLatency < 0)
+                            latencySortMs = null;
+
                         rows.Add(new PeerRow
                         {
                             Endpoint = $"{ip}:{port}",
                             LastSeenUtc = lastSeenText,
                             LatencyMs = GetPeerLatencyText(ip, port, connected),
+                            LatencySortMs = latencySortMs,
+                            HostSortKey = ip,
+                            PortSortKey = port,
                             Status = hasSeen
                                 ? GetPeerStatus(ip, port, seenAt, connected)
                                 : GetAnnouncedPeerStatus(ip, port, seenAt, hasAnyTimestamp, connected)
                         });
                     }
                 }
+
+                rows = rows
+                    .OrderBy(row => row.LatencySortMs.HasValue ? 0 : 1)
+                    .ThenBy(row => row.LatencySortMs ?? int.MaxValue)
+                    .ThenBy(row => row.HostSortKey, StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(row => row.PortSortKey)
+                    .ToList();
 
                 if (rows.Count == 0)
                     rows.Add(new PeerRow { Status = "No peers known." });
@@ -2051,6 +2126,9 @@ LIMIT 200;";
             public string LastSeenUtc { get; set; } = "";
             public string LatencyMs { get; set; } = "-";
             public string Status { get; set; } = "";
+            public int? LatencySortMs { get; set; }
+            public string HostSortKey { get; set; } = "";
+            public int PortSortKey { get; set; }
         }
 
         public sealed class MempoolRow

@@ -15,13 +15,16 @@ If TLS is required, terminate TLS on a reverse proxy.
 
 No API authentication is enforced by the node.
 Any client that can reach the API endpoint can use it.
+For exchange use, expose the API only on a trusted internal network or behind a reverse proxy/VPN/TLS terminator.
 
 ## Endpoints
 
 ### System
 
 - `GET /v1/health`
+- `GET /v1/readiness`
 - `GET /v1/network`
+- `GET /v1/asset`
 
 ### Chain
 
@@ -35,9 +38,11 @@ Any client that can reach the API endpoint can use it.
 ### Address
 
 - `GET /v1/address/{address}`
+- `POST /v1/address/validate`
 - `GET /v1/address/{address}/incoming`
 
-`address` must be 64-char lowercase hex.
+`address` must be a 32-byte public key encoded as 64-char lowercase hex.
+QADO does not require a separate on-chain address derivation step beyond the public key, so exchanges can generate keypairs externally with standard `ed25519` tooling and use `/v1/address/validate` as a format/normalization check.
 
 ### Transaction
 
@@ -63,6 +68,16 @@ Optional query parameter on both transaction `GET` endpoints:
 {
   "raw_tx_hex": "f0ab...",
   "idempotency_key": "optional-exchange-key-123"
+}
+```
+
+## Address validation request body
+
+`POST /v1/address/validate`
+
+```json
+{
+  "address": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 }
 ```
 
@@ -96,8 +111,49 @@ Optional query parameter on both transaction `GET` endpoints:
 {
   "status": "ok",
   "network": "mainnet",
-  "node_version": "1.0.0.0",
+  "node_version": "1.0.1+buildmeta",
   "timestamp_utc": "2026-02-12T12:00:00.0000000Z"
+}
+```
+
+`GET /v1/readiness`
+
+```json
+{
+  "ready": true,
+  "reason": null,
+  "initial_block_sync_active": false,
+  "tip_height": "15234",
+  "tip_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "peer_count": 8,
+  "node_version": "1.0.1+buildmeta",
+  "timestamp_utc": "2026-03-31T18:00:00.0000000Z"
+}
+```
+
+`reason` is one of:
+- `node_unavailable`
+- `tip_unavailable`
+- `no_connected_peers`
+- `peer_tip_ahead`
+
+`initial_block_sync_active` is diagnostic only. A node can still report `ready=true` while this flag is `true` if no connected peer currently advertises a better tip than the local canonical chain.
+
+`GET /v1/asset`
+
+```json
+{
+  "chain_name": "qado",
+  "symbol": "QADO",
+  "decimals": 9,
+  "chain_id": "1",
+  "network_id": "1",
+  "genesis_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "address_format": "hex32_pubkey",
+  "public_key_curve": "ed25519",
+  "memo_required": false,
+  "recommended_deposit_confirmations": "6",
+  "tx_broadcast_mode": "pre_signed_raw_tx"
 }
 ```
 
@@ -197,7 +253,19 @@ For deterministic coinbase transactions, the same `txid` can legitimately appear
 }
 ```
 
-## Three cURL smoke tests
+`POST /v1/address/validate`
+
+```json
+{
+  "valid": true,
+  "normalized": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "address_format": "hex32_pubkey",
+  "public_key_curve": "ed25519",
+  "reason": null
+}
+```
+
+## cURL smoke tests
 
 ### 1) Health
 
@@ -205,13 +273,33 @@ For deterministic coinbase transactions, the same `txid` can legitimately appear
 curl -sS http://127.0.0.1:18080/v1/health
 ```
 
-### 2) Tip
+### 2) Readiness
+
+```bash
+curl -sS http://127.0.0.1:18080/v1/readiness
+```
+
+### 3) Asset metadata
+
+```bash
+curl -sS http://127.0.0.1:18080/v1/asset
+```
+
+### 4) Address validation
+
+```bash
+curl -sS -X POST http://127.0.0.1:18080/v1/address/validate \
+  -H "Content-Type: application/json" \
+  -d "{\"address\":\"<PUBKEY32_HEX>\"}"
+```
+
+### 5) Tip
 
 ```bash
 curl -sS http://127.0.0.1:18080/v1/tip
 ```
 
-### 3) Broadcast (replace raw hex)
+### 6) Broadcast (replace raw hex)
 
 ```bash
 curl -sS -X POST http://127.0.0.1:18080/v1/tx/broadcast \
@@ -219,7 +307,7 @@ curl -sS -X POST http://127.0.0.1:18080/v1/tx/broadcast \
   -d "{\"raw_tx_hex\":\"<SIGNED_RAW_TX_HEX>\",\"idempotency_key\":\"exch-test-001\"}"
 ```
 
-### 4) Mining job
+### 7) Mining job
 
 ```bash
 curl -sS -X POST http://127.0.0.1:18080/v1/mining/job \
@@ -227,7 +315,7 @@ curl -sS -X POST http://127.0.0.1:18080/v1/mining/job \
   -d "{\"miner\":\"<MINER_PUBKEY32_HEX>\"}"
 ```
 
-### 5) Mining submit
+### 8) Mining submit
 
 ```bash
 curl -sS -X POST http://127.0.0.1:18080/v1/mining/submit \
@@ -238,12 +326,17 @@ curl -sS -X POST http://127.0.0.1:18080/v1/mining/submit \
 ## Notes for exchanges
 
 - Use `confirmations` from `/v1/tx/{txid}/confirmations` for deposit credit logic.
+- Use `/v1/readiness` to decide whether the node is ready for deposit polling and transaction broadcast.
+- Use `/v1/asset` as the node-provided chain metadata surface for exchange/backoffice integration.
 - For deterministic coinbase lookups, pass `block_ref` on `/v1/tx/{txid}` or `/v1/tx/{txid}/confirmations` to disambiguate a specific block occurrence.
-- Prefer `GET /v1/address/{address}/incoming` plus `event_id` for incremental deposit polling.
+- Prefer `GET /v1/address/{address}/incoming` plus `event_id` for incremental deposit polling. `order=desc` is available if your backend prefers newest-first pages.
+- `POST /v1/address/validate` only validates and normalizes the public-key address format; exchanges are expected to manage keypair generation externally.
 - The incoming-events `cursor` is opaque; persist and replay `next_cursor` exactly as returned.
 - Incoming events are canonical-only and currently return `status = confirmed`.
 - Treat `status = orphaned` as not confirmed.
-- Amount fields are in atomic units (`decimals = 9` from `/v1/network`).
+- Amount fields are in atomic units (`decimals = 9` from `/v1/asset` or `/v1/network`).
+- `node_version` may include build metadata suffixes such as `1.0.1+<commit>`.
+- Do not treat `initial_block_sync_active` alone as a hard not-ready signal; use the top-level `ready` and `reason` values.
 - Mining jobs are short-lived in-memory templates tied to the current canonical tip.
 - `submit` only accepts node-generated templates; clients cannot modify coinbase, transaction selection, or merkle composition.
 - For full schema details, see `Qado/docs/exchange-api-v1.openapi.yaml`.
