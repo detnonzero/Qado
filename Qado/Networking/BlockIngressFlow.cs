@@ -801,6 +801,35 @@ namespace Qado.Networking
             }
 
             await _promoteOrphansForParentAsync(block.BlockHash!, peer, ct).ConfigureAwait(false);
+            TryReevaluateBestKnownTipAfterPromotion(block.BlockHash!);
+        }
+
+        private void TryReevaluateBestKnownTipAfterPromotion(byte[] acceptedBlockHash)
+        {
+            if (acceptedBlockHash is not { Length: 32 })
+                return;
+
+            try
+            {
+                if (!BlockIndexStore.TryGetBestKnownTip(out var bestKnownHash, out _, out _))
+                    return;
+                if (bestKnownHash is not { Length: 32 })
+                    return;
+                if (BytesEqual32(bestKnownHash, acceptedBlockHash))
+                    return;
+                if (!BlockIndexStore.HasPayload(bestKnownHash))
+                    return;
+
+                var canonTipHash = BlockStore.GetCanonicalHashAtHeight(BlockStore.GetLatestHeight());
+                if (canonTipHash is { Length: 32 } && BytesEqual32(canonTipHash, bestKnownHash))
+                    return;
+
+                ChainSelector.MaybeAdoptNewTip(bestKnownHash, _log, _mempool);
+            }
+            catch (Exception ex)
+            {
+                _log?.Warn("P2P", $"Post-promotion tip reevaluation failed for {Hex16(acceptedBlockHash)}: {ex.Message}");
+            }
         }
 
         private static bool TryExtendCanonTipNoReorg(Block block, SqliteTransaction tx, out ulong newHeight)
@@ -1009,9 +1038,11 @@ namespace Qado.Networking
         {
             if (_blockSyncClient.IsActive)
             {
-                // Keep one sender-first direct chase alive even during initial sync so live orphan
-                // recovery does not fully stall behind the bulk planner. RequestParentFromPeer and
-                // the download manager both apply their own dedupe/budgeting.
+                // Keep a bounded side-path alive even during active historical sync so live orphan
+                // recovery does not fully stall behind the bulk planner. This still avoids nested
+                // resync storms: sender-first direct chase plus an out-of-plan fallback, but no
+                // extra RequestSyncNow while bulk sync is already active.
+                _ = _blockDownloadManager.QueueOutOfPlanFallback(prevHash, fallbackSource);
                 _requestParentFromPeer(peer, prevHash, parentRequestSource);
                 return;
             }

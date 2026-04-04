@@ -7,15 +7,14 @@ namespace Qado.Networking
             public const string Name = "mainnet";
             public const uint ChainId = 1u;
             public const byte NetworkId = 0x01;
+            public static readonly bool EnableIpv6 = false;
             public const int P2PPort = 33333;
             public const int ApiPort = 18080;
             public const string GenesisHost = "212.227.21.183";
             public static readonly string[] BootstrapHosts =
             {
                 GenesisHost,
-                "2a02:2479:b2:4900::1",
-                "82.165.121.88",
-                "2a02:2479:7b:7a00::1"
+                "82.165.121.88"
             };
             public const string GenesisMinerHex = "e4449f3cce0e9b0db225e11cae2f97594725bee62255f2131310f9625fd26382";
             public const ulong GenesisTimestamp = 1773428400UL;
@@ -30,6 +29,7 @@ namespace Qado.Networking
             public const string Name = "testnet";
             public const uint ChainId = 10u;
             public const byte NetworkId = 0x10;
+            public static readonly bool EnableIpv6 = false;
             public const int P2PPort = 34333;
             public const int ApiPort = 19080;
             public const string GenesisHost = "212.227.21.183";
@@ -52,6 +52,7 @@ namespace Qado.Networking
         public const string Name = UseTestnet ? Testnet.Name : Mainnet.Name;
         public const uint ChainId = UseTestnet ? Testnet.ChainId : Mainnet.ChainId;
         public const byte NetworkId = UseTestnet ? Testnet.NetworkId : Mainnet.NetworkId;
+        public static readonly bool EnableIpv6 = UseTestnet ? Testnet.EnableIpv6 : Mainnet.EnableIpv6;
         public const int P2PPort = UseTestnet ? Testnet.P2PPort : Mainnet.P2PPort;
         public const int ApiPort = UseTestnet ? Testnet.ApiPort : Mainnet.ApiPort;
         public const string GenesisHost = UseTestnet ? Testnet.GenesisHost : Mainnet.GenesisHost;

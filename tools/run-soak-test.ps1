@@ -1,9 +1,6 @@
 param(
-    [string[]]$Peers = @(
-        "116.202.117.5:33333",
-        "116.202.117.6:33333",
-        "116.202.117.7:33333"
-    ),
+    [bool]$UseDefaultSeeds = $true,
+    [string[]]$Peers = @(),
     [int]$DurationHours = 4,
     [int]$P2pPort = 33443,
     [int]$ApiPort = 18091,
@@ -13,6 +10,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+if (-not $UseDefaultSeeds -and ($null -eq $Peers -or $Peers.Count -eq 0)) {
+    throw "When UseDefaultSeeds is false, at least one bootstrap peer must be provided via -Peers."
+}
 
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Split-Path -Parent $scriptRoot
@@ -67,7 +68,7 @@ function Get-TipSnapshot {
     }
 }
 
-Write-RunnerLog ("Preparing soak test. peers={0} durationHours={1} p2p={2} api={3}" -f ($Peers -join ","), $DurationHours, $P2pPort, $ApiPort)
+Write-RunnerLog ("Preparing soak test. defaultSeeds={0} peers={1} durationHours={2} p2p={3} api={4}" -f $UseDefaultSeeds, ($Peers -join ","), $DurationHours, $P2pPort, $ApiPort)
 
 & dotnet build $nodeProject -c Release --nologo | Tee-Object -FilePath (Join-Path $runRoot "build.log")
 if ($LASTEXITCODE -ne 0) {
@@ -87,9 +88,12 @@ $nodeArgs = @(
     "--label", $Label,
     "--data-dir", $dataDir,
     "--p2p-port", [string]$P2pPort,
-    "--api-port", [string]$ApiPort,
-    "--no-default-seed"
+    "--api-port", [string]$ApiPort
 )
+
+if (-not $UseDefaultSeeds) {
+    $nodeArgs += "--no-default-seed"
+}
 
 foreach ($peer in $Peers) {
     $nodeArgs += "--peer"
@@ -189,6 +193,7 @@ $summary = @(
     ("planned_end_utc={0}" -f $plannedEndUtc.ToString("o"))
     ("finished_utc={0}" -f ((Get-Date).ToUniversalTime().ToString("o")))
     ("duration_hours={0}" -f $DurationHours)
+    ("use_default_seeds={0}" -f $UseDefaultSeeds)
     ("process_id={0}" -f $proc.Id)
     ("exit_code={0}" -f $proc.ExitCode)
     ("early_exit={0}" -f $earlyExit)
@@ -205,7 +210,7 @@ $summary = @(
     ("sync_reset_count={0}" -f $syncResetCount)
     ("timeout_line_count={0}" -f $timeoutCount)
     ("adopted_tip_count={0}" -f $adoptCount)
-    ("peers={0}" -f ($Peers -join ","))
+    ("bootstrap_peers={0}" -f ($Peers -join ","))
     ("node_stdout_log={0}" -f $nodeOutLog)
     ("node_stderr_log={0}" -f $nodeErrLog)
     ("runner_log={0}" -f $runnerLog)

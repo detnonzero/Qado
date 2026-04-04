@@ -404,7 +404,20 @@ namespace Qado.Networking
 
                 int peerFree = MaxInflightPerPeer - peerInflight;
                 if (peerFree <= 0)
-                    return;
+                {
+                    var alternatePeer = FindAlternatePeerWithCapacity_NoLock(orderedPeers, selectedPeerKey);
+                    if (alternatePeer == null)
+                        return;
+
+                    selectedPeer = alternatePeer;
+                    selectedPeerKey = NormalizePeerKey(selectedPeer.SessionKey);
+                    peerInflight = GetPeerInflightCount_NoLock(selectedPeerKey);
+                    peerFree = MaxInflightPerPeer - peerInflight;
+                    if (peerFree <= 0)
+                        return;
+
+                    chunkRemaining = RecoveryRequestBatchSize;
+                }
 
                 int toTake = Math.Min(RecoveryRequestBatchSize, Math.Min(peerFree, Math.Min(globalFree, chunkRemaining)));
                 if (toTake <= 0)
@@ -427,7 +440,8 @@ namespace Qado.Networking
                 }
 
                 ReserveInflight_NoLock(selectedHashes, selectedPeerKey, now);
-                _activeChunkRequested += selectedHashes.Count;
+                if (string.Equals(_activeChunkPeerKey, selectedPeerKey, StringComparison.Ordinal))
+                    _activeChunkRequested += selectedHashes.Count;
             }
 
             if (rotated && selectedPeer != null)
@@ -656,6 +670,39 @@ namespace Qado.Networking
                 return string.CompareOrdinal(NormalizePeerKey(a.SessionKey), NormalizePeerKey(b.SessionKey));
             });
             return ordered;
+        }
+
+        private PeerSession? FindAlternatePeerWithCapacity_NoLock(List<PeerSession> orderedPeers, string currentPeerKey)
+        {
+            if (orderedPeers == null || orderedPeers.Count == 0)
+                return null;
+
+            int start = 0;
+            if (!string.IsNullOrWhiteSpace(currentPeerKey))
+            {
+                for (int i = 0; i < orderedPeers.Count; i++)
+                {
+                    if (string.Equals(NormalizePeerKey(orderedPeers[i].SessionKey), currentPeerKey, StringComparison.Ordinal))
+                    {
+                        start = (i + 1) % orderedPeers.Count;
+                        break;
+                    }
+                }
+            }
+
+            for (int i = 0; i < orderedPeers.Count; i++)
+            {
+                var candidate = orderedPeers[(start + i) % orderedPeers.Count];
+                string key = NormalizePeerKey(candidate.SessionKey);
+                if (string.Equals(key, currentPeerKey, StringComparison.Ordinal))
+                    continue;
+                if (GetPeerInflightCount_NoLock(key) >= MaxInflightPerPeer)
+                    continue;
+
+                return candidate;
+            }
+
+            return null;
         }
 
         private static int GetPeerLatencySortKey(PeerSession peer, DateTime now)

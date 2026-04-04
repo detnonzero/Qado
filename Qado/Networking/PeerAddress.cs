@@ -157,6 +157,9 @@ namespace Qado.Networking
             if (address.AddressFamily != AddressFamily.InterNetworkV6)
                 return false;
 
+            if (!NetworkParams.EnableIpv6)
+                return false;
+
             if (address.IsIPv6LinkLocal || address.IsIPv6Multicast || address.IsIPv6SiteLocal || address.Equals(IPAddress.IPv6Loopback))
                 return false;
 
@@ -190,7 +193,11 @@ namespace Qado.Networking
                     continue;
 
                 if (address.AddressFamily == AddressFamily.InterNetworkV6)
+                {
+                    if (!NetworkParams.EnableIpv6)
+                        continue;
                     ipv6.Add(address);
+                }
                 else if (address.AddressFamily == AddressFamily.InterNetwork)
                     ipv4.Add(address);
             }

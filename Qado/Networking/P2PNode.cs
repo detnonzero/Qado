@@ -69,6 +69,8 @@ namespace Qado.Networking
         private static readonly TimeSpan ValidationQueueFullLogWindow = TimeSpan.FromSeconds(10);
         private static readonly TimeSpan ParentPackBenignFailureLogWindow = TimeSpan.FromSeconds(15);
         private static readonly TimeSpan ParentPackRequestLogWindow = TimeSpan.FromSeconds(10);
+        private static readonly TimeSpan ParentPackBurstCooldown = TimeSpan.FromSeconds(8);
+        private static readonly TimeSpan ParentPackPeerRetryCooldown = TimeSpan.FromSeconds(20);
         private static readonly TimeSpan DuplicateSessionLogWindow = TimeSpan.FromSeconds(20);
         private static readonly TimeSpan ParentPackRequestBudgetWindow = TimeSpan.FromSeconds(1);
         private static readonly TimeSpan MissingHeaderResyncCooldown = TimeSpan.FromSeconds(12);
@@ -82,7 +84,9 @@ namespace Qado.Networking
         private static readonly TimeSpan RelayQueueOverflowLogWindow = TimeSpan.FromSeconds(10);
         private const int MaxParentPackRequestsPerBudgetWindowGlobal = 4;
         private const int MaxParentPackRequestsPerBudgetWindowPerPeer = 2;
-        private static readonly LruSet ParentRequestSeen = new(capacity: 200_000, ttl: TimeSpan.FromSeconds(60));
+        private const int MaxParentPackPeersPerRecovery = 3;
+        private static readonly LruSet ParentRequestBurstSeen = new(capacity: 200_000, ttl: ParentPackBurstCooldown);
+        private static readonly LruSet ParentRequestSeenByPeer = new(capacity: 400_000, ttl: ParentPackPeerRetryCooldown);
         private static readonly LruSet RecentRelayedTxSeen = new(capacity: MaxTxRelayEntries, ttl: TxRelayCooldown);
         private static readonly TimeSpan PeerExchangeInterval = TimeSpan.FromMinutes(15);
         private static readonly TimeSpan InventoryRefreshInterval = TimeSpan.FromSeconds(5);
@@ -304,7 +308,7 @@ namespace Qado.Networking
             bool listeningV4;
             bool listeningV6 = false;
             _listenerV4 = TryStartListener(IPAddress.Any, port, ipv6Only: false, out listeningV4);
-            if (Socket.OSSupportsIPv6)
+            if (NetworkParams.EnableIpv6 && Socket.OSSupportsIPv6)
                 _listenerV6 = TryStartListener(IPAddress.IPv6Any, port, ipv6Only: true, out listeningV6);
 
             // Validation is serialized by _validationSerializeGate, so one dispatcher
@@ -1818,34 +1822,138 @@ namespace Qado.Networking
 
             try
             {
-                string peerKey = NormalizeBanKey(peer.SessionKey);
                 string key = Convert.ToHexString(parentHash).ToLowerInvariant();
-                if (ParentRequestSeen.Seen(key))
-                    return;
-
-                if (!TryReserveParentPackRequest(peerKey))
-                    return;
-
-                if (!ParentRequestSeen.TryAdd(key))
+                if (!ParentRequestBurstSeen.TryAdd(key))
                     return;
 
                 var payload = SmallNetSyncProtocol.BuildGetAncestorPack(parentHash, SmallNetSyncProtocol.MaxAncestorPackBlocks);
-                _ = Task.Run(async () =>
+                var targets = GetParentPackRequestTargets(peer, MaxParentPackPeersPerRecovery);
+                for (int i = 0; i < targets.Count; i++)
                 {
-                    try
+                    var target = targets[i];
+                    string peerKey = NormalizeBanKey(target.SessionKey);
+                    string peerSeenKey = $"{key}:{peerKey}";
+                    if (ParentRequestSeenByPeer.Seen(peerSeenKey))
+                        continue;
+
+                    if (!TryReserveParentPackRequest(peerKey))
+                        continue;
+
+                    if (!ParentRequestSeenByPeer.TryAdd(peerSeenKey))
+                        continue;
+
+                    string targetSource = ReferenceEquals(target, peer)
+                        ? source
+                        : $"{source}-backup";
+
+                    _ = Task.Run(async () =>
                     {
-                        await SendFrameAsync(peer, MsgType.GetAncestorPack, payload, CancellationToken.None).ConfigureAwait(false);
-                        LogParentPackRequest(source, parentHash, peer);
-                    }
-                    catch (Exception ex)
-                    {
-                        LogParentPackRequestFailure(source, parentHash, peer, ex);
-                    }
-                }, CancellationToken.None);
+                        try
+                        {
+                            await SendFrameAsync(target, MsgType.GetAncestorPack, payload, CancellationToken.None).ConfigureAwait(false);
+                            LogParentPackRequest(targetSource, parentHash, target);
+                        }
+                        catch (Exception ex)
+                        {
+                            LogParentPackRequestFailure(targetSource, parentHash, target, ex);
+                        }
+                    }, CancellationToken.None);
+                }
             }
             catch
             {
             }
+        }
+
+        private IReadOnlyList<PeerSession> GetParentPackRequestTargets(PeerSession primaryPeer, int maxPeers)
+        {
+            maxPeers = Math.Max(1, maxPeers);
+
+            var result = new List<PeerSession>(maxPeers);
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            TryAddParentPackTarget(primaryPeer, result, seen);
+            if (result.Count >= maxPeers)
+                return result;
+
+            var candidates = new List<PeerSession>();
+            foreach (var candidate in GetSessionSnapshot())
+            {
+                if (candidate == null || ReferenceEquals(candidate, primaryPeer))
+                    continue;
+                if (!IsParentPackRequestCandidate(candidate))
+                    continue;
+
+                candidates.Add(candidate);
+            }
+
+            candidates.Sort(CompareParentPackRequestCandidates);
+            for (int i = 0; i < candidates.Count && result.Count < maxPeers; i++)
+                TryAddParentPackTarget(candidates[i], result, seen);
+
+            return result;
+        }
+
+        private void TryAddParentPackTarget(PeerSession? candidate, List<PeerSession> result, HashSet<string> seen)
+        {
+            if (!IsParentPackRequestCandidate(candidate))
+                return;
+
+            var target = candidate!;
+            string sessionKey = target.SessionKey ?? string.Empty;
+            string key = NormalizeBanKey(sessionKey);
+            if (string.IsNullOrWhiteSpace(key))
+                key = sessionKey;
+
+            if (!seen.Add(key))
+                return;
+
+            result.Add(target);
+        }
+
+        private static bool IsParentPackRequestCandidate(PeerSession? candidate)
+        {
+            if (candidate == null || !candidate.HandshakeOk)
+                return false;
+
+            if (candidate.Client != null && !candidate.Client.Connected)
+                return false;
+
+            return true;
+        }
+
+        private static int CompareParentPackRequestCandidates(PeerSession? x, PeerSession? y)
+        {
+            int xScore = GetParentPackRequestCandidateScore(x);
+            int yScore = GetParentPackRequestCandidateScore(y);
+            int scoreCompare = yScore.CompareTo(xScore);
+            if (scoreCompare != 0)
+                return scoreCompare;
+
+            int xLatency = x != null && x.LastLatencyMs >= 0 ? x.LastLatencyMs : int.MaxValue;
+            int yLatency = y != null && y.LastLatencyMs >= 0 ? y.LastLatencyMs : int.MaxValue;
+            int latencyCompare = xLatency.CompareTo(yLatency);
+            if (latencyCompare != 0)
+                return latencyCompare;
+
+            return string.CompareOrdinal(x?.RemoteEndpoint, y?.RemoteEndpoint);
+        }
+
+        private static int GetParentPackRequestCandidateScore(PeerSession? candidate)
+        {
+            if (candidate == null)
+                return int.MinValue;
+
+            int score = 0;
+            if (!candidate.IsInbound)
+                score++;
+            if (candidate.Supports(HandshakeCapabilities.BlocksBatchData))
+                score += 4;
+            if (candidate.Supports(HandshakeCapabilities.ExtendedSyncWindow))
+                score += 2;
+            if (candidate.Supports(HandshakeCapabilities.SyncWindowPreview))
+                score += 1;
+
+            return score;
         }
 
         private bool TryReserveParentPackRequest(string peerKey)
@@ -2298,7 +2406,12 @@ namespace Qado.Networking
         private static async Task<IReadOnlyList<IPAddress>> ResolveDialAddressesAsync(string host, CancellationToken ct)
         {
             if (PeerAddress.TryParseIp(host, out var literal))
+            {
+                if (!NetworkParams.EnableIpv6 && literal.AddressFamily == AddressFamily.InterNetworkV6)
+                    return Array.Empty<IPAddress>();
+
                 return new[] { literal };
+            }
 
             try
             {

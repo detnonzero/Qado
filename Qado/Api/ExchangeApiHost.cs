@@ -6,6 +6,7 @@ using System.Numerics;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Threading.RateLimiting;
+using System.Net;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
@@ -70,7 +71,13 @@ namespace Qado.Api
                     Args = Array.Empty<string>()
                 });
 
-                builder.WebHost.ConfigureKestrel(options => options.ListenAnyIP(port));
+                builder.WebHost.ConfigureKestrel(options =>
+                {
+                    if (NetworkParams.EnableIpv6)
+                        options.ListenAnyIP(port);
+                    else
+                        options.Listen(IPAddress.Any, port);
+                });
 
                 builder.Services.ConfigureHttpJsonOptions(options =>
                 {

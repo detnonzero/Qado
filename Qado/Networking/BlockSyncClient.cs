@@ -912,6 +912,7 @@ namespace Qado.Networking
             CancellationToken ct)
         {
             List<PeerSession> activePeers;
+            TimeSpan cooldown = TimeSpan.Zero;
             lock (_gate)
             {
                 activePeers = ResolveActivePeers_NoLock();
@@ -923,7 +924,12 @@ namespace Qado.Networking
             lock (_gate)
             {
                 if (peer != null)
-                    _cooldownUntilByPeerKey[peer.SessionKey] = DateTime.UtcNow + PeerCooldown;
+                {
+                    string peerHistoryKey = GetPeerHistoryKey(peer);
+                    cooldown = RecordPipelineFailureAndGetCooldown_NoLock(peer, severe: penalize);
+                    if (peerHistoryKey.Length != 0)
+                        _cooldownUntilByPeerKey[peerHistoryKey] = DateTime.UtcNow + cooldown;
+                }
 
                 ResetPipeline_NoLock(forceLocator);
                 if (_haveCommittedCursor)
@@ -936,7 +942,9 @@ namespace Qado.Networking
             if (peer != null && penalize)
                 _penalizePeer?.Invoke(peer, reason);
 
-            _log?.Warn("Sync", $"Block sync reset: {reason}");
+            _log?.Warn("Sync", cooldown > TimeSpan.Zero
+                ? $"Block sync reset: {reason} cooldown={cooldown.TotalSeconds:F0}s"
+                : $"Block sync reset: {reason}");
             await EnsurePipelineAsync(ct).ConfigureAwait(false);
         }
 
@@ -1158,7 +1166,10 @@ namespace Qado.Networking
 
                 _requestsByPeerKey.Remove(peerKey);
                 cooldown = RecordTimeoutAndGetCooldown_NoLock(peer, request.MaxBlocks);
-                _cooldownUntilByPeerKey[peerKey] = DateTime.UtcNow + cooldown;
+                string peerHistoryKey = GetPeerHistoryKey(peer) is { Length: > 0 } historyKey
+                    ? historyKey
+                    : peerKey;
+                _cooldownUntilByPeerKey[peerHistoryKey] = DateTime.UtcNow + cooldown;
                 _planningReady = true;
                 _useLocatorNext = true;
                 if (_haveCommittedCursor)
@@ -1216,14 +1227,17 @@ namespace Qado.Networking
                 if (peer == null || !peer.HandshakeOk)
                     continue;
 
-                string key = peer.SessionKey;
-                if (_requestsByPeerKey.ContainsKey(key))
+                string sessionKey = peer.SessionKey;
+                if (_requestsByPeerKey.ContainsKey(sessionKey))
                     continue;
 
-                if (_cooldownUntilByPeerKey.TryGetValue(key, out var until) && until > DateTime.UtcNow)
+                string historyKey = GetPeerHistoryKey(peer);
+                if (historyKey.Length != 0 &&
+                    _cooldownUntilByPeerKey.TryGetValue(historyKey, out var until) &&
+                    until > DateTime.UtcNow)
                     continue;
 
-                if (!_tipByPeerKey.TryGetValue(key, out var tip))
+                if (!_tipByPeerKey.TryGetValue(sessionKey, out var tip))
                     continue;
 
                 if (tip.Chainwork == 0 || tip.Chainwork <= localChainwork)
@@ -1241,14 +1255,17 @@ namespace Qado.Networking
                 if (peer == null || !peer.HandshakeOk)
                     continue;
 
-                string key = peer.SessionKey;
-                if (_requestsByPeerKey.ContainsKey(key))
+                string sessionKey = peer.SessionKey;
+                if (_requestsByPeerKey.ContainsKey(sessionKey))
                     continue;
 
-                if (_cooldownUntilByPeerKey.TryGetValue(key, out var until) && until > DateTime.UtcNow)
+                string historyKey = GetPeerHistoryKey(peer);
+                if (historyKey.Length != 0 &&
+                    _cooldownUntilByPeerKey.TryGetValue(historyKey, out var until) &&
+                    until > DateTime.UtcNow)
                     continue;
 
-                if (!_tipByPeerKey.TryGetValue(key, out var tip))
+                if (!_tipByPeerKey.TryGetValue(sessionKey, out var tip))
                     continue;
 
                 if (tip.Chainwork == 0 || tip.Chainwork <= localChainwork)
@@ -1258,7 +1275,7 @@ namespace Qado.Networking
                 if (anyPreferredEligible && !preferredSync)
                     continue;
 
-                var stats = GetOrCreatePeerSyncStats_NoLock(key);
+                var stats = GetOrCreatePeerSyncStats_NoLock(historyKey);
                 int latency = peer.LastLatencyMs >= 0 ? peer.LastLatencyMs : int.MaxValue;
                 int preferredWindowBlocks = preferredSync
                     ? Math.Max(BlockSyncProtocol.BatchMaxBlocks, Math.Min(BlockSyncProtocol.ExtendedSyncWindowBlocks, stats.PreferredWindowBlocks))
@@ -1422,6 +1439,7 @@ namespace Qado.Networking
 
         private PeerSyncStats GetOrCreatePeerSyncStats_NoLock(string peerKey)
         {
+            peerKey ??= string.Empty;
             if (!_peerSyncStatsByPeerKey.TryGetValue(peerKey, out var stats))
             {
                 stats = new PeerSyncStats();
@@ -1554,11 +1572,13 @@ namespace Qado.Networking
                 if (!SupportsPreferredHistoricalSync(peer))
                     continue;
 
-                string key = peer.SessionKey;
-                if (_cooldownUntilByPeerKey.TryGetValue(key, out var until) && until > DateTime.UtcNow)
+                string historyKey = GetPeerHistoryKey(peer);
+                if (historyKey.Length != 0 &&
+                    _cooldownUntilByPeerKey.TryGetValue(historyKey, out var until) &&
+                    until > DateTime.UtcNow)
                     continue;
 
-                if (!_tipByPeerKey.TryGetValue(key, out var tip) || tip.Chainwork <= localChainwork)
+                if (!_tipByPeerKey.TryGetValue(peer.SessionKey, out var tip) || tip.Chainwork <= localChainwork)
                     continue;
 
                 preferredAheadPeers++;
@@ -1577,7 +1597,7 @@ namespace Qado.Networking
             if (peer == null)
                 return;
 
-            var stats = GetOrCreatePeerSyncStats_NoLock(peer.SessionKey);
+            var stats = GetOrCreatePeerSyncStats_NoLock(GetPeerHistoryKey(peer));
             stats.CompletedWindows++;
             stats.ConsecutiveSuccesses++;
             stats.ConsecutiveTimeouts = 0;
@@ -1615,7 +1635,7 @@ namespace Qado.Networking
             if (peer == null)
                 return TimeoutCooldownShort;
 
-            var stats = GetOrCreatePeerSyncStats_NoLock(peer.SessionKey);
+            var stats = GetOrCreatePeerSyncStats_NoLock(GetPeerHistoryKey(peer));
             stats.TimeoutEvents++;
             stats.ConsecutiveTimeouts++;
             stats.ConsecutiveSuccesses = 0;
@@ -1633,6 +1653,33 @@ namespace Qado.Networking
                 2 => TimeoutCooldownMedium,
                 _ => PeerCooldown
             };
+        }
+
+        private TimeSpan RecordPipelineFailureAndGetCooldown_NoLock(PeerSession? peer, bool severe)
+        {
+            if (peer == null)
+                return severe ? TimeoutCooldownMedium : TimeoutCooldownShort;
+
+            var stats = GetOrCreatePeerSyncStats_NoLock(GetPeerHistoryKey(peer));
+            stats.ConsecutiveSuccesses = 0;
+            stats.ConsecutiveTimeouts = Math.Max(1, stats.ConsecutiveTimeouts);
+            stats.LastTimeoutUtc = DateTime.UtcNow;
+            stats.TimeoutStrikes = Math.Min(3, stats.TimeoutStrikes + 1);
+            stats.PreferredWindowBlocks = BlockSyncProtocol.BatchMaxBlocks;
+
+            return severe
+                ? stats.TimeoutStrikes switch
+                {
+                    <= 1 => TimeoutCooldownMedium,
+                    2 => PeerCooldown,
+                    _ => PeerCooldown
+                }
+                : stats.TimeoutStrikes switch
+                {
+                    <= 1 => TimeoutCooldownShort,
+                    2 => TimeoutCooldownMedium,
+                    _ => PeerCooldown
+                };
         }
 
         private void PruneCooldown_NoLock()
@@ -1736,7 +1783,7 @@ namespace Qado.Networking
             if (!SupportsPreferredHistoricalSync(peer))
                 return BlockSyncProtocol.BatchMaxBlocks;
 
-            var stats = GetOrCreatePeerSyncStats_NoLock(peer.SessionKey);
+            var stats = GetOrCreatePeerSyncStats_NoLock(GetPeerHistoryKey(peer));
             int preferred = stats.PreferredWindowBlocks;
             if (preferred < BlockSyncProtocol.BatchMaxBlocks)
                 preferred = BlockSyncProtocol.BatchMaxBlocks;
@@ -1839,6 +1886,17 @@ namespace Qado.Networking
             for (int i = 0; i < 32; i++)
                 diff |= left[i] ^ right[i];
             return diff == 0;
+        }
+
+        private static string GetPeerHistoryKey(PeerSession? peer)
+        {
+            if (peer == null)
+                return string.Empty;
+
+            if (!string.IsNullOrWhiteSpace(peer.RemoteBanKey))
+                return peer.RemoteBanKey;
+
+            return peer.SessionKey ?? string.Empty;
         }
 
         private void NoteProgress_NoLock(string reason)

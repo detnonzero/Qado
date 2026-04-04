@@ -2,6 +2,31 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+### Changed
+- Mainnet networking is currently operated in an IPv4-only mode for stability while the node converges toward a more robust production networking profile:
+  - IPv6 dialing/listening is disabled through `NetworkParams`
+  - mainnet bootstrap seeds were reduced to the IPv4 set
+  - the exchange API now binds on IPv4 only as well
+- Soak tooling was updated to behave more like a real mainnet node:
+  - soak runs now default to the built-in seed list plus normal peer exchange instead of a fixed custom bootstrap list
+  - soak output now captures richer readiness/convergence metrics for later analysis
+- Historical sync peer choice is less sticky after repeated failures:
+  - sync failure history and cooldowns now follow a stable peer history key instead of only the transient session endpoint
+  - pipeline failures such as prepare/reset/disconnect now contribute to sync cooldown/strike handling instead of only pure batch timeouts
+
+### Fixed
+- The block-sync planner is less likely to keep retrying effectively the same peer immediately after repeated failures or reconnect churn.
+- Parent/side-path recovery was made more convergence-focused without changing consensus:
+  - missing-parent recovery now keeps sender-first behavior but uses bounded backup peers earlier
+  - best-chain reevaluation now happens more aggressively after orphan promotion
+  - out-of-plan recovery can spread sooner across multiple peers
+  - bounded side-path recovery remains active even during historical sync instead of waiting entirely on lucky gossip
+
+### Notes
+- These changes are not released yet; they were introduced to harden mainnet convergence and to support additional soak testing before the next public release.
+
 ## [1.0.1] - 2026-03-31
 
 ### Added

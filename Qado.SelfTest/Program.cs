@@ -74,6 +74,8 @@ internal static class Program
         new TestCase("BlockSyncProtocol_Batches128Blocks", TestBlockSyncProtocolBatches128Blocks),
         new TestCase("HandshakeCapabilities_ExtendedPayloadKeepsLegacyCompatibility", TestHandshakeCapabilitiesExtendedPayloadKeepsLegacyCompatibility),
         new TestCase("P2PNode_DuplicateSessionPreference_UsesNodeIdTieBreak", TestP2PNodeDuplicateSessionPreferenceUsesNodeIdTieBreak),
+        new TestCase("P2PNode_ParentPackTargets_UseSenderFirstAndBoundedBackups", TestP2PNodeParentPackTargetsUseSenderFirstAndBoundedBackups),
+        new TestCase("BlockIngressFlow_PostPromotionReevaluatesBestKnownTip", TestBlockIngressFlowPostPromotionReevaluatesBestKnownTip),
         new TestCase("BlockSyncClient_ExtendedSyncWindow_Requests512ForCapablePeers", TestBlockSyncClientExtendedSyncWindowRequests512ForCapablePeers),
         new TestCase("BlockSyncClient_SyncWindowPreview_PipelinesNextPeerBeforeBatchEnd", TestBlockSyncClientSyncWindowPreviewPipelinesNextPeerBeforeBatchEnd),
         new TestCase("BlockSyncClient_FromHashContinuation_DoesNotRequireImmediatePrepare", TestBlockSyncClientFromHashContinuationDoesNotRequireImmediatePrepare),
@@ -84,10 +86,11 @@ internal static class Program
         new TestCase("BlockSyncClient_ActiveStallWatchdog_RevivesLocatorSync", TestBlockSyncClientActiveStallWatchdogRevivesLocatorSync),
         new TestCase("BlockSyncClient_ResetPipeline_ClearsCommitLoopLatch", TestBlockSyncClientResetPipelineClearsCommitLoopLatch),
         new TestCase("BlockSyncClient_ResumeHash_PrefersLocalTipWhenCommittedCursorIsStale", TestBlockSyncClientResumeHashPrefersLocalTipWhenCommittedCursorIsStale),
-        new TestCase("PeerDiscovery_HandlePeersPayload_StoresIpv6AndNormalizesMappedIpv4", TestPeerDiscoveryHandlePeersPayloadStoresIpv6AndNormalizesMappedIpv4),
+        new TestCase("PeerDiscovery_HandlePeersPayload_SkipsIpv6WhenDisabled_AndNormalizesMappedIpv4", TestPeerDiscoveryHandlePeersPayloadSkipsIpv6WhenDisabledAndNormalizesMappedIpv4),
         new TestCase("PeerDiscovery_BuildPeersPayload_LegacyPeerExcludesIpv6", TestPeerDiscoveryBuildPeersPayloadLegacyPeerExcludesIpv6),
-        new TestCase("PeerDiscovery_BuildPeersPayload_CapablePeerIncludesIpv6", TestPeerDiscoveryBuildPeersPayloadCapablePeerIncludesIpv6),
+        new TestCase("PeerDiscovery_BuildPeersPayload_CapablePeerSkipsIpv6WhenDisabled", TestPeerDiscoveryBuildPeersPayloadCapablePeerSkipsIpv6WhenDisabled),
         new TestCase("PeerDiscovery_BuildPeersPayload_MixesVerifiedAndUnverifiedRoutables", TestPeerDiscoveryBuildPeersPayloadMixesVerifiedAndUnverifiedRoutables),
+        new TestCase("PeerAddress_OrderDialAddresses_SkipsIpv6WhenDisabled", TestPeerAddressOrderDialAddressesSkipsIpv6WhenDisabled),
         new TestCase("BlockSyncServer_UsesCapabilityGatedBatchFrames", TestBlockSyncServerUsesCapabilityGatedBatchFrames),
         new TestCase("SmallNetSyncProtocol_RoundTripsCoreFrames", TestSmallNetSyncProtocolRoundTripsCoreFrames),
         new TestCase("SmallNetPeerState_ClassifiesGapPragmatically", TestSmallNetPeerStateClassifiesGapPragmatically),
@@ -104,11 +107,14 @@ internal static class Program
         new TestCase("BlockIngressFlow_AlreadyBufferedOrphanDoesNotReRequestParent", TestBlockIngressFlowAlreadyBufferedOrphanDoesNotReRequestParent),
         new TestCase("BlockIngressFlow_LiveUnknownParentDefersUntilRecoveryArmed", TestBlockIngressFlowLiveUnknownParentDefersUntilRecoveryArmed),
         new TestCase("BlockIngressFlow_LiveFarBehindKnownParentDefersWithoutPersist", TestBlockIngressFlowLiveFarBehindKnownParentDefersWithoutPersist),
-        new TestCase("BlockIngressFlow_RecoveryOrphanDuringActiveSyncSkipsFastParentChase", TestBlockIngressFlowRecoveryOrphanDuringActiveSyncSkipsFastParentChase),
+        new TestCase("BlockIngressFlow_RecoveryOrphanDuringActiveSyncKeepsBoundedSidePathRecovery", TestBlockIngressFlowRecoveryOrphanDuringActiveSyncKeepsBoundedSidePathRecovery),
         new TestCase("ValidationWorker_PrioritizesLivePush", TestValidationWorkerPrioritizesLivePush),
         new TestCase("BlockDownloadManager_RequestsRecoveryViaAncestorPack", TestBlockDownloadManagerRequestsRecoveryViaAncestorPack),
+        new TestCase("BlockDownloadManager_ParallelizesRecoveryAcrossPeers", TestBlockDownloadManagerParallelizesRecoveryAcrossPeers),
         new TestCase("BlockSyncClient_TipStateStartsSyncWithoutLegacyGetTip", TestBlockSyncClientTipStateStartsSyncWithoutLegacyGetTip),
         new TestCase("BlockSyncClient_PrefersHigherChainworkOverHeight", TestBlockSyncClientPrefersHigherChainworkOverHeight),
+        new TestCase("BlockSyncClient_ReconnectedPeerInheritsCooldownByBanKey", TestBlockSyncClientReconnectedPeerInheritsCooldownByBanKey),
+        new TestCase("BlockSyncClient_ReconnectedPeerRetainsFailureBiasAfterCooldown", TestBlockSyncClientReconnectedPeerRetainsFailureBiasAfterCooldown),
         new TestCase("BlockSyncClient_MoreAvailable_ContinuesFromLastCommittedSyncPoint", TestBlockSyncClientMoreAvailableContinuesFromLastCommittedSyncPoint),
         new TestCase("BlockSyncClient_RemoteTipLatch_SuppressesDuplicateFinishContinuation", TestBlockSyncClientRemoteTipLatchSuppressesDuplicateFinishContinuation),
         new TestCase("BlockSyncClient_StaleBatchEndBeforeStart_IsIgnored", TestBlockSyncClientStaleBatchEndBeforeStartIsIgnored),
@@ -1482,7 +1488,63 @@ internal static class Program
         }
     }
 
-    private static void TestPeerDiscoveryHandlePeersPayloadStoresIpv6AndNormalizesMappedIpv4()
+    private static void TestP2PNodeParentPackTargetsUseSenderFirstAndBoundedBackups()
+    {
+        var mempool = new MempoolManager(
+            senderHex => StateStore.GetBalanceU64(senderHex),
+            senderHex => StateStore.GetNonceU64(senderHex),
+            log: null);
+        var node = new P2PNode(mempool, log: null);
+
+        try
+        {
+            MethodInfo getTargets = typeof(P2PNode).GetMethod("GetParentPackRequestTargets", BindingFlags.Instance | BindingFlags.NonPublic)
+                ?? throw new InvalidOperationException("GetParentPackRequestTargets reflection lookup failed");
+            FieldInfo sessionsField = typeof(P2PNode).GetField("_sessions", BindingFlags.Instance | BindingFlags.NonPublic)
+                ?? throw new InvalidOperationException("_sessions reflection lookup failed");
+
+            var primary = CreateFakePeer("peer-primary");
+            primary.LastLatencyMs = 75;
+
+            var modernFast = CreateFakePeer(
+                "peer-modern-fast",
+                HandshakeCapabilities.BlocksBatchData |
+                HandshakeCapabilities.ExtendedSyncWindow |
+                HandshakeCapabilities.SyncWindowPreview);
+            modernFast.LastLatencyMs = 10;
+
+            var modernSlow = CreateFakePeer(
+                "peer-modern-slow",
+                HandshakeCapabilities.BlocksBatchData |
+                HandshakeCapabilities.ExtendedSyncWindow);
+            modernSlow.LastLatencyMs = 90;
+
+            var legacyFast = CreateFakePeer("peer-legacy-fast");
+            legacyFast.LastLatencyMs = 5;
+
+            object sessions = sessionsField.GetValue(node)
+                ?? throw new InvalidOperationException("_sessions value lookup failed");
+            MethodInfo tryAdd = sessions.GetType().GetMethod("TryAdd")
+                ?? throw new InvalidOperationException("_sessions.TryAdd reflection lookup failed");
+
+            _ = (bool)tryAdd.Invoke(sessions, new object[] { primary.RemoteEndpoint, primary })!;
+            _ = (bool)tryAdd.Invoke(sessions, new object[] { modernFast.RemoteEndpoint, modernFast })!;
+            _ = (bool)tryAdd.Invoke(sessions, new object[] { modernSlow.RemoteEndpoint, modernSlow })!;
+            _ = (bool)tryAdd.Invoke(sessions, new object[] { legacyFast.RemoteEndpoint, legacyFast })!;
+
+            var targets = ((IReadOnlyList<PeerSession>)getTargets.Invoke(node, new object[] { primary, 3 })!).ToArray();
+            Assert(targets.Length == 3, $"parent recovery must stay bounded to three peers, got {targets.Length}");
+            Assert(ReferenceEquals(targets[0], primary), "parent recovery must keep the sender as the first target");
+            Assert(ReferenceEquals(targets[1], modernFast), "capable low-latency backup should be chosen before weaker peers");
+            Assert(ReferenceEquals(targets[2], modernSlow), "bounded backup set should prefer another capable peer before a legacy fallback");
+        }
+        finally
+        {
+            node.Stop();
+        }
+    }
+
+    private static void TestPeerDiscoveryHandlePeersPayloadSkipsIpv6WhenDisabledAndNormalizesMappedIpv4()
     {
         const string ipv6 = "2001:4860:4860::8888";
         const string mappedIpv4 = "::ffff:93.184.216.34";
@@ -1528,7 +1590,7 @@ internal static class Program
             cmd.Parameters.AddWithValue("$ipv4", normalizedIpv4);
             cmd.Parameters.AddWithValue("$port4", port4);
             long matches = Convert.ToInt64(cmd.ExecuteScalar() ?? 0L);
-            Assert(matches == 2L, $"expected both IPv6 and normalized IPv4 peers to be stored, got {matches}");
+            Assert(matches == 1L, $"expected IPv6 peer to be skipped and mapped IPv4 peer to be stored, got {matches}");
         }
     }
 
@@ -1567,7 +1629,7 @@ internal static class Program
         }
     }
 
-    private static void TestPeerDiscoveryBuildPeersPayloadCapablePeerIncludesIpv6()
+    private static void TestPeerDiscoveryBuildPeersPayloadCapablePeerSkipsIpv6WhenDisabled()
     {
         var mempool = new MempoolManager(
             senderHex => StateStore.GetBalanceU64(senderHex),
@@ -1594,8 +1656,8 @@ internal static class Program
 
             Assert(peers.Any(p => string.Equals(p.ip, ipv4, StringComparison.OrdinalIgnoreCase) && p.port == port4),
                 "capable PEX payload must include IPv4 peer");
-            Assert(peers.Any(p => string.Equals(NormalizePeerHostForTest(p.ip), NormalizePeerHostForTest(ipv6), StringComparison.OrdinalIgnoreCase) && p.port == port6),
-                "capable PEX payload must include IPv6 peer");
+            Assert(!peers.Any(p => string.Equals(NormalizePeerHostForTest(p.ip), NormalizePeerHostForTest(ipv6), StringComparison.OrdinalIgnoreCase) && p.port == port6),
+                "capable PEX payload must skip IPv6 peer while IPv6 is disabled");
         }
         finally
         {
@@ -2463,6 +2525,112 @@ internal static class Program
         Assert(BytesEqual(promotedParent, parent.BlockHash!), "accepted parent must trigger orphan promotion callback");
     }
 
+    private static void TestBlockIngressFlowPostPromotionReevaluatesBestKnownTip()
+    {
+        var peer = CreateFakePeer("peer-ingress-post-promotion");
+        var mempool = new MempoolManager(
+            senderHex => StateStore.GetBalanceU64(senderHex),
+            senderHex => StateStore.GetNonceU64(senderHex),
+            log: null);
+        var log = new ListLogSink();
+
+        var genesis = BlockStore.GetBlockByHeight(0) ?? throw new InvalidOperationException("missing genesis block");
+        var genesisHash = genesis.BlockHash ?? throw new InvalidOperationException("missing genesis hash");
+        var canonicalMiner = KeyGenerator.GenerateKeypairHex();
+        var canonical1 = BuildLooseMinedBlock(
+            height: 1UL,
+            prevHash: genesisHash,
+            timestamp: genesis.Header!.Timestamp + 61UL,
+            minerPubHex: canonicalMiner.pubHex);
+        BlockPersistHelper.Persist(canonical1);
+        var canonical2 = BuildLooseMinedBlock(
+            height: 2UL,
+            prevHash: canonical1.BlockHash!,
+            timestamp: canonical1.Header!.Timestamp + 61UL,
+            minerPubHex: canonicalMiner.pubHex);
+        BlockPersistHelper.Persist(canonical2);
+
+        var branchMiner = KeyGenerator.GenerateKeypairHex();
+
+        var branch1 = BuildLooseMinedBlock(
+            height: 1UL,
+            prevHash: genesisHash,
+            timestamp: genesis.Header!.Timestamp + 62UL,
+            minerPubHex: branchMiner.pubHex);
+        var branch2 = BuildLooseMinedBlock(
+            height: 2UL,
+            prevHash: branch1.BlockHash!,
+            timestamp: branch1.Header!.Timestamp + 61UL,
+            minerPubHex: branchMiner.pubHex);
+        var branch3 = BuildLooseMinedBlock(
+            height: 3UL,
+            prevHash: branch2.BlockHash!,
+            timestamp: branch2.Header!.Timestamp + 61UL,
+            minerPubHex: branchMiner.pubHex);
+
+        var client = CreateNoopBlockSyncClient(peer, 0UL, canonical2.BlockHash!);
+        var downloadManager = new BlockDownloadManager(
+            sessionSnapshot: () => new[] { peer },
+            sendFrameAsync: (_, _, _, _) => Task.CompletedTask,
+            haveBlock: _ => false,
+            enqueueValidator: _ => true,
+            revalidateStoredBlock: _ => { },
+            log: log);
+        var flow = new BlockIngressFlow(
+            blockDownloadManager: downloadManager,
+            blockSyncClient: client,
+            mempool: mempool,
+            getPeerKey: targetPeer => targetPeer.SessionKey,
+            allowInboundBlock: _ => true,
+            shouldRequestMissingHeaderResync: () => false,
+            requestSyncNow: _ => { },
+            tryStoreOrphan: (byte[] _, Block _, PeerSession _, string _, BlockIngressKind _, out string reason) =>
+            {
+                reason = string.Empty;
+                return true;
+            },
+            requestParentFromPeer: (_, _, _) => { },
+            markStoredBlockInvalid: (_, _, _) => { },
+            passesSidechainAdmission: (Block _, byte[]? _, ulong _, int _, out string reason) =>
+            {
+                reason = string.Empty;
+                return true;
+            },
+            logKnownBlockAlready: _ => { },
+            notifyUiAfterAcceptedBlock: () => { },
+            relayValidatedBlockAsync: (_, _, _) => Task.CompletedTask,
+            promoteOrphansForParentAsync: (_, _, _) =>
+            {
+                lock (Db.Sync)
+                {
+                    using var tx = Db.Connection.BeginTransaction();
+                    BlockStore.SaveBlock(branch2, tx, BlockIndexStore.StatusHaveBlockPayload);
+                    BlockStore.SaveBlock(branch3, tx, BlockIndexStore.StatusHaveBlockPayload);
+                    tx.Commit();
+                }
+
+                return Task.CompletedTask;
+            },
+            log: log);
+
+        flow.HandleBlockAsync(SerializeBlock(branch1), peer, CancellationToken.None, BlockIngressKind.LivePush, enforceRateLimitOverride: null)
+            .GetAwaiter().GetResult();
+
+        Assert(BlockStore.GetLatestHeight() == 3UL, "post-promotion reevaluation must adopt the stronger promoted branch tip");
+        Assert(BytesEqual(
+                BlockStore.GetCanonicalHashAtHeight(1UL) ?? throw new InvalidOperationException("missing canonical hash at height 1"),
+                branch1.BlockHash!),
+            "post-promotion reevaluation must reorg canonical height 1 onto the promoted branch");
+        Assert(BytesEqual(
+                BlockStore.GetCanonicalHashAtHeight(2UL) ?? throw new InvalidOperationException("missing canonical hash at height 2"),
+                branch2.BlockHash!),
+            "post-promotion reevaluation must pull the promoted height 2 block into canonical");
+        Assert(BytesEqual(
+                BlockStore.GetCanonicalHashAtHeight(3UL) ?? throw new InvalidOperationException("missing canonical hash at height 3"),
+                branch3.BlockHash!),
+            "post-promotion reevaluation must pull the promoted height 3 block into canonical");
+    }
+
     private static void TestBlockIngressFlowAlreadyBufferedOrphanDoesNotReRequestParent()
     {
         var peer = CreateFakePeer("peer-ingress-orphan-duplicate");
@@ -2667,7 +2835,7 @@ internal static class Program
             $"expected defer log for far-behind live sidechain, logs={string.Join(" || ", log.Lines)}");
     }
 
-    private static void TestBlockIngressFlowRecoveryOrphanDuringActiveSyncSkipsFastParentChase()
+    private static void TestBlockIngressFlowRecoveryOrphanDuringActiveSyncKeepsBoundedSidePathRecovery()
     {
         var peer = CreateFakePeer("peer-ingress-recovery-active-sync");
         var mempool = new MempoolManager(
@@ -2732,9 +2900,9 @@ internal static class Program
             .GetAwaiter().GetResult();
 
         Assert(orphanStores == 1, $"recovery orphan should still be buffered once, got {orphanStores}");
-        Assert(parentRequests == 0, $"active historical sync must skip direct parent-pack chase, got {parentRequests}");
+        Assert(parentRequests == 1, $"active historical sync should keep one direct parent-pack chase alive, got {parentRequests}");
         Assert(syncRequests == 0, $"active historical sync must not trigger nested resync for recovery orphan, got {syncRequests}");
-        Assert(!downloadManager.IsOutOfPlanFallbackHash(missingParentHash), "recovery orphan during active sync must not arm fallback side-path work");
+        Assert(downloadManager.IsOutOfPlanFallbackHash(missingParentHash), "recovery orphan during active sync should arm bounded fallback side-path work");
     }
 
     private static void TestValidationWorkerPrioritizesLivePush()
@@ -2813,6 +2981,92 @@ internal static class Program
         }
     }
 
+    private static void TestPeerAddressOrderDialAddressesSkipsIpv6WhenDisabled()
+    {
+        Assert(!NetworkParams.EnableIpv6, "test expects IPv6 to be disabled in NetworkParams");
+
+        Type peerAddressType = typeof(P2PNode).Assembly.GetType("Qado.Networking.PeerAddress")
+            ?? throw new InvalidOperationException("PeerAddress reflection lookup failed");
+        MethodInfo orderDialAddresses = peerAddressType.GetMethod("OrderDialAddresses", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("PeerAddress.OrderDialAddresses reflection lookup failed");
+
+        var ordered = (IReadOnlyList<IPAddress>)orderDialAddresses.Invoke(null, new object[]
+        {
+            new[]
+            {
+                IPAddress.Parse("2001:4860:4860::8888"),
+                IPAddress.Parse("93.184.216.44")
+            }
+        })!;
+
+        Assert(ordered.Count == 1, $"expected only IPv4 dial address when IPv6 is disabled, got {ordered.Count}");
+        Assert(ordered[0].AddressFamily == AddressFamily.InterNetwork, "ordered dial addresses should retain only IPv4 entries");
+        Assert(string.Equals(ordered[0].ToString(), "93.184.216.44", StringComparison.Ordinal), "unexpected IPv4 address ordering result");
+    }
+
+    private static void TestBlockDownloadManagerParallelizesRecoveryAcrossPeers()
+    {
+        var peer1 = CreateFakePeer("recovery-parallel-peer-1");
+        peer1.LastLatencyMs = 5;
+        peer1.LastLatencyUpdatedUtc = DateTime.UtcNow;
+
+        var peer2 = CreateFakePeer("recovery-parallel-peer-2");
+        peer2.LastLatencyMs = 15;
+        peer2.LastLatencyUpdatedUtc = DateTime.UtcNow;
+
+        byte[] wanted1 = HashFromU64(881UL);
+        byte[] wanted2 = HashFromU64(882UL);
+        var sent = new List<(string peer, MsgType type, byte[] payload)>();
+        using var requested = new ManualResetEventSlim(false);
+
+        using var manager = new BlockDownloadManager(
+            sessionSnapshot: () => new[] { peer1, peer2 },
+            sendFrameAsync: (peer, type, payload, ct) =>
+            {
+                lock (sent)
+                {
+                    sent.Add((peer.SessionKey, type, (byte[])payload.Clone()));
+                    if (sent.Count >= 2)
+                        requested.Set();
+                }
+
+                return Task.CompletedTask;
+            },
+            haveBlock: _ => false,
+            enqueueValidator: _ => true,
+            revalidateStoredBlock: _ => { },
+            log: null);
+
+        Assert(manager.QueueOutOfPlanFallback(wanted1, "selftest-parallel-1") == 1, "first recovery hash was not queued");
+        Assert(manager.QueueOutOfPlanFallback(wanted2, "selftest-parallel-2") == 1, "second recovery hash was not queued");
+        manager.Start(CancellationToken.None);
+        manager.OnPeerReady(peer1);
+        manager.OnPeerReady(peer2);
+
+        Assert(requested.Wait(TimeSpan.FromSeconds(10)), "queued recovery hashes were not dispatched across multiple peers");
+
+        lock (sent)
+        {
+            Assert(sent.Count >= 2, $"expected at least two recovery requests, got {sent.Count}");
+            Assert(sent[0].type == MsgType.GetAncestorPack, "first recovery request must use GetAncestorPack");
+            Assert(sent[1].type == MsgType.GetAncestorPack, "second recovery request must use GetAncestorPack");
+            Assert(!string.Equals(sent[0].peer, sent[1].peer, StringComparison.Ordinal), "parallel recovery should use a backup peer instead of waiting on the first peer");
+
+            Assert(SmallNetSyncProtocol.TryParseGetAncestorPack(sent[0].payload, out var frame1), "first ancestor-pack request did not parse");
+            Assert(SmallNetSyncProtocol.TryParseGetAncestorPack(sent[1].payload, out var frame2), "second ancestor-pack request did not parse");
+            Assert(frame1.MaxBlocks == 1, $"expected single-block recovery request for first frame, got {frame1.MaxBlocks}");
+            Assert(frame2.MaxBlocks == 1, $"expected single-block recovery request for second frame, got {frame2.MaxBlocks}");
+
+            var requestedHashes = new HashSet<string>(StringComparer.Ordinal)
+            {
+                Convert.ToHexString(frame1.StartHash),
+                Convert.ToHexString(frame2.StartHash)
+            };
+            Assert(requestedHashes.Contains(Convert.ToHexString(wanted1)), "parallel recovery must include the first wanted hash");
+            Assert(requestedHashes.Contains(Convert.ToHexString(wanted2)), "parallel recovery must include the second wanted hash");
+        }
+    }
+
     private static void TestBlockSyncClientPrefersHigherChainworkOverHeight()
     {
         byte[] localTip = HashFromU64(100UL);
@@ -2857,6 +3111,121 @@ internal static class Program
         Assert(sent.Count == 1, $"expected one sync request after lowering local chainwork, got {sent.Count}");
         Assert(sent[0].peer == peerStrong.SessionKey, "client must prefer the higher-chainwork peer even at lower height");
         Assert(sent[0].type == MsgType.GetBlocksByLocator, "initial sync request must use locator-based sync");
+    }
+
+    private static void TestBlockSyncClientReconnectedPeerInheritsCooldownByBanKey()
+    {
+        byte[] localTip = HashFromU64(100UL);
+        UInt128 localChainwork = 1_000UL;
+        var sent = new List<(string peer, MsgType type)>();
+        var sessions = new List<PeerSession>();
+
+        var peerA1 = CreateFakePeer("peer-a-session-1");
+        peerA1.RemoteBanKey = "peer-a";
+        sessions.Add(peerA1);
+
+        var client = new BlockSyncClient(
+            sessionSnapshot: () => sessions.ToArray(),
+            sendFrameAsync: (peer, type, payload, ct) =>
+            {
+                sent.Add((peer.SessionKey, type));
+                return Task.CompletedTask;
+            },
+            getLocalTipChainwork: () => localChainwork,
+            getLocalTipHash: () => (byte[])localTip.Clone(),
+            prepareBatchAsync: (startHash, startHeight, advertisedTipChainwork, peer, ct) =>
+                Task.FromResult(new BlockSyncPrepareResult(true, string.Empty)),
+            commitBlocksAsync: (payloads, height, prevHash, peer, ct) =>
+                Task.FromResult(new BlockSyncCommitResult(true, HashFromU64(height + (ulong)payloads.Count - 1UL), string.Empty)),
+            completeBatchAsync: (peer, status, ct) => Task.CompletedTask,
+            abortBatchAsync: (peer, reason, ct) => Task.CompletedTask,
+            log: null);
+
+        byte[] tipHash = HashFromU64(250UL);
+        var tipState = new SmallNetTipStateFrame(250UL, tipHash, 2_500UL, null, new[] { HashFromU64(249UL), tipHash });
+
+        client.OnTipStateAsync(peerA1, tipState, CancellationToken.None).GetAwaiter().GetResult();
+        Assert(sent.Count == 1, $"expected initial sync request to first session, got {sent.Count}");
+        Assert(sent[0].peer == peerA1.SessionKey, "initial request must target first peer session");
+
+        client.OnNoCommonAncestorAsync(peerA1, CancellationToken.None).GetAwaiter().GetResult();
+
+        var peerA2 = CreateFakePeer("peer-a-session-2");
+        peerA2.RemoteBanKey = "peer-a";
+        sessions.Clear();
+        sessions.Add(peerA2);
+
+        client.OnTipStateAsync(peerA2, tipState, CancellationToken.None).GetAwaiter().GetResult();
+
+        Assert(sent.Count == 1,
+            $"reconnected peer with same ban key should stay on cooldown instead of being retried immediately; got {sent.Count} sends");
+    }
+
+    private static void TestBlockSyncClientReconnectedPeerRetainsFailureBiasAfterCooldown()
+    {
+        byte[] localTip = HashFromU64(100UL);
+        UInt128 localChainwork = 1_000UL;
+        var sent = new List<(string peer, MsgType type)>();
+        var sessions = new List<PeerSession>();
+
+        var peerA1 = CreateFakePeer("peer-a-session-1");
+        peerA1.RemoteBanKey = "peer-a";
+        sessions.Add(peerA1);
+
+        var client = new BlockSyncClient(
+            sessionSnapshot: () => sessions.ToArray(),
+            sendFrameAsync: (peer, type, payload, ct) =>
+            {
+                sent.Add((peer.SessionKey, type));
+                return Task.CompletedTask;
+            },
+            getLocalTipChainwork: () => localChainwork,
+            getLocalTipHash: () => (byte[])localTip.Clone(),
+            prepareBatchAsync: (startHash, startHeight, advertisedTipChainwork, peer, ct) =>
+                Task.FromResult(new BlockSyncPrepareResult(true, string.Empty)),
+            commitBlocksAsync: (payloads, height, prevHash, peer, ct) =>
+                Task.FromResult(new BlockSyncCommitResult(true, HashFromU64(height + (ulong)payloads.Count - 1UL), string.Empty)),
+            completeBatchAsync: (peer, status, ct) => Task.CompletedTask,
+            abortBatchAsync: (peer, reason, ct) => Task.CompletedTask,
+            log: null);
+
+        byte[] tipHash = HashFromU64(250UL);
+        var tipState = new SmallNetTipStateFrame(250UL, tipHash, 2_500UL, null, new[] { HashFromU64(249UL), tipHash });
+
+        client.OnTipStateAsync(peerA1, tipState, CancellationToken.None).GetAwaiter().GetResult();
+        Assert(sent.Count == 1, $"expected initial sync request to first session, got {sent.Count}");
+
+        client.OnNoCommonAncestorAsync(peerA1, CancellationToken.None).GetAwaiter().GetResult();
+
+        FieldInfo cooldownField = typeof(BlockSyncClient).GetField("_cooldownUntilByPeerKey", BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("BlockSyncClient cooldown dictionary reflection lookup failed");
+        var cooldownByPeer = (Dictionary<string, DateTime>)cooldownField.GetValue(client)!;
+        cooldownByPeer.Clear();
+
+        FieldInfo planningReadyField = typeof(BlockSyncClient).GetField("_planningReady", BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("BlockSyncClient planningReady reflection lookup failed");
+        planningReadyField.SetValue(client, false);
+
+        var peerA2 = CreateFakePeer("peer-a-session-2");
+        peerA2.RemoteBanKey = "peer-a";
+        var peerB = CreateFakePeer("peer-b-session-1");
+        peerB.RemoteBanKey = "peer-b";
+
+        sessions.Clear();
+        sessions.Add(peerA2);
+        sessions.Add(peerB);
+
+        client.OnTipStateAsync(peerA2, tipState, CancellationToken.None).GetAwaiter().GetResult();
+        client.OnTipStateAsync(peerB, tipState, CancellationToken.None).GetAwaiter().GetResult();
+
+        planningReadyField.SetValue(client, true);
+        MethodInfo ensureMethod = typeof(BlockSyncClient).GetMethod("EnsurePipelineAsync", BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("BlockSyncClient EnsurePipelineAsync reflection lookup failed");
+        ((Task)ensureMethod.Invoke(client, new object[] { CancellationToken.None })!).GetAwaiter().GetResult();
+
+        Assert(sent.Count >= 2, $"expected a replacement sync request after reconnect, got {sent.Count}");
+        Assert(sent[^1].peer == peerB.SessionKey,
+            "peer selection should prefer a fresh peer over a reconnected peer with prior sync failures");
     }
 
     private static void TestBlockSyncClientTipStateStartsSyncWithoutLegacyGetTip()
