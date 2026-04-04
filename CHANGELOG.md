@@ -14,7 +14,7 @@ All notable changes to this project are documented in this file.
   - soak output now captures richer readiness/convergence metrics for later analysis
 - Historical sync peer choice is less sticky after repeated failures:
   - sync failure history and cooldowns now follow a stable peer history key instead of only the transient session endpoint
-  - pipeline failures such as prepare/reset/disconnect now contribute to sync cooldown/strike handling instead of only pure batch timeouts
+  - pipeline failures such as prepare/reset/disconnect now contribute to sync cooldown handling instead of only pure batch timeouts
 
 ### Fixed
 - The block-sync planner is less likely to keep retrying effectively the same peer immediately after repeated failures or reconnect churn.
