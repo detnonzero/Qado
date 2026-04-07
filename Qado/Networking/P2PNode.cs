@@ -65,6 +65,7 @@ namespace Qado.Networking
         private static readonly TimeSpan OrphanPeerInitialCooldown = TimeSpan.FromSeconds(15);
         private static readonly TimeSpan OrphanPeerMaxCooldown = TimeSpan.FromSeconds(60);
         private static readonly TimeSpan KnownBlockLogCooldown = TimeSpan.FromSeconds(60);
+        private static readonly TimeSpan KnownBlockCatchupLogWindow = TimeSpan.FromSeconds(15);
         private const int MaxKnownBlockLogEntries = 4096;
         private static readonly TimeSpan ValidationQueueFullLogWindow = TimeSpan.FromSeconds(10);
         private static readonly TimeSpan ParentPackBenignFailureLogWindow = TimeSpan.FromSeconds(15);
@@ -131,6 +132,8 @@ namespace Qado.Networking
         private readonly Dictionary<string, PeerOrphanCooldownState> _peerOrphanCooldowns = new(StringComparer.Ordinal);
         private readonly object _knownBlockLogGate = new();
         private readonly Dictionary<string, DateTime> _knownBlockLogByHash = new(StringComparer.Ordinal);
+        private DateTime _nextKnownBlockCatchupLogUtc = DateTime.MinValue;
+        private int _knownBlockCatchupSuppressed;
         private readonly object _validationQueueLogGate = new();
         private DateTime _lastLiveQueueFullLogUtc = DateTime.MinValue;
         private int _liveQueueFullSuppressed;
@@ -3236,6 +3239,35 @@ namespace Qado.Networking
 
         private void LogKnownBlockAlready(byte[] blockHash)
         {
+            if (IsInitialBlockSyncActive && HasBetterPeerTipThanLocal)
+            {
+                bool shouldLogCatchup = false;
+                int suppressedCount = 0;
+                var catchupNow = DateTime.UtcNow;
+
+                lock (_knownBlockLogGate)
+                {
+                    _knownBlockCatchupSuppressed++;
+                    if (catchupNow >= _nextKnownBlockCatchupLogUtc)
+                    {
+                        _nextKnownBlockCatchupLogUtc = catchupNow + KnownBlockCatchupLogWindow;
+                        suppressedCount = _knownBlockCatchupSuppressed;
+                        _knownBlockCatchupSuppressed = 0;
+                        shouldLogCatchup = true;
+                    }
+                }
+
+                if (shouldLogCatchup)
+                {
+                    _log?.Info("P2P",
+                        suppressedCount <= 1
+                            ? "Block already known (catch-up tail)."
+                            : $"Block already known (catch-up tail) x{suppressedCount}.");
+                }
+
+                return;
+            }
+
             if (blockHash is not { Length: 32 })
             {
                 _log?.Info("P2P", "Block already known.");

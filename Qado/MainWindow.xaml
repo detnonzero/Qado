@@ -191,8 +191,11 @@
                                   Grid.Row="1"
                                   SelectionMode="Extended"
                                   MouseDoubleClick="BlocksListView_MouseDoubleClick"
+                                  ScrollViewer.CanContentScroll="True"
                                   ScrollViewer.VerticalScrollBarVisibility="Auto"
-                                  ScrollViewer.HorizontalScrollBarVisibility="Auto">
+                                  ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                                  VirtualizingPanel.IsVirtualizing="True"
+                                  VirtualizingPanel.VirtualizationMode="Recycling">
                             <ListView.View>
                                 <GridView>
                                     <GridViewColumn Header="Height" DisplayMemberBinding="{Binding Height}" Width="90"/>

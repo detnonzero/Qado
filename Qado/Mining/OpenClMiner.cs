@@ -14,6 +14,14 @@ using Qado.Storage;
 
 namespace Qado.Mining
 {
+    public readonly record struct MiningGateState(bool Allowed, string Reason)
+    {
+        public static MiningGateState Open => new(true, string.Empty);
+
+        public static MiningGateState Closed(string reason)
+            => new(false, string.IsNullOrWhiteSpace(reason) ? "mining gate closed" : reason.Trim());
+    }
+
     public sealed class OpenClMiner : IDisposable
     {
         private const int HashBatchSize = 256_000_000;
@@ -26,6 +34,7 @@ namespace Qado.Mining
         private readonly Action<Block> _onBlockAccepted;
         private readonly Action? _onTemplateStarted;
         private readonly Action<long> _onHashesCompleted;
+        private readonly Func<MiningGateState>? _getMiningGateState;
         private readonly ILogSink? _log;
         private readonly string _tuningProfileName;
         private readonly int[] _preferredLocalWorkSizes;
@@ -58,6 +67,7 @@ namespace Qado.Mining
         private int _configuredLocalWorkSize;
         private bool _initialized;
         private bool _disposed;
+        private string _lastGatePauseReason = string.Empty;
 
         public OpenClMiner(
             OpenClMiningDevice device,
@@ -67,7 +77,8 @@ namespace Qado.Mining
             Action<Block> onBlockAccepted,
             Action? onTemplateStarted,
             Action<long> onHashesCompleted,
-            ILogSink? log = null)
+            ILogSink? log = null,
+            Func<MiningGateState>? getMiningGateState = null)
         {
             _device = device ?? throw new ArgumentNullException(nameof(device));
             _getReadyTransactions = getReadyTransactions ?? throw new ArgumentNullException(nameof(getReadyTransactions));
@@ -76,6 +87,7 @@ namespace Qado.Mining
             _onTemplateStarted = onTemplateStarted;
             _onHashesCompleted = onHashesCompleted ?? throw new ArgumentNullException(nameof(onHashesCompleted));
             _log = log;
+            _getMiningGateState = getMiningGateState;
 
             var profile = ResolveTuningProfile(device);
             _tuningProfileName = profile.ProfileName;
@@ -109,7 +121,8 @@ namespace Qado.Mining
             Action? onTemplateStarted,
             Action<long> onHashesCompleted,
             ILogSink? log,
-            bool treatKeyAsPublic)
+            bool treatKeyAsPublic,
+            Func<MiningGateState>? getMiningGateState = null)
         {
             _device = device ?? throw new ArgumentNullException(nameof(device));
             _getReadyTransactions = getReadyTransactions ?? throw new ArgumentNullException(nameof(getReadyTransactions));
@@ -118,6 +131,7 @@ namespace Qado.Mining
             _onTemplateStarted = onTemplateStarted;
             _onHashesCompleted = onHashesCompleted ?? throw new ArgumentNullException(nameof(onHashesCompleted));
             _log = log;
+            _getMiningGateState = getMiningGateState;
 
             var profile = ResolveTuningProfile(device);
             _tuningProfileName = profile.ProfileName;
@@ -155,6 +169,7 @@ namespace Qado.Mining
                 while (true)
                 {
                     token.ThrowIfCancellationRequested();
+                    WaitForMiningGateOpen(token);
 
                     var txs = _getReadyTransactions() ?? new List<Transaction>(0);
 
@@ -254,6 +269,13 @@ namespace Qado.Mining
                 long nowTick = Stopwatch.GetTimestamp();
                 if (nowTick >= nextMaintenanceTick)
                 {
+                    var gateState = GetMiningGateState();
+                    if (!gateState.Allowed)
+                    {
+                        _log?.Info("Mining", $"Aborted: {gateState.Reason}.");
+                        return false;
+                    }
+
                     ulong curTipHeight = BlockStore.GetLatestHeight();
                     if (curTipHeight != tipHeight)
                     {
@@ -301,6 +323,47 @@ namespace Qado.Mining
             }
 
             return false;
+        }
+
+        private void WaitForMiningGateOpen(CancellationToken token)
+        {
+            while (true)
+            {
+                token.ThrowIfCancellationRequested();
+
+                var gateState = GetMiningGateState();
+                if (gateState.Allowed)
+                {
+                    if (!string.IsNullOrWhiteSpace(_lastGatePauseReason))
+                    {
+                        _log?.Info("Mining", $"Resumed: {_lastGatePauseReason} cleared.");
+                        _lastGatePauseReason = string.Empty;
+                    }
+
+                    return;
+                }
+
+                if (!string.Equals(_lastGatePauseReason, gateState.Reason, StringComparison.Ordinal))
+                {
+                    _lastGatePauseReason = gateState.Reason;
+                    _log?.Info("Mining", $"Paused: {gateState.Reason}.");
+                }
+
+                Task.Delay(TimeSpan.FromSeconds(1), token).Wait(token);
+            }
+        }
+
+        private MiningGateState GetMiningGateState()
+        {
+            try
+            {
+                return _getMiningGateState?.Invoke() ?? MiningGateState.Open;
+            }
+            catch (Exception ex)
+            {
+                _log?.Warn("Mining", $"Mining gate callback failed: {ex.Message}");
+                return MiningGateState.Closed("mining gate callback failure");
+            }
         }
 
         private static byte[] ParseMinerPublicKeyHex(string minerPublicKeyHex)

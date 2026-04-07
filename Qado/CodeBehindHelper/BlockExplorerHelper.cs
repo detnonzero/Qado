@@ -1,10 +1,12 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Numerics;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
 using Qado.Blockchain;
+using Qado.Serialization;
 using Qado.Storage;
 using Qado.Utils;
 
@@ -12,6 +14,20 @@ namespace Qado.CodeBehindHelper
 {
     public static class BlockExplorerHelper
     {
+        public sealed class BlockSummary
+        {
+            public ulong Height { get; set; }
+            public byte[] Hash { get; set; } = Array.Empty<byte>();
+            public byte[] PreviousHash { get; set; } = Array.Empty<byte>();
+            public ulong Timestamp { get; set; }
+            public byte[] Miner { get; set; } = Array.Empty<byte>();
+            public ulong Nonce { get; set; }
+            public byte[] Target { get; set; } = Array.Empty<byte>();
+            public byte[] MerkleRoot { get; set; } = Array.Empty<byte>();
+            public byte Version { get; set; }
+            public int TxCount { get; set; }
+        }
+
         public sealed class BlockUiTag
         {
             public ulong Height { get; }
@@ -50,6 +66,68 @@ namespace Qado.CodeBehindHelper
 
                 if (h == 0) break;
                 h--;
+            }
+
+            return list;
+        }
+
+        public static List<BlockSummary> ReadBlockSummariesDescendingFrom(ulong startHeight, int count)
+        {
+            var list = new List<BlockSummary>(Math.Max(0, count));
+            if (count <= 0) return list;
+
+            lock (Db.Sync)
+            {
+                using var cmd = Db.Connection.CreateCommand();
+                cmd.CommandText = @"
+SELECT c.height, c.hash, bi.prev_hash, bi.ts, bi.target, bi.miner, p.payload
+FROM canon c
+JOIN block_index bi ON bi.hash = c.hash
+JOIN block_payloads p ON p.hash = c.hash
+WHERE c.height <= $startHeight
+ORDER BY c.height DESC
+LIMIT $count;";
+                cmd.Parameters.AddWithValue("$startHeight", (long)startHeight);
+                cmd.Parameters.AddWithValue("$count", count);
+
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    long heightRaw = reader.GetInt64(0);
+                    var hash = reader[1] as byte[];
+                    var prevHash = reader[2] as byte[];
+                    long tsRaw = reader.GetInt64(3);
+                    var target = reader[4] as byte[];
+                    var miner = reader[5] as byte[];
+                    var payload = reader[6] as byte[];
+
+                    if (heightRaw < 0 ||
+                        hash is not { Length: 32 } ||
+                        prevHash is not { Length: 32 } ||
+                        target is not { Length: 32 } ||
+                        miner is not { Length: 32 } ||
+                        payload is not { Length: > 0 })
+                    {
+                        continue;
+                    }
+
+                    if (!TryReadPayloadSummary(payload, out var version, out var merkleRoot, out var nonce, out var txCount))
+                        continue;
+
+                    list.Add(new BlockSummary
+                    {
+                        Height = (ulong)heightRaw,
+                        Hash = (byte[])hash.Clone(),
+                        PreviousHash = (byte[])prevHash.Clone(),
+                        Timestamp = tsRaw < 0 ? 0UL : (ulong)tsRaw,
+                        Miner = (byte[])miner.Clone(),
+                        Nonce = nonce,
+                        Target = (byte[])target.Clone(),
+                        MerkleRoot = merkleRoot,
+                        Version = version,
+                        TxCount = txCount
+                    });
+                }
             }
 
             return list;
@@ -220,6 +298,41 @@ namespace Qado.CodeBehindHelper
 
             result.AddRange(rest);
             return result;
+        }
+
+        private static bool TryReadPayloadSummary(
+            byte[] payload,
+            out byte version,
+            out byte[] merkleRoot,
+            out ulong nonce,
+            out int txCount)
+        {
+            version = 0;
+            merkleRoot = Array.Empty<byte>();
+            nonce = 0;
+            txCount = 0;
+
+            if (payload == null || payload.Length < BlockBinarySerializer.HeaderSize)
+                return false;
+
+            int o = 0;
+            version = payload[o++];
+
+            o += 32; // prev
+            merkleRoot = payload.AsSpan(o, 32).ToArray();
+            o += 32;
+
+            o += 8;  // timestamp
+            o += 32; // target
+
+            nonce = BinaryPrimitives.ReadUInt64BigEndian(payload.AsSpan(o, 8));
+            o += 8;
+
+            o += 32; // miner
+
+            uint rawTxCount = BinaryPrimitives.ReadUInt32BigEndian(payload.AsSpan(o, 4));
+            txCount = rawTxCount > int.MaxValue ? int.MaxValue : (int)rawTxCount;
+            return true;
         }
 
         private static int CompareBytesLex(byte[]? a, byte[]? b)

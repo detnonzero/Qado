@@ -51,13 +51,13 @@ namespace Qado
         private Timer? _peerReloadDebounceTimer;
         private Timer? _nodeStatusDebounceTimer;
         private Timer? _nodeStatusPollTimer;
+        private int _uiTimerTickRunning;
 
         private CancellationTokenSource? _p2pCts;
         private P2PNode? _p2pNode;
         private ExchangeApiHost? _exchangeApiHost;
 
-        private const int InitialCount = 100;
-        private const int PageSize = 50;
+        private const int BlockExplorerWindowSize = 120;
         private const int PeerReloadDebounceMs = 300;
         private const int NodeStatusDebounceMs = 400;
         private const int BlockExplorerRefreshDebounceMs = 5000;
@@ -67,7 +67,6 @@ namespace Qado
         private const int MempoolCleanupMaxAgeSeconds = 3600;
         private static readonly TimeSpan PeerSeenRecentlyWindow = TimeSpan.FromMinutes(5);
 
-        private ulong _nextHeightToLoad = 0;
         private bool _isLoading = false;
         private bool _initialized = false;
         private bool _isClosing = false;
@@ -159,7 +158,6 @@ namespace Qado
                 PersonalTxListView.ItemsSource = _personalTxRows;
                 AddressBookListView.ItemsSource = _addressBookRows;
                 BlocksListView.ItemsSource = _blockRows;
-                BlocksListView.AddHandler(ScrollViewer.ScrollChangedEvent, new ScrollChangedEventHandler(BlockScroll_ScrollChanged));
 
                 ClearLogButton.Click -= ClearLogButton_Click;
                 ClearLogButton.Click += ClearLogButton_Click;
@@ -354,13 +352,34 @@ namespace Qado
         public void StartUiTimer(Action updateAction)
         {
             _uiTimer?.Dispose();
-            _uiTimer = new Timer(_ => Dispatcher.Invoke(updateAction), null, 1000, 1000);
+            Interlocked.Exchange(ref _uiTimerTickRunning, 0);
+            _uiTimer = new Timer(_ =>
+            {
+                if (_isClosing)
+                    return;
+
+                if (Interlocked.CompareExchange(ref _uiTimerTickRunning, 1, 0) != 0)
+                    return;
+
+                try
+                {
+                    updateAction();
+                }
+                catch
+                {
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _uiTimerTickRunning, 0);
+                }
+            }, null, 1000, 1000);
         }
 
         public void StopUiTimer()
         {
             _uiTimer?.Dispose();
             _uiTimer = null;
+            Interlocked.Exchange(ref _uiTimerTickRunning, 0);
         }
 
         public void AddTxToPreview(Transaction tx)
@@ -560,31 +579,77 @@ namespace Qado
         {
             if (GuiUtils.IsDesignMode) return;
 
-            var newPrivateKey = KeyGenerator.GeneratePrivateKeyHex();
-            var keys = KeyStorage.LoadAllPrivateKeys();
-
-            if (!keys.Contains(newPrivateKey))
-            {
-                keys.Insert(0, newPrivateKey);
-                KeyStorage.SavePrivateKeys(keys);
-            }
-
-            PopulateKeyDropdown();
-            PrivateKeyComboBox.SelectedItem = newPrivateKey;
-            PrivateKeyComboBox.Text = newPrivateKey;
-            PrivateKeyComboBox.IsReadOnly = true;
-            SpendPublicKeyTextBox.Text = KeyGenerator.GetPublicKeyFromPrivateKeyHex(newPrivateKey);
             AcceptPrivateKeyButton.IsEnabled = false;
             AcceptPrivateKeyButton.Opacity = 0.5;
             GeneratePrivateKeyButton.IsEnabled = false;
             GeneratePrivateKeyButton.Opacity = 0.5;
-            DeletePrivateKeyButton.IsEnabled = true;
-            DeletePrivateKeyButton.Opacity = 1.0;
 
-            BalanceHelper.UpdateBalanceUI(BalanceTextBlock, newPrivateKey);
-            ReloadPersonalTransactions();
-            PersistSelectedPrivateKeyNoThrow();
-            Info("Key", "New private key generated.");
+            _ = Task.Run(() =>
+            {
+                string? newPrivateKey = null;
+                string? publicKey = null;
+                string? error = null;
+
+                try
+                {
+                    newPrivateKey = KeyGenerator.GeneratePrivateKeyHex();
+                    publicKey = KeyGenerator.GetPublicKeyFromPrivateKeyHex(newPrivateKey);
+                    var keys = KeyStorage.LoadAllPrivateKeys();
+
+                    if (!keys.Contains(newPrivateKey))
+                    {
+                        keys.Insert(0, newPrivateKey);
+                        KeyStorage.SavePrivateKeys(keys);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    error = ex.Message;
+                }
+
+                try
+                {
+                    Dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        if (_isClosing)
+                            return;
+
+                        if (!string.IsNullOrWhiteSpace(error) ||
+                            string.IsNullOrWhiteSpace(newPrivateKey) ||
+                            string.IsNullOrWhiteSpace(publicKey))
+                        {
+                            AcceptPrivateKeyButton.IsEnabled = true;
+                            AcceptPrivateKeyButton.Opacity = 1.0;
+                            GeneratePrivateKeyButton.IsEnabled = true;
+                            GeneratePrivateKeyButton.Opacity = 1.0;
+                            DeletePrivateKeyButton.IsEnabled = false;
+                            DeletePrivateKeyButton.Opacity = 0.5;
+                            MessageBox.Show(
+                                $"Could not generate a new private key: {error ?? "unknown error"}",
+                                "QADO",
+                                MessageBoxButton.OK,
+                                MessageBoxImage.Error);
+                            return;
+                        }
+
+                        PopulateKeyDropdown();
+                        PrivateKeyComboBox.SelectedItem = newPrivateKey;
+                        PrivateKeyComboBox.Text = newPrivateKey;
+                        PrivateKeyComboBox.IsReadOnly = true;
+                        SpendPublicKeyTextBox.Text = publicKey;
+                        DeletePrivateKeyButton.IsEnabled = true;
+                        DeletePrivateKeyButton.Opacity = 1.0;
+
+                        BalanceHelper.UpdateBalanceUI(BalanceTextBlock, newPrivateKey);
+                        ReloadPersonalTransactions();
+                        PersistSelectedPrivateKeyNoThrow();
+                        Info("Key", "New private key generated.");
+                    }));
+                }
+                catch
+                {
+                }
+            });
         }
 
         private void CopyKeyButton_Click(object sender, RoutedEventArgs e)
@@ -2153,7 +2218,6 @@ LIMIT 200;";
             public string MerkleRoot { get; set; } = "";
             public int TxCount { get; set; }
             public byte[] HashBytes { get; set; } = Array.Empty<byte>();
-            public Block Block { get; set; } = null!;
         }
 
         public sealed class TxRow
@@ -2242,8 +2306,19 @@ LIMIT 200;";
 
         private void BlocksListView_MouseDoubleClick(object sender, MouseButtonEventArgs e)
         {
-            if (BlocksListView.SelectedItem is BlockRow row && row.Block != null)
-                ShowBlockTransactions(row.Block);
+            if (BlocksListView.SelectedItem is not BlockRow row || row.HashBytes is not { Length: 32 })
+                return;
+
+            _ = Task.Run(() => BlockStore.GetBlockByHash(row.HashBytes))
+                .ContinueWith(t =>
+                {
+                    var block = t.Status == TaskStatus.RanToCompletion ? t.Result : null;
+                    if (block == null) return;
+
+                    block.BlockHeight = row.Height;
+                    block.BlockHash = (byte[])row.HashBytes.Clone();
+                    ShowBlockTransactions(block);
+                }, TaskScheduler.Default);
         }
 
         private void InitializeBlockExplorerLazy()
@@ -2295,18 +2370,10 @@ LIMIT 200;";
         {
             if (_isLoading) return;
 
-            _nextHeightToLoad = BlockStore.GetLatestHeight();
-
-            Dispatcher.InvokeAsync(() =>
-            {
-                _blockRows.Clear();
-                _displayedHeights.Clear();
-            });
-
-            _ = AppendMore(InitialCount);
+            _ = ReloadBlockWindowAsync();
         }
 
-        private async Task AppendMore(int count)
+        private async Task ReloadBlockWindowAsync()
         {
             if (_isLoading) return;
 
@@ -2314,30 +2381,24 @@ LIMIT 200;";
 
             try
             {
-                var startHeight = _nextHeightToLoad;
-                var blocks = await Task.Run(() => BlockExplorerHelper.ReadBlocksDescendingFrom(startHeight, count));
+                var latestHeight = BlockStore.GetLatestHeight();
+                var blocks = await Task.Run(() => BlockExplorerHelper.ReadBlockSummariesDescendingFrom(latestHeight, BlockExplorerWindowSize));
 
                 await Dispatcher.InvokeAsync(() =>
                 {
+                    _blockRows.Clear();
+                    _displayedHeights.Clear();
+
                     for (int i = 0; i < blocks.Count; i++)
                     {
                         var b = blocks[i];
 
-                        if (!_displayedHeights.Add(b.BlockHeight))
+                        if (!_displayedHeights.Add(b.Height))
                             continue;
 
                         _blockRows.Add(BuildBlockRow(b));
                     }
                 });
-
-                if (blocks.Count > 0)
-                {
-                    ulong min = blocks[0].BlockHeight;
-                    for (int i = 1; i < blocks.Count; i++)
-                        if (blocks[i].BlockHeight < min) min = blocks[i].BlockHeight;
-
-                    _nextHeightToLoad = min > 0 ? min - 1 : 0;
-                }
             }
             finally
             {
@@ -2355,8 +2416,7 @@ LIMIT 200;";
 
             if (_blockRows.Count == 0)
             {
-                _nextHeightToLoad = latestHeight;
-                await AppendMore(InitialCount);
+                await ReloadBlockWindowAsync();
                 return;
             }
 
@@ -2364,19 +2424,25 @@ LIMIT 200;";
             var topH = topRow.Height;
             var topHash = topRow.HashBytes;
 
+            if (latestHeight < topH)
+            {
+                await ReloadBlockWindowAsync();
+                return;
+            }
+
             if (latestHeight == topH)
             {
                 if (latestHash is not { Length: 32 } || topHash is not { Length: 32 } || !BytesEqual32(latestHash, topHash))
                 {
-                    ReloadAllBlocks();
+                    await ReloadBlockWindowAsync();
                     return;
                 }
             }
 
             if (latestHeight > topH)
             {
-                int toFetch = (int)Math.Min((long)(latestHeight - topH), PageSize);
-                var newBlocks = await Task.Run(() => BlockExplorerHelper.ReadBlocksDescendingFrom(latestHeight, toFetch));
+                int toFetch = (int)Math.Min((long)(latestHeight - topH), BlockExplorerWindowSize);
+                var newBlocks = await Task.Run(() => BlockExplorerHelper.ReadBlockSummariesDescendingFrom(latestHeight, toFetch));
 
                 await Dispatcher.InvokeAsync(() =>
                 {
@@ -2385,11 +2451,13 @@ LIMIT 200;";
                     for (int i = newBlocks.Count - 1; i >= 0; i--)
                     {
                         var b = newBlocks[i];
-                        if (!_displayedHeights.Add(b.BlockHeight))
+                        if (!_displayedHeights.Add(b.Height))
                             continue;
 
                         _blockRows.Insert(0, BuildBlockRow(b));
                     }
+
+                    TrimBlockExplorerWindow_NoLock();
 
                     SetBlocksVerticalOffset(oldOffset);
                 });
@@ -2403,16 +2471,7 @@ LIMIT 200;";
             return true;
         }
 
-        private async void BlockScroll_ScrollChanged(object sender, ScrollChangedEventArgs e)
-        {
-            double remaining = e.ExtentHeight - (e.VerticalOffset + e.ViewportHeight);
-
-            if (!_isLoading && remaining < 40.0)
-            {
-                if (_nextHeightToLoad > 0 || HasGenesisMissingInLoadedBlocks())
-                    await AppendMore(PageSize);
-            }
-        }
+        private void BlockScroll_ScrollChanged(object sender, ScrollChangedEventArgs e) { }
 
         private static MempoolRow BuildMempoolRow(Transaction tx)
         {
@@ -2426,25 +2485,12 @@ LIMIT 200;";
             };
         }
 
-        private static BlockRow BuildBlockRow(Block block)
+        private static BlockRow BuildBlockRow(BlockExplorerHelper.BlockSummary block)
         {
-            var header = block.Header;
-            if (header == null)
-            {
-                return new BlockRow
-                {
-                    Height = block.BlockHeight,
-                    Hash = ToHex(block.BlockHash),
-                    TxCount = block.Transactions?.Count ?? 0,
-                    HashBytes = block.BlockHash is null ? Array.Empty<byte>() : (byte[])block.BlockHash.Clone(),
-                    Block = block
-                };
-            }
-
             string difficultyText;
             try
             {
-                BigInteger diff = Difficulty.TargetToDifficulty(header.Target);
+                BigInteger diff = Difficulty.TargetToDifficulty(block.Target);
                 difficultyText = diff.ToString();
             }
             catch
@@ -2454,36 +2500,22 @@ LIMIT 200;";
 
             return new BlockRow
             {
-                Height = block.BlockHeight,
-                Hash = ToHex(block.BlockHash),
-                PreviousHash = ToHex(header.PreviousBlockHash),
-                TimestampLocal = SafeUnixToLocal(header.Timestamp),
-                Miner = ToHex(header.Miner),
-                Nonce = header.Nonce.ToString(),
+                Height = block.Height,
+                Hash = ToHex(block.Hash),
+                PreviousHash = ToHex(block.PreviousHash),
+                TimestampLocal = SafeUnixToLocal(block.Timestamp),
+                Miner = ToHex(block.Miner),
+                Nonce = block.Nonce.ToString(),
                 Difficulty = difficultyText,
-                Version = header.Version.ToString(),
-                MerkleRoot = ToHex(header.MerkleRoot),
-                TxCount = block.Transactions?.Count ?? 0,
-                HashBytes = block.BlockHash is null ? Array.Empty<byte>() : (byte[])block.BlockHash.Clone(),
-                Block = block
+                Version = block.Version.ToString(),
+                MerkleRoot = ToHex(block.MerkleRoot),
+                TxCount = block.TxCount,
+                HashBytes = (byte[])block.Hash.Clone()
             };
         }
 
         private static string ToHex(byte[]? value)
             => value == null || value.Length == 0 ? "" : Convert.ToHexString(value).ToLowerInvariant();
-
-        private bool HasGenesisMissingInLoadedBlocks()
-        {
-            if (_blockRows.Count == 0) return true;
-
-            for (int i = 0; i < _blockRows.Count; i++)
-            {
-                if (_blockRows[i].Height == 0UL)
-                    return false;
-            }
-
-            return true;
-        }
 
         private double GetBlocksVerticalOffset()
         {
@@ -2514,6 +2546,17 @@ LIMIT 200;";
             }
 
             return null;
+        }
+
+        private void TrimBlockExplorerWindow_NoLock()
+        {
+            while (_blockRows.Count > BlockExplorerWindowSize)
+            {
+                int lastIndex = _blockRows.Count - 1;
+                var removed = _blockRows[lastIndex];
+                _displayedHeights.Remove(removed.Height);
+                _blockRows.RemoveAt(lastIndex);
+            }
         }
 
         private static string SafeUnixToLocal(ulong unixSeconds)

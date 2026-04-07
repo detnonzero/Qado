@@ -114,7 +114,8 @@ internal static class Program
                     () => { },
                     _ => { },
                     log,
-                    true);
+                    true,
+                    () => GetHeadlessMiningGateState(node));
 
                 miningTask = openClMiner.StartMiningAsync(shutdownCts.Token);
                 log.Info(
@@ -520,6 +521,13 @@ internal static class Program
     {
         try
         {
+            var miningGate = GetHeadlessMiningGateState(node);
+            if (!miningGate.Allowed)
+            {
+                log.Warn("Mining", $"Discarding mined block while gate is closed: {miningGate.Reason}.");
+                return;
+            }
+
             if (Db.Connection == null)
             {
                 log.Error("Mining", "Db.Connection is null (cannot persist block).");
@@ -645,6 +653,29 @@ internal static class Program
 
         newHeight = tipH + 1UL;
         return true;
+    }
+
+    private static MiningGateState GetHeadlessMiningGateState(P2PNode? node)
+    {
+        if (node == null)
+            return MiningGateState.Closed("node unavailable");
+
+        ulong tipHeight = BlockStore.GetLatestHeight();
+        var tipHash = BlockStore.GetCanonicalHashAtHeight(tipHeight);
+        if (tipHash is not { Length: 32 } || IsZero32(tipHash))
+            return MiningGateState.Closed("canonical tip unavailable");
+
+        int peerCount = node.GetConnectedHandshakePeerCount();
+        if (peerCount <= 0)
+            return MiningGateState.Closed("no connected peers");
+
+        if (node.IsInitialBlockSyncActive)
+            return MiningGateState.Closed("initial block sync active");
+
+        if (node.HasBetterPeerTipThanLocal)
+            return MiningGateState.Closed("peer tip ahead");
+
+        return MiningGateState.Open;
     }
 
     private static bool BytesEqual32(byte[] a, byte[] b)

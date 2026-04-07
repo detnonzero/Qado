@@ -76,7 +76,8 @@ internal static class Program
         new TestCase("P2PNode_DuplicateSessionPreference_UsesNodeIdTieBreak", TestP2PNodeDuplicateSessionPreferenceUsesNodeIdTieBreak),
         new TestCase("P2PNode_ParentPackTargets_UseSenderFirstAndBoundedBackups", TestP2PNodeParentPackTargetsUseSenderFirstAndBoundedBackups),
         new TestCase("BlockIngressFlow_PostPromotionReevaluatesBestKnownTip", TestBlockIngressFlowPostPromotionReevaluatesBestKnownTip),
-        new TestCase("BlockSyncClient_ExtendedSyncWindow_Requests512ForCapablePeers", TestBlockSyncClientExtendedSyncWindowRequests512ForCapablePeers),
+        new TestCase("BlockSyncClient_CapablePeers_StartAt128BeforeWindowRamp", TestBlockSyncClientCapablePeersStartAt128BeforeWindowRamp),
+        new TestCase("BlockSyncClient_TailCatchup_CapsContinuationToAdvertisedGap", TestBlockSyncClientTailCatchupCapsContinuationToAdvertisedGap),
         new TestCase("BlockSyncClient_SyncWindowPreview_PipelinesNextPeerBeforeBatchEnd", TestBlockSyncClientSyncWindowPreviewPipelinesNextPeerBeforeBatchEnd),
         new TestCase("BlockSyncClient_FromHashContinuation_DoesNotRequireImmediatePrepare", TestBlockSyncClientFromHashContinuationDoesNotRequireImmediatePrepare),
         new TestCase("BlockSyncClient_EqualChainworkPrepare_SkipsWithoutPenalty", TestBlockSyncClientEqualChainworkPrepareSkipsWithoutPenalty),
@@ -84,6 +85,8 @@ internal static class Program
         new TestCase("BlockSyncClient_PreviewContinuation_RetriesAfterCommitWhenNoPeerWasInitiallyFree", TestBlockSyncClientPreviewContinuationRetriesAfterCommitWhenNoPeerWasInitiallyFree),
         new TestCase("BlockSyncClient_IdleBehindWatchdog_RevivesLocatorSync", TestBlockSyncClientIdleBehindWatchdogRevivesLocatorSync),
         new TestCase("BlockSyncClient_ActiveStallWatchdog_RevivesLocatorSync", TestBlockSyncClientActiveStallWatchdogRevivesLocatorSync),
+        new TestCase("BlockSyncClient_BatchCompletion_RearmsNextAheadPeerImmediately", TestBlockSyncClientBatchCompletionRearmsNextAheadPeerImmediately),
+        new TestCase("BlockSyncClient_WindowCommitWithoutPreview_RearmsNextAheadPeerImmediately", TestBlockSyncClientWindowCommitWithoutPreviewRearmsNextAheadPeerImmediately),
         new TestCase("BlockSyncClient_ResetPipeline_ClearsCommitLoopLatch", TestBlockSyncClientResetPipelineClearsCommitLoopLatch),
         new TestCase("BlockSyncClient_ResumeHash_PrefersLocalTipWhenCommittedCursorIsStale", TestBlockSyncClientResumeHashPrefersLocalTipWhenCommittedCursorIsStale),
         new TestCase("PeerDiscovery_HandlePeersPayload_SkipsIpv6WhenDisabled_AndNormalizesMappedIpv4", TestPeerDiscoveryHandlePeersPayloadSkipsIpv6WhenDisabledAndNormalizesMappedIpv4),
@@ -3276,7 +3279,7 @@ internal static class Program
         Assert(sent[0].type == MsgType.GetBlocksByLocator, "tip-state sync must start with locator-based batch request");
     }
 
-    private static void TestBlockSyncClientExtendedSyncWindowRequests512ForCapablePeers()
+    private static void TestBlockSyncClientCapablePeersStartAt128BeforeWindowRamp()
     {
         byte[] localTip = HashFromU64(100UL);
         UInt128 localChainwork = 1_000UL;
@@ -3284,7 +3287,9 @@ internal static class Program
         var sessions = new List<PeerSession>();
         var peer = CreateFakePeer(
             "peer-fast-window",
-            HandshakeCapabilities.BlocksBatchData | HandshakeCapabilities.ExtendedSyncWindow);
+            HandshakeCapabilities.BlocksBatchData |
+            HandshakeCapabilities.ExtendedSyncWindow |
+            HandshakeCapabilities.SyncWindowPreview);
         sessions.Add(peer);
 
         var client = new BlockSyncClient(
@@ -3319,8 +3324,8 @@ internal static class Program
         Assert(sent[0].type == MsgType.GetBlocksByLocator, "initial fast-window request must use locator sync");
         Assert(BlockSyncProtocol.TryParseGetBlocksByLocator(sent[0].payload, out _, out var locatorMaxBlocks),
             "fast-window locator request did not parse");
-        Assert(locatorMaxBlocks == BlockSyncProtocol.ExtendedSyncWindowBlocks,
-            $"fast-window locator request max_blocks mismatch: got {locatorMaxBlocks}");
+        Assert(locatorMaxBlocks == BlockSyncProtocol.BatchMaxBlocks,
+            $"capable-peer locator request should start at 128 before ramping, got {locatorMaxBlocks}");
 
         Guid batchId = Guid.NewGuid();
         sent.Clear();
@@ -3344,8 +3349,88 @@ internal static class Program
         Assert(sent[0].type == MsgType.GetBlocksFrom, "continuation request must use GetBlocksFrom");
         Assert(BlockSyncProtocol.TryParseGetBlocksFrom(sent[0].payload, out _, out var fromMaxBlocks),
             "fast-window continuation request did not parse");
-        Assert(fromMaxBlocks == BlockSyncProtocol.ExtendedSyncWindowBlocks,
-            $"fast-window continuation request max_blocks mismatch: got {fromMaxBlocks}");
+        Assert(fromMaxBlocks == BlockSyncProtocol.BatchMaxBlocks,
+            $"capable-peer continuation request should still be 128 before ramping, got {fromMaxBlocks}");
+    }
+
+    private static void TestBlockSyncClientTailCatchupCapsContinuationToAdvertisedGap()
+    {
+        byte[] localTip = HashFromU64(100UL);
+        UInt128 localChainwork = 1_000UL;
+        var sent = new List<(string peer, MsgType type, byte[] payload)>();
+        var caps = HandshakeCapabilities.BlocksBatchData |
+                   HandshakeCapabilities.ExtendedSyncWindow |
+                   HandshakeCapabilities.SyncWindowPreview;
+        var peer1 = CreateFakePeer("peer-tail-gap-1", caps);
+        var peer2 = CreateFakePeer("peer-tail-gap-2", caps);
+        var sessions = new List<PeerSession> { peer1, peer2 };
+
+        var client = new BlockSyncClient(
+            sessionSnapshot: () => sessions.ToArray(),
+            sendFrameAsync: (targetPeer, type, payload, ct) =>
+            {
+                sent.Add((targetPeer.SessionKey, type, (byte[])payload.Clone()));
+                return Task.CompletedTask;
+            },
+            getLocalTipChainwork: () => localChainwork,
+            getLocalTipHash: () => (byte[])localTip.Clone(),
+            prepareBatchAsync: (startHash, startHeight, advertisedTipChainwork, targetPeer, ct) =>
+                Task.FromResult(new BlockSyncPrepareResult(true, string.Empty)),
+            commitBlocksAsync: (payloads, height, prevHash, targetPeer, ct) =>
+                Task.FromResult(new BlockSyncCommitResult(true, HashFromU64(height + (ulong)payloads.Count - 1UL), string.Empty)),
+            completeBatchAsync: (targetPeer, status, ct) => Task.CompletedTask,
+            abortBatchAsync: (targetPeer, reason, ct) => Task.CompletedTask,
+            log: null);
+
+        byte[] remoteTipHash = HashFromU64(650UL);
+        byte[] previewLastHash = HashFromU64(612UL);
+        client.OnTipStateAsync(
+                peer1,
+                new SmallNetTipStateFrame(650UL, remoteTipHash, 1_650UL, null, new[] { HashFromU64(649UL), remoteTipHash }),
+                CancellationToken.None)
+            .GetAwaiter().GetResult();
+        client.OnTipStateAsync(
+                peer2,
+                new SmallNetTipStateFrame(650UL, remoteTipHash, 1_650UL, null, new[] { HashFromU64(649UL), remoteTipHash }),
+                CancellationToken.None)
+            .GetAwaiter().GetResult();
+
+        Assert(sent.Count == 1, $"expected one locator request, got {sent.Count}");
+        Assert(sent[0].type == MsgType.GetBlocksByLocator, "initial tail-gap sync request must use locator sync");
+        Assert(sent[0].peer == peer1.SessionKey, "initial tail-gap sync request should target the first peer");
+
+        sent.Clear();
+        client.OnBlocksBatchStartAsync(
+                peer1,
+                new SmallNetBlocksBatchStartFrame(
+                    Guid.NewGuid(),
+                    HashFromU64(100UL),
+                    100UL,
+                    BlockSyncProtocol.ExtendedSyncWindowBlocks,
+                    remoteTipHash,
+                    1_650UL,
+                    previewLastHash,
+                    612UL),
+                CancellationToken.None)
+            .GetAwaiter().GetResult();
+
+        if (sent.Count == 0)
+        {
+            MethodInfo ensureMethod = typeof(BlockSyncClient).GetMethod("EnsurePipelineAsync", BindingFlags.Instance | BindingFlags.NonPublic)
+                ?? throw new InvalidOperationException("BlockSyncClient EnsurePipelineAsync reflection lookup failed");
+            ((Task)ensureMethod.Invoke(client, new object[] { CancellationToken.None })!)
+                .GetAwaiter().GetResult();
+        }
+
+        Assert(sent.Count == 1, $"expected one continuation request after preview, got {sent.Count}");
+        Assert(sent[0].type == MsgType.GetBlocksFrom, "preview continuation should use from-hash sync");
+        Assert(sent[0].peer == peer2.SessionKey, "tail-gap continuation should pipeline through the free second peer");
+        Assert(BlockSyncProtocol.TryParseGetBlocksFrom(sent[0].payload, out var continuationFromHash, out var continuationMaxBlocks),
+            "tail-gap continuation request did not parse");
+        Assert(BytesEqual(continuationFromHash, previewLastHash),
+            "tail-gap continuation should resume exactly from the preview last hash");
+        Assert(continuationMaxBlocks == 38,
+            $"tail-gap continuation should cap max_blocks to the advertised remainder (38), got {continuationMaxBlocks}");
     }
 
     private static void TestBlockSyncClientStaleBatchEndBeforeStartIsIgnored()
@@ -3528,8 +3613,8 @@ internal static class Program
         Assert(BlockSyncProtocol.TryParseGetBlocksFrom(sent[0].payload, out var fromHash, out var maxBlocks),
             "preview pipeline continuation request did not parse");
         Assert(BytesEqual(fromHash, previewLastHash), "preview pipeline must request from the preview hash");
-        Assert(maxBlocks == BlockSyncProtocol.ExtendedSyncWindowBlocks,
-            $"preview pipeline max_blocks mismatch: got {maxBlocks}");
+        Assert(maxBlocks == BlockSyncProtocol.BatchMaxBlocks,
+            $"preview pipeline should still start at 128 before window ramp, got {maxBlocks}");
     }
 
     private static void TestBlockSyncClientFromHashContinuationDoesNotRequireImmediatePrepare()
@@ -3940,6 +4025,167 @@ internal static class Program
             "stalled-sync watchdog recovery must restart with a locator request");
         Assert(log.Lines.Exists(line => line.Contains("watchdog revived stalled-sync", StringComparison.Ordinal)),
             "stalled-sync watchdog should emit a diagnostic log line");
+    }
+
+    private static void TestBlockSyncClientBatchCompletionRearmsNextAheadPeerImmediately()
+    {
+        byte[] localTip = HashFromU64(10UL);
+        ulong localTipHeight = 10UL;
+        UInt128 localChainwork = 10UL;
+        var sent = new List<(string peer, MsgType type, byte[] payload)>();
+        var peer1 = CreateFakePeer("peer-batch-finish-1");
+        var peer2 = CreateFakePeer("peer-batch-finish-2");
+        var sessions = new List<PeerSession> { peer1 };
+
+        var client = new BlockSyncClient(
+            sessionSnapshot: () => sessions.ToArray(),
+            sendFrameAsync: (targetPeer, type, payload, ct) =>
+            {
+                sent.Add((targetPeer.SessionKey, type, (byte[])payload.Clone()));
+                return Task.CompletedTask;
+            },
+            getLocalTipChainwork: () => localChainwork,
+            getLocalTipHash: () => (byte[])localTip.Clone(),
+            prepareBatchAsync: (startHash, startHeight, advertisedTipChainwork, targetPeer, ct) =>
+                Task.FromResult(new BlockSyncPrepareResult(true, string.Empty)),
+            commitBlocksAsync: (payloads, height, prevHash, targetPeer, ct) =>
+            {
+                ulong lastHeight = height + (ulong)payloads.Count - 1UL;
+                localTipHeight = lastHeight;
+                localTip = HashFromU64(lastHeight);
+                localChainwork = lastHeight;
+                return Task.FromResult(new BlockSyncCommitResult(true, (byte[])localTip.Clone(), string.Empty));
+            },
+            completeBatchAsync: (targetPeer, status, ct) => Task.CompletedTask,
+            abortBatchAsync: (targetPeer, reason, ct) => Task.CompletedTask,
+            log: null,
+            getLocalTipHeight: () => localTipHeight);
+
+        byte[] peer1TipHash = HashFromU64(11UL);
+        client.OnTipStateAsync(
+                peer1,
+                new SmallNetTipStateFrame(11UL, peer1TipHash, 11UL, null, new[] { HashFromU64(10UL), peer1TipHash }),
+                CancellationToken.None)
+            .GetAwaiter().GetResult();
+
+        Assert(sent.Count == 1 && sent[0].peer == peer1.SessionKey && sent[0].type == MsgType.GetBlocksByLocator,
+            "initial sync should start against the first ahead peer");
+
+        sent.Clear();
+        sessions.Add(peer2);
+        byte[] peer2TipHash = HashFromU64(12UL);
+        client.OnTipStateAsync(
+                peer2,
+                new SmallNetTipStateFrame(12UL, peer2TipHash, 12UL, null, new[] { HashFromU64(11UL), peer2TipHash }),
+                CancellationToken.None)
+            .GetAwaiter().GetResult();
+
+        Assert(sent.Count == 0, "second ahead peer should not be scheduled while the first request is still active");
+
+        Guid batchId = Guid.NewGuid();
+        client.OnBlocksBatchStartAsync(
+                peer1,
+                new SmallNetBlocksBatchStartFrame(batchId, HashFromU64(10UL), 10UL, 1, peer1TipHash, 11UL),
+                CancellationToken.None)
+            .GetAwaiter().GetResult();
+        client.OnBlocksChunkAsync(
+                peer1,
+                SmallNetSyncProtocol.BuildBlocksChunk(11UL, new[] { new byte[] { 0x01 } }),
+                CancellationToken.None)
+            .GetAwaiter().GetResult();
+        client.OnBlocksBatchEndAsync(
+                peer1,
+                new SmallNetBlocksBatchEndFrame(batchId, peer1TipHash, 11UL, MoreAvailable: false),
+                CancellationToken.None)
+            .GetAwaiter().GetResult();
+
+        Assert(sent.Count == 1, $"batch completion should immediately rearm the next ahead peer, got {sent.Count} new requests");
+        Assert(sent[0].peer == peer2.SessionKey && sent[0].type == MsgType.GetBlocksByLocator,
+            "next catch-up request should jump directly to the still-ahead peer via locator sync");
+    }
+
+    private static void TestBlockSyncClientWindowCommitWithoutPreviewRearmsNextAheadPeerImmediately()
+    {
+        byte[] localTip = HashFromU64(20UL);
+        ulong localTipHeight = 20UL;
+        UInt128 localChainwork = 20UL;
+        var sent = new List<(string peer, MsgType type, byte[] payload)>();
+        var peer1 = CreateFakePeer("peer-window-commit-1");
+        var peer2 = CreateFakePeer("peer-window-commit-2");
+        var sessions = new List<PeerSession> { peer1, peer2 };
+
+        var client = new BlockSyncClient(
+            sessionSnapshot: () => sessions.ToArray(),
+            sendFrameAsync: (targetPeer, type, payload, ct) =>
+            {
+                sent.Add((targetPeer.SessionKey, type, (byte[])payload.Clone()));
+                return Task.CompletedTask;
+            },
+            getLocalTipChainwork: () => localChainwork,
+            getLocalTipHash: () => (byte[])localTip.Clone(),
+            prepareBatchAsync: (startHash, startHeight, advertisedTipChainwork, targetPeer, ct) =>
+                Task.FromResult(new BlockSyncPrepareResult(true, string.Empty)),
+            commitBlocksAsync: (payloads, height, prevHash, targetPeer, ct) =>
+            {
+                ulong lastHeight = height + (ulong)payloads.Count - 1UL;
+                localTipHeight = lastHeight;
+                localTip = HashFromU64(lastHeight);
+                localChainwork = lastHeight;
+                return Task.FromResult(new BlockSyncCommitResult(true, (byte[])localTip.Clone(), string.Empty));
+            },
+            completeBatchAsync: (targetPeer, status, ct) => Task.CompletedTask,
+            abortBatchAsync: (targetPeer, reason, ct) => Task.CompletedTask,
+            log: null,
+            getLocalTipHeight: () => localTipHeight);
+
+        byte[] peer1TipHash = HashFromU64(21UL);
+        client.OnTipStateAsync(
+                peer1,
+                new SmallNetTipStateFrame(21UL, peer1TipHash, 21UL, null, new[] { HashFromU64(20UL), peer1TipHash }),
+                CancellationToken.None)
+            .GetAwaiter().GetResult();
+
+        Assert(sent.Count == 1 && sent[0].peer == peer1.SessionKey && sent[0].type == MsgType.GetBlocksByLocator,
+            "initial sync should start against the first ahead peer");
+
+        sent.Clear();
+        byte[] peer2TipHash = HashFromU64(22UL);
+        client.OnTipStateAsync(
+                peer2,
+                new SmallNetTipStateFrame(22UL, peer2TipHash, 22UL, null, new[] { HashFromU64(21UL), peer2TipHash }),
+                CancellationToken.None)
+            .GetAwaiter().GetResult();
+
+        Assert(sent.Count == 0, "second ahead peer should stay queued while the first request is still active");
+
+        Guid batchId = Guid.NewGuid();
+        client.OnBlocksBatchStartAsync(
+                peer1,
+                new SmallNetBlocksBatchStartFrame(
+                    batchId,
+                    HashFromU64(20UL),
+                    20UL,
+                    1,
+                    peer1TipHash,
+                    21UL,
+                    PreviewLastHash: null,
+                    PreviewLastHeight: 0),
+                CancellationToken.None)
+            .GetAwaiter().GetResult();
+        client.OnBlocksChunkAsync(
+                peer1,
+                SmallNetSyncProtocol.BuildBlocksChunk(21UL, new[] { new byte[] { 0x02 } }),
+                CancellationToken.None)
+            .GetAwaiter().GetResult();
+        client.OnBlocksBatchEndAsync(
+                peer1,
+                new SmallNetBlocksBatchEndFrame(batchId, peer1TipHash, 21UL, MoreAvailable: false),
+                CancellationToken.None)
+            .GetAwaiter().GetResult();
+
+        Assert(sent.Count == 1, $"window commit without preview should immediately rearm the next ahead peer, got {sent.Count}");
+        Assert(sent[0].peer == peer2.SessionKey && sent[0].type == MsgType.GetBlocksByLocator,
+            "planner should jump directly to the next ahead peer after the committed window finishes");
     }
 
     private static void TestBlockSyncClientResumeHashPrefersLocalTipWhenCommittedCursorIsStale()

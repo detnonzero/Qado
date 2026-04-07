@@ -2,7 +2,35 @@
 
 All notable changes to this project are documented in this file.
 
-## [Unreleased]
+## [1.0.3] - 2026-04-04
+
+### Changed
+- Desktop explorer rendering was slimmed down for better responsiveness:
+  - the block list now keeps only a rolling in-memory window of the latest `120` summary rows
+  - full block payloads are no longer materialized for the list itself and are loaded on demand when opening block details
+  - list virtualization was enabled to reduce UI churn while new blocks arrive
+- Desktop UI work around mining/key handling is less synchronous:
+  - mining status refreshes no longer lean as heavily on blocking dispatcher usage
+  - keypair generation/storage work was moved off the hot UI path so the window stays responsive during key creation
+
+### Fixed
+- Headless `OpenCL` mining is now gated on actual node readiness instead of continuing while the node is still catching up or already behind:
+  - mining pauses when the canonical tip is unavailable, there are no connected peers, initial block sync is active, or a better peer tip is known
+  - long-running `OpenCL` work aborts early when the mining gate closes mid-template
+  - late mined blocks are discarded if the node falls behind before persistence, preventing stale side-chain mining from continuing unnoticed
+- Historical sync follow-up behavior was tightened to reduce avoidable watchdog and duplicate continuation churn:
+  - finishing a locator batch can immediately rearm the next ahead peer instead of waiting for the watchdog to revive planning
+  - exhausted `fromHash` continuations at an unchanged remote tip are now latched/suppressed more explicitly
+  - disconnect resume is more selective about when an in-flight continuation can be resumed directly versus when it must fall back to a locator restart
+- Initial sync tail catch-up is less noisy and more explicit near remote tip:
+  - continuation requests near tip are capped to the currently advertised remainder instead of always requesting a full extended window
+  - sync logs now include the continuation height plus `gap=` / `window=` context for easier diagnosis of end-of-sync handoff behavior
+  - duplicate `Block already known` chatter during catch-up tail handling is reduced so the remaining convergence signal is easier to read
+
+### Notes
+- These follow-up changes are still under soak-test validation and are intended to harden mainnet convergence and mining behavior before the next release.
+
+## [1.0.2] - 2026-04-04
 
 ### Changed
 - Mainnet networking is currently operated in an IPv4-only mode for stability while the node converges toward a more robust production networking profile:
@@ -25,7 +53,7 @@ All notable changes to this project are documented in this file.
   - bounded side-path recovery remains active even during historical sync instead of waiting entirely on lucky gossip
 
 ### Notes
-- These changes are not released yet; they were introduced to harden mainnet convergence and to support additional soak testing before the next public release.
+- `1.0.2` focused on hardening real mainnet convergence and operational soak-test realism before wider exchange/node usage.
 
 ## [1.0.1] - 2026-03-31
 

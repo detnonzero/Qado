@@ -111,12 +111,20 @@ namespace Qado.CodeBehindHelper
                 var megaHashesPerSecond = currentHashrateHps / 1_000_000;
                 BigInteger networkHashrateHps = EstimateNetworkHashrateHashesPerSecond();
                 BigInteger networkHashrateGigaHashesPerSecond = networkHashrateHps / 1_000_000_000;
+                string networkHashrateValue = $"{networkHashrateGigaHashesPerSecond} GH/s";
+                string blockUptimeValue = $"{uptime}s";
+                string currentHashrateValue = $"{megaHashesPerSecond} MH/s";
+                string nonceValue = $"{GetCurrentNonceUnsafe()}";
+                string nextBlockProbabilityValue = FormatNextBlockProbabilityPercent(currentHashrateHps, networkHashrateHps);
 
-                networkHashrateText.Text = $"{networkHashrateGigaHashesPerSecond} GH/s";
-                blockUptimeText.Text = $"{uptime}s";
-                currentHashrateText.Text = $"{megaHashesPerSecond} MH/s";
-                nonceText.Text = $"{GetCurrentNonceUnsafe()}";
-                nextBlockProbabilityText.Text = FormatNextBlockProbabilityPercent(currentHashrateHps, networkHashrateHps);
+                UiBeginInvoke(() =>
+                {
+                    networkHashrateText.Text = networkHashrateValue;
+                    blockUptimeText.Text = blockUptimeValue;
+                    currentHashrateText.Text = currentHashrateValue;
+                    nonceText.Text = nonceValue;
+                    nextBlockProbabilityText.Text = nextBlockProbabilityValue;
+                });
             });
 
             _ = backendKind switch
@@ -662,7 +670,8 @@ namespace Qado.CodeBehindHelper
                 if (app?.Dispatcher == null) { a(); return; }
 
                 if (app.Dispatcher.CheckAccess()) a();
-                else app.Dispatcher.Invoke(a);
+                else if (!app.Dispatcher.HasShutdownStarted && !app.Dispatcher.HasShutdownFinished)
+                    app.Dispatcher.BeginInvoke(a);
             }
             catch
             {

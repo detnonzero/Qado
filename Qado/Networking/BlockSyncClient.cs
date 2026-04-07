@@ -32,6 +32,7 @@ namespace Qado.Networking
         private const int BaseMaxParallelWindows = 3;
         private const int MediumMaxParallelWindows = 4;
         private const int PreferredMaxParallelWindows = 5;
+        private const int TailCatchupThresholdBlocks = 256;
 
         private sealed class PeerSyncStats
         {
@@ -60,6 +61,8 @@ namespace Qado.Networking
             public byte[] RequestedFromHash = Array.Empty<byte>();
             public ulong RequestedFromHeight;
             public int MaxBlocks;
+            public byte[] AdvertisedTipHash = Array.Empty<byte>();
+            public ulong AdvertisedTipHeight;
             public UInt128 AdvertisedTipChainwork;
             public bool BatchPrepared;
             public Guid BatchId;
@@ -143,6 +146,12 @@ namespace Qado.Networking
         private byte[] _exhaustedContinuationTipHash = Array.Empty<byte>();
         private ulong _exhaustedContinuationTipHeight;
         private UInt128 _exhaustedContinuationTipChainwork;
+        private bool _haveFinishedTipLatch;
+        private byte[] _finishedTipFromHash = Array.Empty<byte>();
+        private ulong _finishedTipFromHeight;
+        private byte[] _finishedTipHash = Array.Empty<byte>();
+        private ulong _finishedTipHeight;
+        private UInt128 _finishedTipChainwork;
         private byte[] _lastRemoteTipLogHash = Array.Empty<byte>();
         private ulong _lastRemoteTipLogHeight;
 
@@ -237,11 +246,23 @@ namespace Qado.Networking
             if (peer == null)
                 return;
 
+            bool unchangedExhaustedTip;
             lock (_gate)
             {
                 _tipByPeerKey[peer.SessionKey] = new PeerTipState(frame.Height, SafeCloneHash(frame.TipHash), frame.Chainwork);
                 MaybeClearExhaustedContinuation_NoLock(frame.TipHash, frame.Height, frame.Chainwork);
+                MaybeClearFinishedTipLatch_NoLock(frame.TipHash, frame.Height, frame.Chainwork);
+                unchangedExhaustedTip =
+                    IsSameFinishedTip_NoLock(frame.TipHash, frame.Height, frame.Chainwork) ||
+                    (_haveExhaustedContinuation &&
+                     frame.TipHash is { Length: 32 } &&
+                     frame.Height == _exhaustedContinuationTipHeight &&
+                     frame.Chainwork <= _exhaustedContinuationTipChainwork &&
+                     BytesEqual32(_exhaustedContinuationTipHash, frame.TipHash));
             }
+
+            if (unchangedExhaustedTip)
+                return;
 
             await EnsurePipelineAsync(ct).ConfigureAwait(false);
         }
@@ -457,6 +478,29 @@ namespace Qado.Networking
                         if (!request.HasPreview)
                             _planningReady = true;
 
+                        if (request.HasPreview &&
+                            _requestsByPeerKey.Count == 0 &&
+                            _completedWindowsByStartHeight.Count == 0 &&
+                            _haveCommittedCursor &&
+                            _committedHash is { Length: 32 })
+                        {
+                            _planningCursorHash = SafeCloneHash(_committedHash);
+                            _planningCursorHeight = _committedHeight;
+                            _havePlanningCursor = true;
+                            _planningReady = true;
+                            _useLocatorNext = false;
+                            scheduleMore = frame.MoreAvailable
+                                ? true
+                                : TryArmImmediateIdleCatchup_NoLock(forceLocator: false);
+                        }
+
+                        if (!frame.MoreAvailable &&
+                            request.Kind == WindowRequestKind.FromHash &&
+                            request.RequestedFromHash is { Length: 32 })
+                        {
+                            MarkFinishedTipLatch_NoLock(request);
+                        }
+
                         if (!request.HasPreview && frame.MoreAvailable && _haveCommittedCursor)
                         {
                             _planningCursorHash = SafeCloneHash(_committedHash);
@@ -471,7 +515,17 @@ namespace Qado.Networking
                         if (request.HasPreview && frame.MoreAvailable && _planningReady)
                             scheduleMore = true;
 
-                        tipReached = !frame.MoreAvailable && _requestsByPeerKey.Count == 0 && _completedWindowsByStartHeight.Count == 0;
+                        if (!scheduleMore &&
+                            request.Kind == WindowRequestKind.Locator &&
+                            TryArmImmediateIdleCatchup_NoLock(forceLocator: false))
+                        {
+                            scheduleMore = true;
+                        }
+
+                        tipReached = !frame.MoreAvailable &&
+                                     !scheduleMore &&
+                                     _requestsByPeerKey.Count == 0 &&
+                                     _completedWindowsByStartHeight.Count == 0;
                     }
 
                     if (remainingBlocks > 0 && request.HasPreview && frame.MoreAvailable && _planningReady)
@@ -528,7 +582,21 @@ namespace Qado.Networking
             {
                 _tipByPeerKey.Remove(peer.SessionKey);
                 hadRequest = _requestsByPeerKey.TryGetValue(peer.SessionKey, out var request);
-                forceLocator = !hadRequest || !request!.BatchPrepared || !_haveCommittedCursor;
+                if (!hadRequest || !_haveCommittedCursor)
+                {
+                    forceLocator = true;
+                }
+                else
+                {
+                    bool preparedResumeSafe = request!.BatchPrepared;
+                    bool committedContinuationResumeSafe =
+                        request.Kind == WindowRequestKind.FromHash &&
+                        request.RequestedFromHeight == _committedHeight &&
+                        request.RequestedFromHash is { Length: 32 } &&
+                        _committedHash is { Length: 32 } &&
+                        BytesEqual32(request.RequestedFromHash, _committedHash);
+                    forceLocator = !(preparedResumeSafe || committedContinuationResumeSafe);
+                }
             }
 
             if (!hadRequest)
@@ -597,18 +665,29 @@ namespace Qado.Networking
             while (true)
             {
                 RequestCommitSlice slice;
+                bool scheduleMore = false;
+                bool noSlice = false;
                 lock (_gate)
                 {
                     if (!TryBuildRequestCommitSlice_NoLock(peer, flushRemainder, out slice))
                     {
                         _commitLoopRunning = false;
+                        scheduleMore = TryArmImmediateIdleCatchup_NoLock(forceLocator: false);
                         RefreshState_NoLock();
-                        return;
+                        noSlice = true;
                     }
-
-                    _commitLoopRunning = true;
-                    RefreshState_NoLock();
+                    else
+                    {
+                        _commitLoopRunning = true;
+                        RefreshState_NoLock();
+                    }
                 }
+
+                if (scheduleMore)
+                    await EnsurePipelineAsync(ct).ConfigureAwait(false);
+
+                if (noSlice)
+                    return;
 
                 var commit = await _commitBlocksAsync(
                     slice.Blocks,
@@ -676,6 +755,9 @@ namespace Qado.Networking
             PeerSession? selectedPeer;
             bool useLocator;
             byte[] fromHash;
+            ulong fromHeight;
+            ulong advertisedGap;
+            bool isTailCatchup;
             int maxBlocks;
             int serial;
             byte[] advertisedTipHash;
@@ -702,8 +784,22 @@ namespace Qado.Networking
                 advertisedTipChainwork = tip.Chainwork;
                 useLocator = _useLocatorNext || !_havePlanningCursor;
                 fromHash = useLocator ? GetResumeHash_NoLock() : SafeCloneHash(_planningCursorHash);
+                fromHeight = useLocator ? 0UL : _planningCursorHeight;
+                advertisedGap = 0UL;
+                isTailCatchup = false;
                 if (!useLocator &&
                     IsExhaustedContinuation_NoLock(
+                        fromHash,
+                        _planningCursorHeight,
+                        advertisedTipHash,
+                        advertisedTipHeight,
+                        advertisedTipChainwork))
+                {
+                    return;
+                }
+
+                if (!useLocator &&
+                    IsFinishedTipLatch_NoLock(
                         fromHash,
                         _planningCursorHeight,
                         advertisedTipHash,
@@ -717,6 +813,17 @@ namespace Qado.Networking
                     return;
 
                 maxBlocks = GetPreferredSyncWindowBlocks_NoLock(selectedPeer);
+                if (!useLocator && advertisedTipHeight > _planningCursorHeight)
+                {
+                    advertisedGap = advertisedTipHeight - _planningCursorHeight;
+                    int gapWindow = advertisedGap >= (ulong)BlockSyncProtocol.ExtendedSyncWindowBlocks
+                        ? BlockSyncProtocol.ExtendedSyncWindowBlocks
+                        : (int)advertisedGap;
+                    if (gapWindow > 0 && gapWindow < maxBlocks)
+                        maxBlocks = gapWindow;
+
+                    isTailCatchup = advertisedGap <= TailCatchupThresholdBlocks;
+                }
                 serial = ++_requestSerial;
 
                 _requestsByPeerKey[selectedPeer.SessionKey] = new SyncWindowRequest
@@ -726,8 +833,10 @@ namespace Qado.Networking
                     PeerKey = selectedPeer.SessionKey,
                     Kind = useLocator ? WindowRequestKind.Locator : WindowRequestKind.FromHash,
                     RequestedFromHash = fromHash,
-                    RequestedFromHeight = useLocator ? 0UL : _planningCursorHeight,
+                    RequestedFromHeight = fromHeight,
                     MaxBlocks = maxBlocks,
+                    AdvertisedTipHash = SafeCloneHash(advertisedTipHash),
+                    AdvertisedTipHeight = advertisedTipHeight,
                     AdvertisedTipChainwork = advertisedTipChainwork
                 };
 
@@ -757,7 +866,10 @@ namespace Qado.Networking
                         BlockSyncProtocol.BuildGetBlocksFrom(fromHash, maxBlocks),
                         serial,
                         ct).ConfigureAwait(false);
-                    _log?.Info("Sync", $"Block sync continuing from {ShortHash(fromHash)} via {selectedPeer.RemoteEndpoint}.");
+                    _log?.Info("Sync",
+                        advertisedGap > 0
+                            ? $"Block sync continuing from {ShortHash(fromHash)}@{fromHeight} via {selectedPeer.RemoteEndpoint} gap={advertisedGap} window={maxBlocks}{(isTailCatchup ? " tail" : string.Empty)}."
+                            : $"Block sync continuing from {ShortHash(fromHash)}@{fromHeight} via {selectedPeer.RemoteEndpoint} window={maxBlocks}.");
                 }
             }
             catch (Exception ex)
@@ -799,6 +911,7 @@ namespace Qado.Networking
                 while (true)
                 {
                     CompletedWindow? window;
+                    bool scheduleMoreAfterCommit = false;
                     lock (_gate)
                     {
                         if (!TryDequeueNextCommitWindow_NoLock(out window))
@@ -867,13 +980,22 @@ namespace Qado.Networking
                             _planningReady = true;
                             _useLocatorNext = false;
                         }
+                        else if (_requestsByPeerKey.Count == 0)
+                        {
+                            _planningCursorHash = SafeCloneHash(_committedHash);
+                            _planningCursorHeight = _committedHeight;
+                            _havePlanningCursor = _committedHash is { Length: 32 };
+                            _planningReady = true;
+                            _useLocatorNext = false;
+                            scheduleMoreAfterCommit = TryArmImmediateIdleCatchup_NoLock(forceLocator: false);
+                        }
                         RefreshState_NoLock();
                     }
 
                     if (_planningReady)
                         await EnsurePipelineAsync(ct).ConfigureAwait(false);
 
-                    if (window.ContinueAfterCommit)
+                    if (window.ContinueAfterCommit || scheduleMoreAfterCommit)
                         await EnsurePipelineAsync(ct).ConfigureAwait(false);
 
                     if (!window.MoreAvailable)
@@ -1036,6 +1158,7 @@ namespace Qado.Networking
             _planningCursorHeight = _haveCommittedCursor ? _committedHeight : 0UL;
             _havePlanningCursor = _haveCommittedCursor;
             ClearExhaustedContinuation_NoLock();
+            ClearFinishedTipLatch_NoLock();
             _lastRemoteTipLogHash = Array.Empty<byte>();
             _lastRemoteTipLogHeight = 0;
             RefreshState_NoLock();
@@ -1120,6 +1243,50 @@ namespace Qado.Networking
 
             if (shouldRecover)
                 await EnsurePipelineAsync(ct).ConfigureAwait(false);
+        }
+
+        private bool TryArmImmediateIdleCatchup_NoLock(bool forceLocator)
+        {
+            if (!_planningReady ||
+                _requestsByPeerKey.Count != 0 ||
+                _completedWindowsByStartHeight.Count != 0 ||
+                _commitLoopRunning)
+            {
+                return false;
+            }
+
+            if (!TryGetBestAheadPeer_NoLock(_getLocalTipChainwork(), out string? bestPeerKey, out _, out _))
+                return false;
+
+            if (!forceLocator &&
+                _havePlanningCursor &&
+                bestPeerKey != null &&
+                _tipByPeerKey.TryGetValue(bestPeerKey, out var bestTip) &&
+                IsExhaustedContinuation_NoLock(_planningCursorHash, _planningCursorHeight, bestTip.Hash, bestTip.Height, bestTip.Chainwork))
+            {
+                return false;
+            }
+
+            if (forceLocator)
+            {
+                _useLocatorNext = true;
+                if (_haveCommittedCursor && _committedHash is { Length: 32 })
+                {
+                    _planningCursorHash = SafeCloneHash(_committedHash);
+                    _planningCursorHeight = _committedHeight;
+                    _havePlanningCursor = true;
+                    _resumeFromHash = SafeCloneHash(_committedHash);
+                }
+                else
+                {
+                    _planningCursorHash = Array.Empty<byte>();
+                    _planningCursorHeight = 0;
+                    _havePlanningCursor = false;
+                    _resumeFromHash = SafeCloneHash(_getLocalTipHash());
+                }
+            }
+
+            return true;
         }
 
         private void ArmTimeout_NoLock(SyncWindowRequest request)
@@ -1498,6 +1665,35 @@ namespace Qado.Networking
             return true;
         }
 
+        private bool IsFinishedTipLatch_NoLock(
+            byte[] fromHash,
+            ulong fromHeight,
+            byte[] advertisedTipHash,
+            ulong advertisedTipHeight,
+            UInt128 advertisedTipChainwork)
+        {
+            if (!_haveFinishedTipLatch ||
+                fromHash is not { Length: 32 } ||
+                !BytesEqual32(_finishedTipFromHash, fromHash) ||
+                _finishedTipFromHeight != fromHeight)
+            {
+                return false;
+            }
+
+            bool sameTip =
+                advertisedTipHeight == _finishedTipHeight &&
+                advertisedTipChainwork <= _finishedTipChainwork &&
+                BytesEqual32(_finishedTipHash, advertisedTipHash);
+
+            if (!sameTip)
+            {
+                ClearFinishedTipLatch_NoLock();
+                return false;
+            }
+
+            return true;
+        }
+
         private void MarkExhaustedContinuation_NoLock(SyncWindowRequest request, SmallNetBlocksBatchEndFrame frame)
         {
             if (request.Kind != WindowRequestKind.FromHash ||
@@ -1510,9 +1706,31 @@ namespace Qado.Networking
             _haveExhaustedContinuation = true;
             _exhaustedContinuationFromHash = SafeCloneHash(request.RequestedFromHash);
             _exhaustedContinuationFromHeight = request.RequestedFromHeight;
-            _exhaustedContinuationTipHash = SafeCloneHash(frame.LastHash);
-            _exhaustedContinuationTipHeight = frame.LastHeight;
+            _exhaustedContinuationTipHash =
+                request.AdvertisedTipHash is { Length: 32 }
+                    ? SafeCloneHash(request.AdvertisedTipHash)
+                    : SafeCloneHash(frame.LastHash);
+            _exhaustedContinuationTipHeight =
+                request.AdvertisedTipHash is { Length: 32 }
+                    ? request.AdvertisedTipHeight
+                    : frame.LastHeight;
             _exhaustedContinuationTipChainwork = request.AdvertisedTipChainwork;
+        }
+
+        private void MarkFinishedTipLatch_NoLock(SyncWindowRequest request)
+        {
+            if (request.RequestedFromHash is not { Length: 32 })
+                return;
+
+            _haveFinishedTipLatch = true;
+            _finishedTipFromHash = SafeCloneHash(request.RequestedFromHash);
+            _finishedTipFromHeight = request.RequestedFromHeight;
+            _finishedTipHash =
+                request.AdvertisedTipHash is { Length: 32 }
+                    ? SafeCloneHash(request.AdvertisedTipHash)
+                    : Array.Empty<byte>();
+            _finishedTipHeight = request.AdvertisedTipHeight;
+            _finishedTipChainwork = request.AdvertisedTipChainwork;
         }
 
         private void MaybeClearExhaustedContinuation_NoLock(byte[] tipHash, ulong tipHeight, UInt128 tipChainwork)
@@ -1529,6 +1747,20 @@ namespace Qado.Networking
                 ClearExhaustedContinuation_NoLock();
         }
 
+        private void MaybeClearFinishedTipLatch_NoLock(byte[] tipHash, ulong tipHeight, UInt128 tipChainwork)
+        {
+            if (!_haveFinishedTipLatch)
+                return;
+
+            bool sameTip =
+                tipHeight == _finishedTipHeight &&
+                tipChainwork <= _finishedTipChainwork &&
+                BytesEqual32(_finishedTipHash, tipHash);
+
+            if (!sameTip)
+                ClearFinishedTipLatch_NoLock();
+        }
+
         private void ClearExhaustedContinuation_NoLock()
         {
             _haveExhaustedContinuation = false;
@@ -1537,6 +1769,25 @@ namespace Qado.Networking
             _exhaustedContinuationTipHash = Array.Empty<byte>();
             _exhaustedContinuationTipHeight = 0;
             _exhaustedContinuationTipChainwork = 0;
+        }
+
+        private bool IsSameFinishedTip_NoLock(byte[] tipHash, ulong tipHeight, UInt128 tipChainwork)
+        {
+            return _haveFinishedTipLatch &&
+                   tipHash is { Length: 32 } &&
+                   tipHeight == _finishedTipHeight &&
+                   tipChainwork <= _finishedTipChainwork &&
+                   BytesEqual32(_finishedTipHash, tipHash);
+        }
+
+        private void ClearFinishedTipLatch_NoLock()
+        {
+            _haveFinishedTipLatch = false;
+            _finishedTipFromHash = Array.Empty<byte>();
+            _finishedTipFromHeight = 0;
+            _finishedTipHash = Array.Empty<byte>();
+            _finishedTipHeight = 0;
+            _finishedTipChainwork = 0;
         }
 
         private bool ShouldLogRemoteTipReached_NoLock(byte[] tipHash, ulong tipHeight)
