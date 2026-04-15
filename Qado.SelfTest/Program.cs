@@ -79,6 +79,7 @@ internal static class Program
         new TestCase("BlockSyncClient_CapablePeers_StartAt128BeforeWindowRamp", TestBlockSyncClientCapablePeersStartAt128BeforeWindowRamp),
         new TestCase("BlockSyncClient_TailCatchup_CapsContinuationToAdvertisedGap", TestBlockSyncClientTailCatchupCapsContinuationToAdvertisedGap),
         new TestCase("BlockSyncClient_SyncWindowPreview_PipelinesNextPeerBeforeBatchEnd", TestBlockSyncClientSyncWindowPreviewPipelinesNextPeerBeforeBatchEnd),
+        new TestCase("BlockSyncClient_StickyPeer_ContinuesSamePeerWhenChainworkEqual", TestBlockSyncClientStickyPeerContinuesSamePeerWhenChainworkEqual),
         new TestCase("BlockSyncClient_FromHashContinuation_DoesNotRequireImmediatePrepare", TestBlockSyncClientFromHashContinuationDoesNotRequireImmediatePrepare),
         new TestCase("BlockSyncClient_EqualChainworkPrepare_SkipsWithoutPenalty", TestBlockSyncClientEqualChainworkPrepareSkipsWithoutPenalty),
         new TestCase("BlockSyncClient_CompletedContinuation_WaitsForEarlierPreparedWindow", TestBlockSyncClientCompletedContinuationWaitsForEarlierPreparedWindow),
@@ -95,6 +96,7 @@ internal static class Program
         new TestCase("PeerDiscovery_BuildPeersPayload_MixesVerifiedAndUnverifiedRoutables", TestPeerDiscoveryBuildPeersPayloadMixesVerifiedAndUnverifiedRoutables),
         new TestCase("PeerAddress_OrderDialAddresses_SkipsIpv6WhenDisabled", TestPeerAddressOrderDialAddressesSkipsIpv6WhenDisabled),
         new TestCase("BlockSyncServer_UsesCapabilityGatedBatchFrames", TestBlockSyncServerUsesCapabilityGatedBatchFrames),
+        new TestCase("BlockSyncServer_ExtendedWindow_SplitsBatchDataFrames", TestBlockSyncServerExtendedWindowSplitsBatchDataFrames),
         new TestCase("SmallNetSyncProtocol_RoundTripsCoreFrames", TestSmallNetSyncProtocolRoundTripsCoreFrames),
         new TestCase("SmallNetPeerState_ClassifiesGapPragmatically", TestSmallNetPeerStateClassifiesGapPragmatically),
         new TestCase("SmallNetPeerFlow_PushesCanonicalTailToLaggingPeer", TestSmallNetPeerFlowPushesCanonicalTailToLaggingPeer),
@@ -1772,6 +1774,54 @@ internal static class Program
         Assert(chunk.Blocks.Count == 1, $"expected exactly one legacy chunk block, got {chunk.Blocks.Count}");
     }
 
+    private static void TestBlockSyncServerExtendedWindowSplitsBatchDataFrames()
+    {
+        int expectedBlocks = BlockSyncProtocol.BatchMaxBlocks + 2;
+        var canonical = BuildCanonicalChain((ulong)expectedBlocks);
+        var genesis = BlockStore.GetBlockByHeight(0) ?? throw new InvalidOperationException("missing genesis block");
+        byte[] genesisHash = genesis.BlockHash ?? throw new InvalidOperationException("missing genesis hash");
+
+        byte[] request = BlockSyncProtocol.BuildGetBlocksFrom(genesisHash, BlockSyncProtocol.ExtendedSyncWindowBlocks);
+        var peer = CreateFakePeer("smallnet-sync-extended");
+        peer.Capabilities =
+            HandshakeCapabilities.BlocksBatchData |
+            HandshakeCapabilities.ExtendedSyncWindow |
+            HandshakeCapabilities.SyncWindowPreview;
+
+        var sent = new List<(MsgType type, byte[] payload)>();
+        BlockSyncServer.HandleGetBlocksFromAsync(
+                request,
+                peer,
+                (p, type, payload, ct) =>
+                {
+                    sent.Add((type, (byte[])payload.Clone()));
+                    return Task.CompletedTask;
+                },
+                log: null,
+                CancellationToken.None)
+            .GetAwaiter().GetResult();
+
+        Assert(sent.Count == 4, $"expected start + 2 data frames + end, got {sent.Count}");
+        Assert(SmallNetSyncProtocol.TryParseBlocksBatchStart(sent[0].payload, out var start), "batch start payload did not parse");
+        Assert(start.TotalBlocks == expectedBlocks, $"extended window total mismatch: {start.TotalBlocks}");
+        Assert(start.PreviewLastHash is { Length: 32 }, "extended window preview hash missing");
+        Assert(start.PreviewLastHeight == (ulong)expectedBlocks, $"extended window preview height mismatch: {start.PreviewLastHeight}");
+
+        Assert(sent[1].type == MsgType.BlocksBatchData, $"expected first data frame, got {sent[1].type}");
+        Assert(sent[2].type == MsgType.BlocksBatchData, $"expected second data frame, got {sent[2].type}");
+        Assert(SmallNetSyncProtocol.TryParseBlocksBatchData(sent[1].payload, out var firstData), "first data payload did not parse");
+        Assert(SmallNetSyncProtocol.TryParseBlocksBatchData(sent[2].payload, out var secondData), "second data payload did not parse");
+        Assert(firstData.FirstHeight == 1UL, $"first data height mismatch: {firstData.FirstHeight}");
+        Assert(firstData.Blocks.Count == BlockSyncProtocol.BatchMaxBlocks, $"first data count mismatch: {firstData.Blocks.Count}");
+        Assert(secondData.FirstHeight == 1UL + (ulong)BlockSyncProtocol.BatchMaxBlocks, $"second data height mismatch: {secondData.FirstHeight}");
+        Assert(secondData.Blocks.Count == 2, $"second data count mismatch: {secondData.Blocks.Count}");
+
+        Assert(SmallNetSyncProtocol.TryParseBlocksBatchEnd(sent[^1].payload, out var end), "batch end payload did not parse");
+        Assert(!end.MoreAvailable, "extended test batch should finish at tip");
+        Assert(end.LastHeight == (ulong)expectedBlocks, $"end last height mismatch: {end.LastHeight}");
+        Assert(BytesEqual(end.LastHash, canonical[^1].BlockHash!), "end last hash mismatch");
+    }
+
     private static void TestSmallNetSyncProtocolRoundTripsCoreFrames()
     {
         byte[] nodeId = HashFromU64(1UL);
@@ -3391,7 +3441,7 @@ internal static class Program
             .GetAwaiter().GetResult();
         client.OnTipStateAsync(
                 peer2,
-                new SmallNetTipStateFrame(650UL, remoteTipHash, 1_650UL, null, new[] { HashFromU64(649UL), remoteTipHash }),
+                new SmallNetTipStateFrame(650UL, remoteTipHash, 1_651UL, null, new[] { HashFromU64(649UL), remoteTipHash }),
                 CancellationToken.None)
             .GetAwaiter().GetResult();
 
@@ -3582,10 +3632,11 @@ internal static class Program
             log: null);
 
         byte[] remoteTipHash = HashFromU64(900UL);
-        var tipState = new SmallNetTipStateFrame(900UL, remoteTipHash, 9_000UL, null, new[] { HashFromU64(899UL), remoteTipHash });
+        var peer1TipState = new SmallNetTipStateFrame(900UL, remoteTipHash, 9_000UL, null, new[] { HashFromU64(899UL), remoteTipHash });
+        var peer2TipState = new SmallNetTipStateFrame(900UL, remoteTipHash, 9_001UL, null, new[] { HashFromU64(899UL), remoteTipHash });
 
-        client.OnTipStateAsync(peer1, tipState, CancellationToken.None).GetAwaiter().GetResult();
-        client.OnTipStateAsync(peer2, tipState, CancellationToken.None).GetAwaiter().GetResult();
+        client.OnTipStateAsync(peer1, peer1TipState, CancellationToken.None).GetAwaiter().GetResult();
+        client.OnTipStateAsync(peer2, peer2TipState, CancellationToken.None).GetAwaiter().GetResult();
 
         Assert(sent.Count == 1, $"expected initial locator request, got {sent.Count}");
         Assert(sent[0].peer == peer1.SessionKey, "first preview sync request must target the first peer");
@@ -3615,6 +3666,80 @@ internal static class Program
         Assert(BytesEqual(fromHash, previewLastHash), "preview pipeline must request from the preview hash");
         Assert(maxBlocks == BlockSyncProtocol.BatchMaxBlocks,
             $"preview pipeline should still start at 128 before window ramp, got {maxBlocks}");
+    }
+
+    private static void TestBlockSyncClientStickyPeerContinuesSamePeerWhenChainworkEqual()
+    {
+        byte[] localTip = HashFromU64(100UL);
+        UInt128 localChainwork = 1_000UL;
+        var sent = new List<(string peer, MsgType type, byte[] payload)>();
+        var caps =
+            HandshakeCapabilities.BlocksBatchData |
+            HandshakeCapabilities.ExtendedSyncWindow |
+            HandshakeCapabilities.SyncWindowPreview;
+        var peer1 = CreateFakePeer("peer-sticky-a", caps);
+        var peer2 = CreateFakePeer("peer-sticky-b", caps);
+        var sessions = new List<PeerSession> { peer1, peer2 };
+
+        var client = new BlockSyncClient(
+            sessionSnapshot: () => sessions.ToArray(),
+            sendFrameAsync: (targetPeer, type, payload, ct) =>
+            {
+                sent.Add((targetPeer.SessionKey, type, (byte[])payload.Clone()));
+                return Task.CompletedTask;
+            },
+            getLocalTipChainwork: () => localChainwork,
+            getLocalTipHash: () => (byte[])localTip.Clone(),
+            prepareBatchAsync: (startHash, startHeight, advertisedTipChainwork, targetPeer, ct) =>
+                Task.FromResult(new BlockSyncPrepareResult(true, string.Empty)),
+            commitBlocksAsync: (payloads, height, prevHash, targetPeer, ct) =>
+            {
+                ulong lastHeight = height + (ulong)payloads.Count - 1UL;
+                localTip = HashFromU64(lastHeight);
+                localChainwork = lastHeight;
+                return Task.FromResult(new BlockSyncCommitResult(true, (byte[])localTip.Clone(), string.Empty));
+            },
+            completeBatchAsync: (targetPeer, status, ct) => Task.CompletedTask,
+            abortBatchAsync: (targetPeer, reason, ct) => Task.CompletedTask,
+            log: null);
+
+        byte[] remoteTipHash = HashFromU64(900UL);
+        var tipState = new SmallNetTipStateFrame(900UL, remoteTipHash, 9_000UL, null, new[] { HashFromU64(899UL), remoteTipHash });
+
+        client.OnTipStateAsync(peer1, tipState, CancellationToken.None).GetAwaiter().GetResult();
+        client.OnTipStateAsync(peer2, tipState, CancellationToken.None).GetAwaiter().GetResult();
+
+        Assert(sent.Count == 1 && sent[0].peer == peer1.SessionKey && sent[0].type == MsgType.GetBlocksByLocator,
+            "initial sticky sync should start against the first ahead peer");
+
+        sent.Clear();
+        Guid batchId = Guid.NewGuid();
+        byte[] previewLastHash = HashFromU64(101UL);
+        client.OnBlocksBatchStartAsync(
+                peer1,
+                new SmallNetBlocksBatchStartFrame(batchId, localTip, 100UL, 1, remoteTipHash, 9_000UL, previewLastHash, 101UL),
+                CancellationToken.None)
+            .GetAwaiter().GetResult();
+
+        Assert(sent.Count == 0, $"equal-chainwork second peer must not receive preview continuation while sticky peer is active, got {sent.Count}");
+
+        client.OnBlocksBatchDataAsync(
+                peer1,
+                SmallNetSyncProtocol.BuildBlocksBatchData(101UL, new[] { new byte[] { 0x42 } }),
+                CancellationToken.None)
+            .GetAwaiter().GetResult();
+        client.OnBlocksBatchEndAsync(
+                peer1,
+                new SmallNetBlocksBatchEndFrame(batchId, previewLastHash, 101UL, MoreAvailable: true),
+                CancellationToken.None)
+            .GetAwaiter().GetResult();
+
+        Assert(sent.Count == 1, $"sticky peer should receive the continuation after its window finishes, got {sent.Count}");
+        Assert(sent[0].peer == peer1.SessionKey && sent[0].type == MsgType.GetBlocksFrom,
+            "sticky continuation should stay on the original peer");
+        Assert(BlockSyncProtocol.TryParseGetBlocksFrom(sent[0].payload, out var fromHash, out _),
+            "sticky continuation payload did not parse");
+        Assert(BytesEqual(fromHash, previewLastHash), "sticky continuation must resume from the preview hash");
     }
 
     private static void TestBlockSyncClientFromHashContinuationDoesNotRequireImmediatePrepare()
@@ -3657,10 +3782,11 @@ internal static class Program
             log: null);
 
         byte[] remoteTipHash = HashFromU64(900UL);
-        var tipState = new SmallNetTipStateFrame(900UL, remoteTipHash, 9_000UL, null, new[] { HashFromU64(899UL), remoteTipHash });
+        var peer1TipState = new SmallNetTipStateFrame(900UL, remoteTipHash, 9_000UL, null, new[] { HashFromU64(899UL), remoteTipHash });
+        var peer2TipState = new SmallNetTipStateFrame(900UL, remoteTipHash, 9_001UL, null, new[] { HashFromU64(899UL), remoteTipHash });
 
-        client.OnTipStateAsync(peer1, tipState, CancellationToken.None).GetAwaiter().GetResult();
-        client.OnTipStateAsync(peer2, tipState, CancellationToken.None).GetAwaiter().GetResult();
+        client.OnTipStateAsync(peer1, peer1TipState, CancellationToken.None).GetAwaiter().GetResult();
+        client.OnTipStateAsync(peer2, peer2TipState, CancellationToken.None).GetAwaiter().GetResult();
 
         sent.Clear();
         byte[] previewLastHash = HashFromU64(612UL);
@@ -3691,7 +3817,7 @@ internal static class Program
                     100UL + (ulong)BlockSyncProtocol.ExtendedSyncWindowBlocks,
                     BlockSyncProtocol.ExtendedSyncWindowBlocks,
                     remoteTipHash,
-                    9_000UL),
+                    9_001UL),
                 CancellationToken.None)
             .GetAwaiter().GetResult();
 
@@ -3741,10 +3867,11 @@ internal static class Program
             log: null);
 
         byte[] remoteTipHash = HashFromU64(900UL);
-        var tipState = new SmallNetTipStateFrame(900UL, remoteTipHash, 9_000UL, null, new[] { HashFromU64(899UL), remoteTipHash });
+        var peer1TipState = new SmallNetTipStateFrame(900UL, remoteTipHash, 9_000UL, null, new[] { HashFromU64(899UL), remoteTipHash });
+        var peer2TipState = new SmallNetTipStateFrame(900UL, remoteTipHash, 9_001UL, null, new[] { HashFromU64(899UL), remoteTipHash });
 
-        client.OnTipStateAsync(peer1, tipState, CancellationToken.None).GetAwaiter().GetResult();
-        client.OnTipStateAsync(peer2, tipState, CancellationToken.None).GetAwaiter().GetResult();
+        client.OnTipStateAsync(peer1, peer1TipState, CancellationToken.None).GetAwaiter().GetResult();
+        client.OnTipStateAsync(peer2, peer2TipState, CancellationToken.None).GetAwaiter().GetResult();
 
         sent.Clear();
         byte[] previewLastHash = HashFromU64(522UL);
@@ -3775,7 +3902,7 @@ internal static class Program
                     10UL + (ulong)BlockSyncProtocol.ExtendedSyncWindowBlocks,
                     1,
                     remoteTipHash,
-                    9_000UL),
+                    9_001UL),
                 CancellationToken.None)
             .GetAwaiter().GetResult();
 
@@ -3873,7 +4000,7 @@ internal static class Program
             "preview retry continuation payload did not parse");
         Assert(BytesEqual(fromHash, previewLastHash),
             "preview retry must resume from the preview last hash");
-        Assert(maxBlocks == BlockSyncProtocol.ExtendedSyncWindowBlocks,
+        Assert(maxBlocks == 14,
             $"preview retry continuation max_blocks mismatch: got {maxBlocks}");
     }
 
@@ -4298,7 +4425,7 @@ internal static class Program
         Assert(BlockSyncProtocol.TryParseGetBlocksFrom(sent[0].payload, out var fromHash, out var maxBlocks),
             "resume request payload did not parse");
         Assert(BytesEqual(fromHash, localTip), "resume request did not use last committed hash");
-        Assert(maxBlocks == BlockSyncProtocol.BatchMaxBlocks, "resume request max_blocks mismatch");
+        Assert(maxBlocks == 62, "resume request max_blocks mismatch");
     }
 
     private static void TestBlockSyncClientDisconnectDuringPrepareDoesNotLeaveStaleBulkSyncBatch()
@@ -4463,7 +4590,7 @@ internal static class Program
         Assert(BlockSyncProtocol.TryParseGetBlocksFrom(sent[0].payload, out var fromHash, out var maxBlocks),
             "continuation request payload did not parse");
         Assert(BytesEqual(fromHash, lastCommittedTip), "continuation request must resume from the last committed sync hash");
-        Assert(maxBlocks == BlockSyncProtocol.BatchMaxBlocks, "continuation request max_blocks mismatch");
+        Assert(maxBlocks == 14, "continuation request max_blocks mismatch");
     }
 
     private static void TestBlockSyncClientRemoteTipLatchSuppressesDuplicateFinishContinuation()

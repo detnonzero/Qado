@@ -154,6 +154,8 @@ namespace Qado.Networking
         private UInt128 _finishedTipChainwork;
         private byte[] _lastRemoteTipLogHash = Array.Empty<byte>();
         private ulong _lastRemoteTipLogHeight;
+        private bool _haveStickySyncPeer;
+        private string _stickySyncPeerKey = string.Empty;
 
         public BlockSyncClient(
             Func<IReadOnlyCollection<PeerSession>> sessionSnapshot,
@@ -451,7 +453,10 @@ namespace Qado.Networking
                     _requestsByPeerKey.Remove(peer.SessionKey);
                     RecordSuccessfulWindow_NoLock(peer, request.ReceivedBlocks, request.MaxBlocks);
                     if (!frame.MoreAvailable)
+                    {
                         MarkExhaustedContinuation_NoLock(request, frame);
+                        ClearStickySyncPeer_NoLock();
+                    }
 
                     int remainingBlocks = request.ReceivedBlocks - request.CommittedBlocks;
                     if (remainingBlocks > 0)
@@ -581,6 +586,9 @@ namespace Qado.Networking
             lock (_gate)
             {
                 _tipByPeerKey.Remove(peer.SessionKey);
+                if (_haveStickySyncPeer && string.Equals(_stickySyncPeerKey, peer.SessionKey, StringComparison.Ordinal))
+                    ClearStickySyncPeer_NoLock();
+
                 hadRequest = _requestsByPeerKey.TryGetValue(peer.SessionKey, out var request);
                 if (!hadRequest || !_haveCommittedCursor)
                 {
@@ -779,6 +787,9 @@ namespace Qado.Networking
                     return;
 
                 _tipByPeerKey.TryGetValue(selectedPeer.SessionKey, out var tip);
+                if (!_haveStickySyncPeer)
+                    SetStickySyncPeer_NoLock(selectedPeer);
+
                 advertisedTipHash = SafeCloneHash(tip.Hash);
                 advertisedTipHeight = tip.Height;
                 advertisedTipChainwork = tip.Chainwork;
@@ -1085,6 +1096,9 @@ namespace Qado.Networking
                 {
                     _requestsByPeerKey.Remove(peer.SessionKey);
                     _tipByPeerKey.Remove(peer.SessionKey);
+                    if (_haveStickySyncPeer && string.Equals(_stickySyncPeerKey, peer.SessionKey, StringComparison.Ordinal))
+                        ClearStickySyncPeer_NoLock();
+
                     _planningReady = true;
                     _useLocatorNext = true;
                     NoteProgress_NoLock("prepare-no-longer-needed");
@@ -1116,6 +1130,9 @@ namespace Qado.Networking
                     !active.BatchPrepared)
                 {
                     _requestsByPeerKey.Remove(peer.SessionKey);
+                    if (_haveStickySyncPeer && string.Equals(_stickySyncPeerKey, peer.SessionKey, StringComparison.Ordinal))
+                        ClearStickySyncPeer_NoLock();
+
                     _planningReady = true;
                     _useLocatorNext = true;
                     if (_haveCommittedCursor)
@@ -1161,6 +1178,7 @@ namespace Qado.Networking
             ClearFinishedTipLatch_NoLock();
             _lastRemoteTipLogHash = Array.Empty<byte>();
             _lastRemoteTipLogHeight = 0;
+            ClearStickySyncPeer_NoLock();
             RefreshState_NoLock();
         }
 
@@ -1358,6 +1376,9 @@ namespace Qado.Networking
                     _commitLoopRunning = false;
 
                 NoteProgress_NoLock(hadOtherWork ? "timeout-prune" : "timeout-rearm");
+                if (_haveStickySyncPeer && string.Equals(_stickySyncPeerKey, peerKey, StringComparison.Ordinal))
+                    ClearStickySyncPeer_NoLock();
+
                 RefreshState_NoLock();
             }
 
@@ -1388,6 +1409,11 @@ namespace Qado.Networking
             int bestCompletedWindows = 0;
             UInt128 localChainwork = _getLocalTipChainwork();
             bool anyPreferredEligible = false;
+
+            if (TrySelectStickyPeer_NoLock(localChainwork, out var stickyPeer, out var waitForStickyPeer))
+                return stickyPeer;
+            if (waitForStickyPeer)
+                return null;
 
             foreach (var peer in peers)
             {
@@ -1469,6 +1495,95 @@ namespace Qado.Networking
             }
 
             return best;
+        }
+
+        private bool TrySelectStickyPeer_NoLock(
+            UInt128 localChainwork,
+            out PeerSession? selectedPeer,
+            out bool waitForStickyPeer)
+        {
+            selectedPeer = null;
+            waitForStickyPeer = false;
+
+            if (!_haveStickySyncPeer || string.IsNullOrWhiteSpace(_stickySyncPeerKey))
+                return false;
+
+            if (!_tipByPeerKey.TryGetValue(_stickySyncPeerKey, out var stickyTip) ||
+                stickyTip.Chainwork == 0 ||
+                stickyTip.Chainwork <= localChainwork)
+            {
+                ClearStickySyncPeer_NoLock();
+                return false;
+            }
+
+            if (HasEligiblePeerWithHigherChainwork_NoLock(stickyTip.Chainwork))
+            {
+                ClearStickySyncPeer_NoLock();
+                return false;
+            }
+
+            var stickyPeer = ResolvePeerByKey(_stickySyncPeerKey);
+            if (stickyPeer == null || !stickyPeer.HandshakeOk || IsPeerInCooldown_NoLock(stickyPeer))
+            {
+                ClearStickySyncPeer_NoLock();
+                return false;
+            }
+
+            if (_requestsByPeerKey.ContainsKey(_stickySyncPeerKey))
+            {
+                waitForStickyPeer = true;
+                return false;
+            }
+
+            selectedPeer = stickyPeer;
+            return true;
+        }
+
+        private bool HasEligiblePeerWithHigherChainwork_NoLock(UInt128 chainwork)
+        {
+            var peers = _sessionSnapshot();
+            foreach (var peer in peers)
+            {
+                if (peer == null || !peer.HandshakeOk)
+                    continue;
+
+                if (string.Equals(peer.SessionKey, _stickySyncPeerKey, StringComparison.Ordinal))
+                    continue;
+
+                if (IsPeerInCooldown_NoLock(peer))
+                    continue;
+
+                if (!_tipByPeerKey.TryGetValue(peer.SessionKey, out var tip))
+                    continue;
+
+                if (tip.Chainwork > chainwork)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private bool IsPeerInCooldown_NoLock(PeerSession peer)
+        {
+            string historyKey = GetPeerHistoryKey(peer);
+            return historyKey.Length != 0 &&
+                   _cooldownUntilByPeerKey.TryGetValue(historyKey, out var until) &&
+                   until > DateTime.UtcNow;
+        }
+
+        private void SetStickySyncPeer_NoLock(PeerSession peer)
+        {
+            if (peer == null)
+                return;
+
+            _haveStickySyncPeer = true;
+            _stickySyncPeerKey = peer.SessionKey;
+        }
+
+        private void ClearStickySyncPeer_NoLock()
+        {
+            _haveStickySyncPeer = false;
+            _stickySyncPeerKey = string.Empty;
         }
 
         private bool TryBuildRequestCommitSlice_NoLock(PeerSession peer, bool flushRemainder, out RequestCommitSlice slice)

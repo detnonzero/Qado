@@ -1,0 +1,14 @@
+<svg viewBox="155 62 350 396" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<linearGradient id="qg" x1="155" y1="62" x2="505" y2="458" gradientUnits="userSpaceOnUse">
+<stop offset="0%" stop-color="#A78BFA"/>
+<stop offset="50%" stop-color="#7C3AED"/>
+<stop offset="100%" stop-color="#EC4899"/>
+</linearGradient>
+<clipPath id="tailClip">
+<polygon points="477,345 650,345 650,600 200,600 330,430"/>
+</clipPath>
+</defs>
+<polygon points="330,90 477,175 477,345 330,430 183,345 183,175" fill="none" stroke="url(#qg)" stroke-width="42" stroke-linejoin="round"/>
+<line x1="330" y1="345" x2="477" y2="430" stroke="url(#qg)" stroke-width="42" stroke-linecap="round" clip-path="url(#tailClip)"/>
+</svg>

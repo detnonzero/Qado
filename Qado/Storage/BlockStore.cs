@@ -126,6 +126,72 @@ namespace Qado.Storage
             return TryGetSerializedBlockByHash(hash, out payload, tx);
         }
 
+        public static bool TryGetSerializedCanonicalBlocksRange(
+            ulong startHeight,
+            int maxBlocks,
+            out List<(ulong Height, byte[] Hash, byte[] Payload)> blocks,
+            out ulong firstMissingHeight,
+            SqliteTransaction? tx = null)
+        {
+            blocks = new List<(ulong Height, byte[] Hash, byte[] Payload)>(Math.Max(0, maxBlocks));
+            firstMissingHeight = startHeight;
+            if (maxBlocks <= 0)
+                return true;
+            if (startHeight > (ulong)long.MaxValue)
+                return false;
+            if ((ulong)maxBlocks > (ulong)long.MaxValue - startHeight)
+                return false;
+
+            ulong endHeightExclusive = startHeight + (ulong)maxBlocks;
+            ulong expectedHeight = startHeight;
+
+            lock (Db.Sync)
+            {
+                using var cmd = (tx?.Connection ?? Conn).CreateCommand();
+                cmd.Transaction = tx;
+                cmd.CommandText = @"
+SELECT c.height, c.hash, bp.payload
+FROM canon c
+JOIN block_index bi ON bi.hash = c.hash
+JOIN block_payloads bp ON bp.hash = c.hash
+WHERE c.height >= $start AND c.height < $end
+ORDER BY c.height ASC
+LIMIT $limit;";
+                cmd.Parameters.AddWithValue("$start", (long)startHeight);
+                cmd.Parameters.AddWithValue("$end", (long)endHeightExclusive);
+                cmd.Parameters.AddWithValue("$limit", maxBlocks);
+
+                using var r = cmd.ExecuteReader();
+                while (r.Read())
+                {
+                    long rawHeight = r.GetInt64(0);
+                    if (rawHeight < 0)
+                        return false;
+
+                    ulong height = (ulong)rawHeight;
+                    if (height != expectedHeight)
+                    {
+                        firstMissingHeight = expectedHeight;
+                        return false;
+                    }
+
+                    var hash = r[1] as byte[];
+                    var payload = r[2] as byte[];
+                    if (hash is not { Length: 32 } || payload is not { Length: > 0 })
+                    {
+                        firstMissingHeight = expectedHeight;
+                        return false;
+                    }
+
+                    blocks.Add((height, hash, payload));
+                    expectedHeight++;
+                }
+            }
+
+            firstMissingHeight = expectedHeight;
+            return blocks.Count == maxBlocks;
+        }
+
         private static void TryMarkPayloadMissing(byte[] hash, SqliteTransaction? tx = null)
         {
             try { BlockPayloadStore.Delete(hash, tx); } catch { }
@@ -165,6 +231,44 @@ namespace Qado.Storage
                 {
                     return null;
                 }
+            }
+        }
+
+        public static bool TryGetCanonicalHashAndChainworkAtHeight(
+            ulong height,
+            out byte[] hash,
+            out UInt128 chainwork,
+            SqliteTransaction? tx = null)
+        {
+            hash = Array.Empty<byte>();
+            chainwork = 0;
+            if (height > (ulong)long.MaxValue)
+                return false;
+
+            lock (Db.Sync)
+            {
+                using var cmd = (tx?.Connection ?? Conn).CreateCommand();
+                cmd.Transaction = tx;
+                cmd.CommandText = @"
+SELECT c.hash, bi.chainwork
+FROM canon c
+JOIN block_index bi ON bi.hash = c.hash
+WHERE c.height = $h
+LIMIT 1;";
+                cmd.Parameters.AddWithValue("$h", (long)height);
+
+                using var r = cmd.ExecuteReader();
+                if (!r.Read())
+                    return false;
+
+                var rawHash = r[0] as byte[];
+                var rawChainwork = r[1] as byte[];
+                if (rawHash is not { Length: 32 } || rawChainwork is not { Length: 16 })
+                    return false;
+
+                hash = rawHash;
+                chainwork = U128.ReadBE(rawChainwork);
+                return true;
             }
         }
 

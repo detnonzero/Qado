@@ -2,6 +2,31 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.0.4] - 2026-04-15
+
+### Added
+- Application branding was added to the desktop build:
+  - `Qado.exe` now embeds the Qado icon for Explorer/taskbar display
+  - the main window uses the same icon for the running app/taskbar entry
+  - the node status header now shows the Qado logo in the upper-left GUI area
+
+### Changed
+- Historical block serving is faster for modern sync peers:
+  - canonical sync windows are now loaded from SQLite with a single ordered range query over `canon`, `block_index`, and `block_payloads`
+  - the server then splits the prepared range into `BlocksBatchData` / legacy chunk frames without doing per-height payload queries
+  - tip hash and chainwork for batch metadata are read together instead of via separate lookups
+- Historical sync peer selection now prefers a stable good supplier:
+  - once a peer is selected for catch-up, continuation windows stay on that peer while it keeps delivering successfully
+  - equal or lower-chainwork peers no longer steal preview continuations from the current good supplier
+  - the planner still switches away on disconnect, timeout, pipeline failure, cooldown, remote tip exhaustion, or when another eligible peer advertises higher chainwork
+
+### Fixed
+- Extended-window serving is now covered by tests to ensure windows larger than one `BlocksBatchData` frame are split and finalized correctly.
+- Block sync planner tests were updated to cover sticky-peer continuation and the existing advertised-gap cap near remote tip.
+
+### Notes
+- Release binaries were rebuilt with `release.ps1` for `win-x64`; `SHA256SUMS.txt` was refreshed.
+
 ## [1.0.3] - 2026-04-04
 
 ### Changed
